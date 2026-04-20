@@ -8,18 +8,40 @@ from typing import Any
 
 try:
     import chromadb
-except ImportError:  # pragma: no cover - optional dependency
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+except ImportError:  # pragma: no cover
     chromadb = None
+    SentenceTransformerEmbeddingFunction = None
 
 
 class _MemoryStore:
-    def __init__(self, db_path: Path, collection_name: str, use_chroma: bool) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        collection_name: str,
+        use_chroma: bool,
+        embed_model_name: str = "all-MiniLM-L6-v2",
+    ) -> None:
         self._docs: list[dict[str, Any]] = []
         self._collection = None
-        if use_chroma and chromadb is not None:
+        if not use_chroma or chromadb is None:
+            return
+
+        try:
             db_path.mkdir(parents=True, exist_ok=True)
             client = chromadb.PersistentClient(path=str(db_path))
-            self._collection = client.get_or_create_collection(collection_name)
+            embed_fn = None
+            if SentenceTransformerEmbeddingFunction is not None:
+                embed_fn = SentenceTransformerEmbeddingFunction(model_name=embed_model_name)
+            if embed_fn is not None:
+                self._collection = client.get_or_create_collection(
+                    name=collection_name,
+                    embedding_function=embed_fn,
+                )
+                return
+            self._collection = client.get_or_create_collection(name=collection_name)
+        except BaseException:
+            self._collection = None
 
     def add(self, *, layer: str, session_id: str, text: str, evidence: str, source: str) -> None:
         item_id = hashlib.sha1(f"{layer}:{session_id}:{text}".encode("utf-8")).hexdigest()
@@ -33,7 +55,6 @@ class _MemoryStore:
         if self._collection is not None:
             self._collection.upsert(ids=[item_id], documents=[text], metadatas=[metadata])
             return
-
         self._docs = [doc for doc in self._docs if doc["id"] != item_id]
         self._docs.append({"id": item_id, "text": text, "metadata": metadata})
 
@@ -139,10 +160,8 @@ class MemoryManager:
         lowered = candidate_text.lower()
         if any(token in lowered for token in blocked):
             return False
-        verified = ("success", "ok", "pass", "tool:", "shell", "file")
-        if not any(token in evidence.lower() for token in verified):
-            return False
-        return True
+        verified = ("success", "ok", "pass", "tool:", "shell", "file", "archive")
+        return any(token in evidence.lower() for token in verified)
 
     def load_l1_index(self) -> str:
         return self.l1_path.read_text(encoding="utf-8")
@@ -184,6 +203,9 @@ class MemoryManager:
         )
 
     def build_memory_system_prompt(self, session_id: str, query: str) -> str:
+        return self.build_memory_header(session_id=session_id, query=query)
+
+    def get_memory(self, session_id: str, query: str) -> str:
         return self.build_memory_header(session_id=session_id, query=query)
 
     def enrich_messages(self, messages: list[dict[str, Any]], metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -264,6 +286,9 @@ class MemoryManager:
                 source="archive_session",
             )
 
+    def distill_to_l4(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        self.archive_session(session_id=session_id, messages=messages)
+
     def start_memory_update(self, session_id: str, messages: list[dict[str, Any]], final_result: str) -> None:
         if not self.enabled:
             return
@@ -301,8 +326,7 @@ class MemoryManager:
     def _extract_response_text(response_payload: dict[str, Any]) -> str:
         try:
             choices = response_payload.get("choices") or []
-            first = choices[0]
-            message = first.get("message") or {}
+            message = (choices[0].get("message") or {}) if choices else {}
             content = message.get("content") or ""
             if isinstance(content, str):
                 return content

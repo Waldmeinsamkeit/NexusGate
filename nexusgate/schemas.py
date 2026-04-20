@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
@@ -12,8 +12,9 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
+    model: str | None = None
     messages: list[ChatMessage]
+    session_id: str = "global"
     temperature: float | None = None
     top_p: float | None = None
     n: int | None = Field(default=1, ge=1)
@@ -24,6 +25,7 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: float | None = None
     user: str | None = None
     metadata: dict[str, Any] | None = None
+    model_config = ConfigDict(extra="allow")
 
     def to_litellm_kwargs(self) -> dict[str, Any]:
         payload = self.model_dump(exclude_none=True)
@@ -34,4 +36,3 @@ class HealthResponse(BaseModel):
     status: str
     app: str
     env: str
-

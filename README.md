@@ -1,33 +1,46 @@
 # NexusGate-Core
 
-统一 OpenAI 兼容入口（`/v1/chat/completions`）+ 内嵌 LiteLLM 聚合网关。
+本地中转网关：统一对外 OpenAI 兼容接口（`/v1/chat/completions`），内部执行记忆召回与提示压缩后，再转发到官方或第三方上游 LLM。
 
-## 核心能力
+## 功能
 
-- 对外只暴露 `POST /v1/chat/completions`
-- 内部通过 `litellm.completion()` 适配 OpenAI/Anthropic 等模型
-- 五层记忆最小可移植子集（L0/L1/L2/L4）已接入
-- 支持第三方 OpenAI 兼容站点（通过 `llmapi/` 模型前缀路由）
+- 单一入口：`POST /v1/chat/completions`
+- 五层记忆（最小可移植子集）：L0/L1/L2/L4
+- 上下文压缩：LLMLingua（超过阈值自动压缩）
+- 上游转发：
+  - 官方模型（OpenAI / Anthropic）
+  - 第三方 OpenAI 兼容聚合器（LiteLLM Proxy / Bifrost / 其他）
 
-## 快速启动
-
-1. 安装依赖
+## 安装
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-2. 配置环境变量（可复制 `.env.example`）
+## 环境变量
+
+可复制 `.env.example` 并填写：
 
 ```env
 OPENAI_API_KEY=sk-xxx
 ANTHROPIC_API_KEY=sk-ant-xxx
 
-DEFAULT_MODEL=claude-sonnet-4-5-20250929
+TARGET_PROVIDER=claude-sonnet-4-5-20250929
+TARGET_BASE_URL=
+TARGET_API_KEY=
+
+COMPRESS_THRESHOLD=4000
 MEMORY_SOURCE_ROOT=F:/repo/GenericAgent
+MEMORY_STORE_PATH=memory
+MEMORY_USE_CHROMA=false
 ```
 
-3. 启动
+说明：
+- 当 `TARGET_BASE_URL` 为空时，走官方模型路由（`TARGET_PROVIDER`）。
+- 当 `TARGET_BASE_URL` 非空时，优先转发到第三方聚合器。
+- `MEMORY_USE_CHROMA=true` 时启用 Chroma 持久化；默认关闭以避免本机环境兼容性问题。
+
+## 启动
 
 ```bash
 # Linux / macOS
@@ -37,36 +50,39 @@ chmod +x run.sh && ./run.sh
 ./run.ps1
 ```
 
-## 第三方 LLM API 站点接入
+## 两种中转场景
 
-在 `.env` 中配置：
+### 场景 A：转发官方 Claude / Codex
 
-```env
-LLMAPI_BASE_URL=https://your-llmapi-site/v1
-LLMAPI_API_KEY=sk-your-third-party-key
-LLMAPI_MODEL_PREFIX=llmapi/
-LLMAPI_PROVIDER_PREFIX=openai/
+```bash
+export TARGET_PROVIDER=claude-sonnet-4-5-20250929
+export ANTHROPIC_API_KEY=sk-ant-xxx
+export OPENAI_API_KEY=sk-xxx
+python -m uvicorn nexus_gate_core:app --host 0.0.0.0 --port 8000
 ```
 
-然后客户端请求时把 `model` 写成 `llmapi/<模型名>`，例如：
+### 场景 B：转发外部 LLM API 聚合器
 
-- `llmapi/gpt-4o-mini`
-- `llmapi/deepseek-v3`
+```bash
+export TARGET_BASE_URL=http://localhost:11434/v1
+export TARGET_API_KEY=sk-anything
+python -m uvicorn nexus_gate_core:app --host 0.0.0.0 --port 8000
+```
 
-网关会自动转换为 LiteLLM 调用参数：
-
-- `model` -> `openai/<模型名>`
-- `api_base` -> `LLMAPI_BASE_URL`
-- `api_key` -> `LLMAPI_API_KEY`
-
-## 客户端通用配置
+## 客户端统一配置
 
 - Base URL: `http://localhost:8000/v1`
-- API Key: 任意值（默认不校验）
-- Model: 任一支持模型名
+- API Key: `sk-anything`（默认不校验）
+- Model: `claude-sonnet-4-5-20250929` 或 `gpt-5.2-codex`
 
-## 记忆存储
+示例：
 
-- 默认优先使用 ChromaDB（`memory/chroma`）
-- 若环境无 `chromadb`，自动回退到进程内内存存储
+```bash
+aider --model claude-sonnet-4-5-20250929 --api-base http://localhost:8000/v1
+```
 
+## 健康检查
+
+```bash
+curl http://127.0.0.1:8000/health
+```
