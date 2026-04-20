@@ -9,6 +9,14 @@ class Settings(BaseSettings):
     port: int = 8000
     request_timeout_seconds: int = 120
     api_key_required: bool = False
+    local_api_key: str | None = None
+    local_api_key_store_path: str = "~/.nexusgate/secrets.json"
+    client_sync_enabled: bool = True
+    codex_config_path: str = "C:/Users/Administrator/.codex/config.toml"
+    claude_settings_path: str = "C:/Users/Administrator/.claude/settings.json"
+    codex_local_base_url: str = "http://127.0.0.1:8000/v1"
+    claude_local_base_url: str = "http://127.0.0.1:8000"
+    upstream_api_key_required: bool = True
     default_model: str = "claude-sonnet-4-5-20250929"
     target_provider: str = "claude-sonnet-4-5-20250929"
     target_base_url: str | None = None
@@ -34,6 +42,14 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @property
+    def effective_target_base_url(self) -> str | None:
+        return self.target_base_url or self.llmapi_base_url
+
+    @property
+    def effective_target_api_key(self) -> str | None:
+        return self.target_api_key or self.llmapi_api_key
 
 
 settings = Settings()

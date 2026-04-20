@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Iterator
 from typing import Any
+from uuid import uuid4
 
 import litellm
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from nexusgate.config import settings
+from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.schemas import ChatCompletionRequest
 
@@ -24,6 +28,29 @@ L0_META_RULES = (
 
 
 def create_app() -> FastAPI:
+    if (
+        settings.effective_target_base_url
+        and settings.upstream_api_key_required
+        and not settings.effective_target_api_key
+    ):
+        raise RuntimeError("TARGET_API_KEY is required when using third-party upstream base URL.")
+
+    local_key_state = LocalKeyManager(
+        configured_key=settings.local_api_key,
+        store_path=settings.local_api_key_store_path,
+    ).resolve()
+    resolved_local_api_key = local_key_state.api_key
+    local_key_source = local_key_state.source
+
+    sync_state = SyncStatus(status="disabled", synced_clients=[], errors=[])
+    if settings.client_sync_enabled:
+        sync_state = ClientSyncService(
+            codex_config_path=settings.codex_config_path,
+            claude_settings_path=settings.claude_settings_path,
+            codex_base_url=settings.codex_local_base_url,
+            claude_base_url=settings.claude_local_base_url,
+        ).sync_all(resolved_local_api_key)
+
     app = FastAPI(title=settings.app_name, version="0.2.0")
     memory = MemoryManager(
         enabled=settings.memory_enabled,
@@ -46,19 +73,24 @@ def create_app() -> FastAPI:
             compressor = None
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        upstream = settings.target_base_url or settings.target_provider
-        return {"status": "ok", "upstream": upstream}
+    async def health() -> dict[str, Any]:
+        upstream = settings.effective_target_base_url or settings.target_provider
+        upstream_mode = "openai_compatible" if settings.effective_target_base_url else "provider_direct"
+        auth_mode = "custom_local_api_key" if resolved_local_api_key else (
+            "bearer_required" if settings.api_key_required else "disabled"
+        )
+        return {
+            "status": "ok",
+            "upstream": upstream,
+            "upstream_mode": upstream_mode,
+            "auth_mode": auth_mode,
+            "local_key_source": local_key_source,
+            "sync_status": sync_state.status,
+            "synced_clients": sync_state.synced_clients,
+            "sync_errors": sync_state.errors,
+        }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        request: Request,
-        background_tasks: BackgroundTasks,
-        authorization: str | None = Header(default=None),
-    ) -> Any:
-        _validate_api_key(authorization)
-        data = await request.json()
-        req = ChatCompletionRequest(**data)
+    def _run_completion(req: ChatCompletionRequest, data: dict[str, Any], background_tasks: BackgroundTasks) -> Any:
         session_id = _resolve_session_id(req)
         user_query = _extract_latest_user_query(req.messages)
 
@@ -90,6 +122,25 @@ def create_app() -> FastAPI:
 
         raw_messages = [message.model_dump(exclude_none=True) for message in req.messages]
         background_tasks.add_task(memory.distill_to_l4, session_id, raw_messages)
+        return response, req
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> Any:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        data = await request.json()
+        req = ChatCompletionRequest(**data)
+        response, req = _run_completion(req=req, data=data, background_tasks=background_tasks)
 
         if req.stream:
             return StreamingResponse(response, media_type="text/event-stream")
@@ -99,10 +150,77 @@ def create_app() -> FastAPI:
             return response
         return dict(response)
 
+    @app.post("/v1/responses")
+    async def responses_api(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> Any:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        data = await request.json()
+        openai_data = _responses_request_to_openai(data)
+        req = ChatCompletionRequest(**openai_data)
+        response, req = _run_completion(req=req, data=openai_data, background_tasks=background_tasks)
+
+        if req.stream:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="Streaming for /v1/responses is not implemented yet.",
+            )
+
+        payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
+        return _responses_response_from_openai(payload=payload, model=req.model or settings.target_provider)
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> Any:
+        auth_value = authorization
+        if x_api_key and not auth_value:
+            auth_value = f"Bearer {x_api_key}"
+        if api_key and not auth_value:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+
+        data = await request.json()
+        openai_data = _anthropic_request_to_openai(data)
+        req = ChatCompletionRequest(**openai_data)
+        response, req = _run_completion(req=req, data=openai_data, background_tasks=background_tasks)
+
+        if req.stream:
+            return StreamingResponse(
+                _anthropic_stream_from_openai(response, model=req.model or settings.target_provider),
+                media_type="text/event-stream",
+            )
+
+        payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
+        return _anthropic_response_from_openai(payload=payload, model=req.model or settings.target_provider)
+
     return app
 
 
-def _validate_api_key(authorization: str | None) -> None:
+def _validate_api_key(authorization: str | None, local_api_key: str | None = None) -> None:
+    effective_local_api_key = local_api_key or settings.local_api_key
+    if effective_local_api_key:
+        token = _extract_auth_token(authorization)
+        if token == effective_local_api_key:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key.",
+        )
+
     if not settings.api_key_required:
         return
     if authorization and authorization.lower().startswith("bearer "):
@@ -113,6 +231,18 @@ def _validate_api_key(authorization: str | None) -> None:
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Missing or invalid API key.",
     )
+
+
+def _extract_auth_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    raw = authorization.strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("bearer "):
+        token = raw[7:].strip()
+        return token or None
+    return raw
 
 
 def _resolve_session_id(req: ChatCompletionRequest) -> str:
@@ -184,8 +314,243 @@ def _build_upstream_kwargs(
         "temperature": req.temperature if req.temperature is not None else 0.7,
         **passthrough,
     }
-    if settings.target_base_url:
-        kwargs["api_base"] = settings.target_base_url
-        if settings.target_api_key:
-            kwargs["api_key"] = settings.target_api_key
+    if settings.effective_target_base_url:
+        kwargs["api_base"] = settings.effective_target_base_url
+        if settings.effective_target_api_key:
+            kwargs["api_key"] = settings.effective_target_api_key
     return kwargs
+
+
+def _anthropic_request_to_openai(data: dict[str, Any]) -> dict[str, Any]:
+    model = data.get("model") or settings.target_provider
+    stream = bool(data.get("stream", False))
+    system = data.get("system")
+    messages = data.get("messages") or []
+
+    converted: list[dict[str, Any]] = []
+    if isinstance(system, str) and system.strip():
+        converted.append({"role": "system", "content": system.strip()})
+    elif isinstance(system, list):
+        system_text = "\n".join(_content_block_to_text(item) for item in system).strip()
+        if system_text:
+            converted.append({"role": "system", "content": system_text})
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if isinstance(content, str):
+            converted.append({"role": role, "content": content})
+            continue
+        if isinstance(content, list):
+            text = "\n".join(_content_block_to_text(item) for item in content).strip()
+            converted.append({"role": role, "content": text})
+            continue
+        converted.append({"role": role, "content": json.dumps(content, ensure_ascii=False)})
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": converted,
+        "stream": stream,
+        "max_tokens": data.get("max_tokens"),
+        "temperature": data.get("temperature"),
+        "metadata": data.get("metadata"),
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def _responses_request_to_openai(data: dict[str, Any]) -> dict[str, Any]:
+    model = data.get("model") or settings.target_provider
+    stream = bool(data.get("stream", False))
+    input_value = data.get("input")
+    instructions = data.get("instructions")
+
+    messages: list[dict[str, Any]] = []
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions.strip()})
+
+    if isinstance(input_value, str):
+        messages.append({"role": "user", "content": input_value})
+    elif isinstance(input_value, list):
+        for item in input_value:
+            role = "user"
+            content = ""
+            if isinstance(item, dict):
+                role = str(item.get("role") or role)
+                raw_content = item.get("content")
+                if isinstance(raw_content, str):
+                    content = raw_content
+                elif isinstance(raw_content, list):
+                    blocks = []
+                    for block in raw_content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type")
+                            if block_type in {"input_text", "output_text", "text"}:
+                                blocks.append(str(block.get("text", "")))
+                            else:
+                                blocks.append(json.dumps(block, ensure_ascii=False))
+                        else:
+                            blocks.append(str(block))
+                    content = "\n".join(blocks).strip()
+                elif raw_content is not None:
+                    content = json.dumps(raw_content, ensure_ascii=False)
+            else:
+                content = str(item)
+            messages.append({"role": role, "content": content})
+    elif input_value is not None:
+        messages.append({"role": "user", "content": json.dumps(input_value, ensure_ascii=False)})
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": data.get("max_output_tokens"),
+        "temperature": data.get("temperature"),
+        "metadata": data.get("metadata"),
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def _content_block_to_text(block: Any) -> str:
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict):
+        if block.get("type") == "text":
+            return str(block.get("text", ""))
+        return json.dumps(block, ensure_ascii=False)
+    return str(block)
+
+
+def _anthropic_response_from_openai(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    text = _extract_openai_text(payload)
+    usage = payload.get("usage") or {}
+    input_tokens = int(usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or 0)
+    return {
+        "id": f"msg_{uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+    }
+
+
+def _extract_openai_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        blocks = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                blocks.append(str(item.get("text", "")))
+            else:
+                blocks.append(json.dumps(item, ensure_ascii=False))
+        return "\n".join(blocks).strip()
+    return str(content)
+
+
+def _responses_response_from_openai(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    text = _extract_openai_text(payload)
+    usage = payload.get("usage") or {}
+    input_tokens = int(usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+
+    return {
+        "id": f"resp_{uuid4().hex}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": f"msg_{uuid4().hex}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "output_text": text,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+def _extract_openai_delta_text(chunk: dict[str, Any]) -> str:
+    choices = chunk.get("choices") or []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                texts.append(str(item.get("text", "")))
+        return "".join(texts)
+    return ""
+
+
+def _anthropic_stream_from_openai(response: Any, model: str) -> Iterator[bytes]:
+    message_id = f"msg_{uuid4().hex}"
+    start = {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    }
+    yield _sse_event("message_start", start)
+    yield _sse_event(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    )
+
+    for chunk in response:
+        row = chunk.model_dump() if hasattr(chunk, "model_dump") else (chunk if isinstance(chunk, dict) else dict(chunk))
+        delta_text = _extract_openai_delta_text(row)
+        if delta_text:
+            yield _sse_event(
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta_text}},
+            )
+
+    yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield _sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}})
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
+def _sse_event(event: str, payload: dict[str, Any]) -> bytes:
+    text = json.dumps(payload, ensure_ascii=False)
+    return f"event: {event}\ndata: {text}\n\n".encode("utf-8")
