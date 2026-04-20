@@ -33,7 +33,17 @@ def create_app() -> FastAPI:
         top_k=settings.memory_top_k,
         use_chroma=settings.memory_use_chroma,
     )
-    compressor = PromptCompressor() if PromptCompressor is not None else None
+    compressor = None
+    if PromptCompressor is not None:
+        try:
+            compressor = PromptCompressor(
+                model_name=settings.llmlingua_model_name,
+                use_llmlingua2=settings.llmlingua_use_llmlingua2,
+            )
+        except TypeError:
+            compressor = PromptCompressor(model_name=settings.llmlingua_model_name)
+        except Exception:
+            compressor = None
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -138,7 +148,11 @@ def _compress_text(compressor: Any, messages: list[dict[str, Any]]) -> str | Non
         return None
     full_text = "\n".join(_message_content_text(msg) for msg in messages)
     try:
-        compressed = compressor.compress(full_text, rate=0.35, preserve=["system", "question"])
+        compressed = compressor.compress(
+            full_text,
+            rate=settings.llmlingua_compress_rate,
+            preserve=["system", "question"],
+        )
         if isinstance(compressed, dict):
             return str(compressed.get("compressed_prompt") or compressed.get("text") or "")
         return str(compressed)
