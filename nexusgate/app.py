@@ -166,6 +166,10 @@ def create_app() -> FastAPI:
             auth_value = f"Bearer {api_key}"
         _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
         data = await request.json()
+        openai_data = _responses_request_to_openai(data)
+        req = ChatCompletionRequest(**openai_data)
+        session_id = _resolve_session_id(req)
+        raw_messages = [message.model_dump(exclude_none=True) for message in req.messages]
 
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
@@ -175,11 +179,14 @@ def create_app() -> FastAPI:
                 payload=data,
                 upstream_base_url=settings.effective_target_base_url,
                 upstream_api_key=settings.effective_target_api_key,
+                on_complete=lambda text: memory.start_memory_update(
+                    session_id=session_id,
+                    messages=raw_messages,
+                    final_result=text or "stream_completed",
+                ),
             )
             return passthrough
 
-        openai_data = _responses_request_to_openai(data)
-        req = ChatCompletionRequest(**openai_data)
         response, req = _run_completion(req=req, data=openai_data, background_tasks=background_tasks)
 
         if req.stream:
@@ -189,6 +196,12 @@ def create_app() -> FastAPI:
             )
 
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
+        background_tasks.add_task(
+            memory.start_memory_update,
+            session_id,
+            raw_messages,
+            _responses_response_output_text(payload),
+        )
         return _responses_response_from_openai(payload=payload, model=req.model or settings.target_provider)
 
     @app.post("/v1/messages")
@@ -725,6 +738,7 @@ async def _passthrough_responses_to_upstream(
     payload: dict[str, Any],
     upstream_base_url: str,
     upstream_api_key: str | None,
+    on_complete: Any = None,
 ) -> Any:
     base = upstream_base_url.rstrip("/")
     url = f"{base}/responses"
@@ -733,6 +747,8 @@ async def _passthrough_responses_to_upstream(
 
     if stream:
         async def event_stream() -> Iterator[bytes]:
+            buffer = ""
+            parts: list[str] = []
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
                     if resp.status_code >= 400:
@@ -744,7 +760,32 @@ async def _passthrough_responses_to_upstream(
                         )
                     async for chunk in resp.aiter_bytes():
                         if chunk:
+                            text = chunk.decode("utf-8", errors="ignore")
+                            buffer += text
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                if not line.startswith("data: "):
+                                    continue
+                                raw = line[6:].strip()
+                                if not raw or raw == "[DONE]":
+                                    continue
+                                try:
+                                    obj = json.loads(raw)
+                                except Exception:
+                                    continue
+                                event_type = obj.get("type")
+                                if event_type == "response.output_text.delta":
+                                    delta = obj.get("delta")
+                                    if isinstance(delta, str):
+                                        parts.append(delta)
+                                elif event_type == "response.output_text.done":
+                                    done_text = obj.get("text")
+                                    if isinstance(done_text, str):
+                                        parts = [done_text]
                             yield chunk
+            if on_complete is not None:
+                final_text = "".join(parts).strip()
+                on_complete(final_text)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -756,7 +797,10 @@ async def _passthrough_responses_to_upstream(
             detail=f"Upstream responses failed ({resp.status_code}): {resp.text}",
         )
     try:
-        return JSONResponse(status_code=resp.status_code, content=resp.json())
+        body = resp.json()
+        if on_complete is not None:
+            on_complete(_responses_response_output_text(body))
+        return JSONResponse(status_code=resp.status_code, content=body)
     except ValueError:
         return JSONResponse(status_code=resp.status_code, content={"raw": resp.text})
 
@@ -774,3 +818,27 @@ def _build_upstream_headers(request: Request, upstream_api_key: str | None) -> d
     elif "Authorization" not in passthrough_headers:
         passthrough_headers["Authorization"] = ""
     return passthrough_headers
+
+
+def _responses_response_output_text(payload: dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    collected: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    collected.append(text)
+    return "".join(collected).strip()

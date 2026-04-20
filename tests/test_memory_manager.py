@@ -15,7 +15,7 @@ class MemoryManagerTests(unittest.TestCase):
         (self.source_root / "memory").mkdir(parents=True, exist_ok=True)
 
         (self.source_root / "memory" / "memory_management_sop.md").write_text(
-            "No Execution, No Memory.\n禁止存储易变状态。\n",
+            "No Execution, No Memory.\n",
             encoding="utf-8",
         )
         (self.source_root / "assets" / "insight_fixed_structure.txt").write_text(
@@ -51,13 +51,13 @@ class MemoryManagerTests(unittest.TestCase):
         manager.upsert_memory(
             layer="L2",
             session_id="s1",
-            text="数据库端口为 5432",
+            text="database port is 5432",
             evidence="shell: cat config",
         )
-        header = manager.build_memory_header(session_id="s1", query="数据库端口")
+        header = manager.build_memory_header(session_id="s1", query="database port")
         self.assertIn("<memory_index>", header)
         self.assertIn("<relevant_memory>", header)
-        self.assertIn("数据库端口", header)
+        self.assertIn("database port is 5432", header)
 
     def test_enrich_messages_injects_system_context(self) -> None:
         manager = MemoryManager(
@@ -66,7 +66,7 @@ class MemoryManagerTests(unittest.TestCase):
             source_root=str(self.source_root),
             use_chroma=False,
         )
-        messages = [{"role": "user", "content": "你好"}]
+        messages = [{"role": "user", "content": "hello"}]
         enriched = manager.enrich_messages(messages=messages, metadata={"session_id": "s2"})
         self.assertEqual(enriched[0]["role"], "system")
         self.assertIn("<nexus_context>", enriched[0]["content"])
@@ -79,17 +79,44 @@ class MemoryManagerTests(unittest.TestCase):
             use_chroma=False,
         )
         messages = [
-            {"role": "user", "content": "请修复启动脚本"},
-            {"role": "assistant", "content": "已修复"},
+            {"role": "user", "content": "please fix startup script"},
+            {"role": "assistant", "content": "fixed"},
         ]
         manager.start_memory_update(
             session_id="s3",
             messages=messages,
-            final_result="任务成功，脚本可启动",
+            final_result="done and startup script works",
         )
-        text = manager.query_memory("s3", "启动脚本", layers=["L4"])
-        self.assertIn("启动脚本", text)
+        text = manager.query_memory("s3", "startup script", layers=["L4"])
+        self.assertIn("startup script", text)
+
+    def test_l4_archive_persisted_and_reloaded_when_no_chroma(self) -> None:
+        manager = MemoryManager(
+            enabled=True,
+            store_path=str(self.workspace),
+            source_root=str(self.source_root),
+            use_chroma=False,
+        )
+        messages = [
+            {"role": "user", "content": "create file codex_write_test.txt"},
+            {"role": "assistant", "content": "file created"},
+        ]
+        manager.archive_session(session_id="s4", messages=messages)
+
+        archive_file = self.workspace / "l4" / "archive.jsonl"
+        self.assertTrue(archive_file.exists())
+        self.assertIn("codex_write_test.txt", archive_file.read_text(encoding="utf-8"))
+
+        reloaded = MemoryManager(
+            enabled=True,
+            store_path=str(self.workspace),
+            source_root=str(self.source_root),
+            use_chroma=False,
+        )
+        text = reloaded.query_memory("s4", "codex_write_test.txt", layers=["L4"])
+        self.assertIn("codex_write_test.txt", text)
 
 
 if __name__ == "__main__":
     unittest.main()
+

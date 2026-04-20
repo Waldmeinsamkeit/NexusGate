@@ -20,3 +20,4 @@ L4: L4_raw_sessions/
 6. 窗口: GUI状态优先win32gui枚举标题
 7. web JS: 输入用原生setter+事件链, 点击前检disabled, 注意引号转义; scan空/不全先稍等再scan, 禁首扫定论
 8. SOP: 读SOP禁凭印象,有utils必用 | 复杂长程/用户提及规划→读plan_sop
+recent_success -> L2

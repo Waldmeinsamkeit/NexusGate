@@ -9,6 +9,7 @@ from nexusgate.app import (
     _responses_request_to_openai,
     _responses_response_from_openai,
     _responses_stream_from_openai,
+    _responses_response_output_text,
 )
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager
 
@@ -115,6 +116,20 @@ class LocalProxyTests(unittest.TestCase):
         self.assertIn("event: response.output_text.done", events)
         self.assertIn("event: response.completed", events)
         self.assertIn("NEXUS_OK", events)
+
+    def test_responses_output_text_extracts_from_output_array(self) -> None:
+        payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "NEXUS_"},
+                        {"type": "output_text", "text": "OK"},
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(_responses_response_output_text(payload), "NEXUS_OK")
 
 
 if __name__ == "__main__":

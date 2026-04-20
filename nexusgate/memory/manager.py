@@ -103,6 +103,9 @@ class MemoryManager:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.l3_dir = self.workspace / "l3"
         self.l3_dir.mkdir(parents=True, exist_ok=True)
+        self.l4_dir = self.workspace / "l4"
+        self.l4_dir.mkdir(parents=True, exist_ok=True)
+        self.l4_archive_path = self.l4_dir / "archive.jsonl"
         self.sop_path = self.workspace / "memory_management_sop.md"
         self.l1_path = self.workspace / "global_mem_insight.txt"
         self.l2_path = self.workspace / "global_mem.txt"
@@ -113,6 +116,7 @@ class MemoryManager:
             collection_name=collection_name,
             use_chroma=use_chroma,
         )
+        self._hydrate_l4_from_file()
 
     def _bootstrap_files(self) -> None:
         self._copy_if_missing(
@@ -285,6 +289,7 @@ class MemoryManager:
                 evidence="tool:archive_success",
                 source="archive_session",
             )
+            self._append_l4_archive(session_id=session_id, summary=summary)
 
     def distill_to_l4(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         self.archive_session(session_id=session_id, messages=messages)
@@ -321,6 +326,45 @@ class MemoryManager:
         messages = request_payload.get("messages") or []
         final_text = self._extract_response_text(response_payload)
         self.start_memory_update(session_id=session_id, messages=messages, final_result=final_text)
+
+    def _append_l4_archive(self, session_id: str, summary: str) -> None:
+        row = {
+            "session_id": session_id,
+            "summary": summary,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        line = json.dumps(row, ensure_ascii=False)
+        if not self.l4_archive_path.exists():
+            self.l4_archive_path.write_text(f"{line}\n", encoding="utf-8")
+            return
+        with self.l4_archive_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{line}\n")
+
+    def _hydrate_l4_from_file(self) -> None:
+        if not self.l4_archive_path.exists():
+            return
+        try:
+            lines = self.l4_archive_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            session_id = str(row.get("session_id") or "default")
+            summary = str(row.get("summary") or "").strip()
+            if not summary:
+                continue
+            self.store.add(
+                layer="L4",
+                session_id=session_id,
+                text=summary,
+                evidence="tool:archive_replay",
+                source="archive_file",
+            )
 
     @staticmethod
     def _extract_response_text(response_payload: dict[str, Any]) -> str:
