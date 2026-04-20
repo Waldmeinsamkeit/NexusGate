@@ -8,6 +8,7 @@ from nexusgate.app import (
     _anthropic_response_from_openai,
     _responses_request_to_openai,
     _responses_response_from_openai,
+    _responses_stream_from_openai,
 )
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager
 
@@ -99,6 +100,21 @@ class LocalProxyTests(unittest.TestCase):
         self.assertEqual(responses_payload["object"], "response")
         self.assertEqual(responses_payload["output_text"], "NEXUS_OK")
         self.assertEqual(responses_payload["usage"]["total_tokens"], 15)
+
+    def test_responses_stream_emits_delta_and_completed(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"content": "NEXUS_"}}]},
+            {"choices": [{"delta": {"content": "OK"}}]},
+        ]
+        events = b"".join(_responses_stream_from_openai(chunks, model="gpt-4o-mini")).decode("utf-8")
+        self.assertIn("event: response.created", events)
+        self.assertIn("event: response.output_item.added", events)
+        self.assertIn("event: response.content_part.added", events)
+        self.assertIn("event: response.output_text.delta", events)
+        self.assertIn("event: response.output_item.done", events)
+        self.assertIn("event: response.output_text.done", events)
+        self.assertIn("event: response.completed", events)
+        self.assertIn("NEXUS_OK", events)
 
 
 if __name__ == "__main__":

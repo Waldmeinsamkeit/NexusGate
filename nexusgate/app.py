@@ -6,9 +6,10 @@ from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import litellm
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from nexusgate.config import settings
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
@@ -165,14 +166,26 @@ def create_app() -> FastAPI:
             auth_value = f"Bearer {api_key}"
         _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
         data = await request.json()
+
+        # Prefer raw pass-through for Responses API so Codex tool-calling semantics
+        # are preserved (editing files, running commands, multi-turn tool loops).
+        if settings.effective_target_base_url:
+            passthrough = await _passthrough_responses_to_upstream(
+                request=request,
+                payload=data,
+                upstream_base_url=settings.effective_target_base_url,
+                upstream_api_key=settings.effective_target_api_key,
+            )
+            return passthrough
+
         openai_data = _responses_request_to_openai(data)
         req = ChatCompletionRequest(**openai_data)
         response, req = _run_completion(req=req, data=openai_data, background_tasks=background_tasks)
 
         if req.stream:
-            raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                detail="Streaming for /v1/responses is not implemented yet.",
+            return StreamingResponse(
+                _responses_stream_from_openai(response, model=req.model or settings.target_provider),
+                media_type="text/event-stream",
             )
 
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
@@ -499,6 +512,157 @@ def _responses_response_from_openai(payload: dict[str, Any], model: str) -> dict
     }
 
 
+def _responses_stream_from_openai(response: Any, model: str) -> Iterator[bytes]:
+    response_id = f"resp_{uuid4().hex}"
+    message_id = f"msg_{uuid4().hex}"
+    created_at = int(time.time())
+    collected_parts: list[str] = []
+
+    created = {
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": model,
+            "output": [],
+        },
+    }
+    yield _sse_event("response.created", created)
+    yield _sse_event(
+        "response.in_progress",
+        {
+            "type": "response.in_progress",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "in_progress",
+                "model": model,
+                "output": [],
+            },
+        },
+    )
+    yield _sse_event(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": {
+                "id": message_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        },
+    )
+    yield _sse_event(
+        "response.content_part.added",
+        {
+            "type": "response.content_part.added",
+            "response_id": response_id,
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        },
+    )
+
+    for chunk in response:
+        row = chunk.model_dump() if hasattr(chunk, "model_dump") else (chunk if isinstance(chunk, dict) else dict(chunk))
+        delta_text = _extract_openai_delta_text(row)
+        if not delta_text:
+            continue
+        collected_parts.append(delta_text)
+        yield _sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "response_id": response_id,
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": delta_text,
+            },
+        )
+
+    full_text = "".join(collected_parts)
+    yield _sse_event(
+        "response.content_part.done",
+        {
+            "type": "response.content_part.done",
+            "response_id": response_id,
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": full_text, "annotations": []},
+        },
+    )
+    yield _sse_event(
+        "response.output_text.done",
+        {
+            "type": "response.output_text.done",
+            "response_id": response_id,
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": full_text,
+        },
+    )
+    yield _sse_event(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": {
+                "id": message_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": full_text,
+                        "annotations": [],
+                    }
+                ],
+            },
+        },
+    )
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "completed",
+            "model": model,
+            "output": [
+                {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": full_text,
+                            "annotations": [],
+                        }
+                    ],
+                }
+            ],
+            "output_text": full_text,
+        },
+    }
+    yield _sse_event("response.completed", completed)
+    yield b"data: [DONE]\n\n"
+
+
 def _extract_openai_delta_text(chunk: dict[str, Any]) -> str:
     choices = chunk.get("choices") or []
     if not choices:
@@ -554,3 +718,59 @@ def _anthropic_stream_from_openai(response: Any, model: str) -> Iterator[bytes]:
 def _sse_event(event: str, payload: dict[str, Any]) -> bytes:
     text = json.dumps(payload, ensure_ascii=False)
     return f"event: {event}\ndata: {text}\n\n".encode("utf-8")
+
+
+async def _passthrough_responses_to_upstream(
+    request: Request,
+    payload: dict[str, Any],
+    upstream_base_url: str,
+    upstream_api_key: str | None,
+) -> Any:
+    base = upstream_base_url.rstrip("/")
+    url = f"{base}/responses"
+    headers = _build_upstream_headers(request, upstream_api_key)
+    stream = bool(payload.get("stream"))
+
+    if stream:
+        async def event_stream() -> Iterator[bytes]:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        detail = body.decode("utf-8", errors="replace")
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"Upstream responses stream failed ({resp.status_code}): {detail}",
+                        )
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Upstream responses failed ({resp.status_code}): {resp.text}",
+        )
+    try:
+        return JSONResponse(status_code=resp.status_code, content=resp.json())
+    except ValueError:
+        return JSONResponse(status_code=resp.status_code, content={"raw": resp.text})
+
+
+def _build_upstream_headers(request: Request, upstream_api_key: str | None) -> dict[str, str]:
+    passthrough_headers = {}
+    for key, value in request.headers.items():
+        lowered = key.lower()
+        if lowered in {"host", "content-length", "authorization"}:
+            continue
+        passthrough_headers[key] = value
+
+    if upstream_api_key:
+        passthrough_headers["Authorization"] = f"Bearer {upstream_api_key}"
+    elif "Authorization" not in passthrough_headers:
+        passthrough_headers["Authorization"] = ""
+    return passthrough_headers
