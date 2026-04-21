@@ -14,6 +14,10 @@ class MemoryCandidate:
     kind: str = ""
     confidence: float = 0.0
     created_at: str = ""
+    candidate_id: str = ""
+    status: str = "pending"
+    updated_at: str = ""
+    rejected_reason: str = ""
 
 
 @dataclass(slots=True)

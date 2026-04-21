@@ -128,6 +128,7 @@ class MemoryManager:
         self.candidates_dir = self.workspace / "candidates"
         self.candidates_dir.mkdir(parents=True, exist_ok=True)
         self.candidates_archive_path = self.candidates_dir / "candidates.jsonl"
+        self.candidates_state_path = self.candidates_dir / "candidate_states.json"
         self.l4_archive_path = self.l4_dir / "archive.jsonl"
         self.sop_path = self.workspace / "memory_management_sop.md"
         self.l1_path = self.workspace / "global_mem_insight.txt"
@@ -542,8 +543,9 @@ class MemoryManager:
             messages=messages,
             final_result=final_result,
         )
-        self._persist_candidates(candidates)
-        self._commit_candidates(candidates)
+        pending = self._persist_candidates(candidates)
+        self._commit_candidates(pending)
+        self._gc_candidate_pool()
 
     def _extract_memory_candidates(
         self,
@@ -621,16 +623,43 @@ class MemoryManager:
             )
         return candidates
 
-    def _persist_candidates(self, candidates: list[MemoryCandidate]) -> None:
+    def _persist_candidates(self, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
         if not candidates:
-            return
-        with self.candidates_archive_path.open("a", encoding="utf-8") as handle:
-            for row in candidates:
-                handle.write(f"{json.dumps(asdict(row), ensure_ascii=False)}\n")
+            return []
+        states = self._load_candidate_states()
+        now = datetime.now(timezone.utc).isoformat()
+        pending: list[MemoryCandidate] = []
+        seen_ids: set[str] = set()
+        for row in candidates:
+            row.candidate_id = self._candidate_id(row)
+            if row.candidate_id in seen_ids:
+                continue
+            seen_ids.add(row.candidate_id)
+            if row.candidate_id in states:
+                continue
+            if not row.created_at:
+                row.created_at = now
+            row.status = "pending"
+            row.updated_at = now
+            states[row.candidate_id] = asdict(row)
+            pending.append(row)
+        self._save_candidate_states(states)
+        self._append_candidate_archive(pending)
+        return pending
 
     def _commit_candidates(self, candidates: list[MemoryCandidate]) -> None:
+        if not candidates:
+            return
+        states = self._load_candidate_states()
+        finished: list[MemoryCandidate] = []
         for row in candidates:
+            now = datetime.now(timezone.utc).isoformat()
             if not self._candidate_allowed(row):
+                row.status = "rejected"
+                row.rejected_reason = "validation_failed"
+                row.updated_at = now
+                states[row.candidate_id] = asdict(row)
+                finished.append(row)
                 continue
             self.upsert_memory(
                 layer=row.suggested_layer,
@@ -639,6 +668,12 @@ class MemoryManager:
                 evidence=row.evidence,
                 source=row.source,
             )
+            row.status = "committed"
+            row.updated_at = now
+            states[row.candidate_id] = asdict(row)
+            finished.append(row)
+        self._save_candidate_states(states)
+        self._append_candidate_archive(finished)
 
     def _candidate_allowed(self, row: MemoryCandidate) -> bool:
         layer = row.suggested_layer.upper()
@@ -654,6 +689,65 @@ class MemoryManager:
         if layer == "L4":
             return True
         return False
+
+    def _candidate_id(self, row: MemoryCandidate) -> str:
+        normalized = re.sub(r"\s+", " ", row.content.strip().lower())
+        payload = "|".join(
+            [
+                row.session_id,
+                row.suggested_layer.upper(),
+                row.kind.strip().lower(),
+                normalized,
+            ]
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def _load_candidate_states(self) -> dict[str, dict[str, Any]]:
+        if not self.candidates_state_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.candidates_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def _save_candidate_states(self, states: dict[str, dict[str, Any]]) -> None:
+        self.candidates_state_path.write_text(
+            json.dumps(states, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _append_candidate_archive(self, candidates: list[MemoryCandidate]) -> None:
+        if not candidates:
+            return
+        with self.candidates_archive_path.open("a", encoding="utf-8") as handle:
+            for row in candidates:
+                handle.write(f"{json.dumps(asdict(row), ensure_ascii=False)}\n")
+
+    def _gc_candidate_pool(self, max_states: int = 2000, max_archive_lines: int = 4000) -> None:
+        states = self._load_candidate_states()
+        if len(states) > max_states:
+            ordered = sorted(
+                states.values(),
+                key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
+                reverse=True,
+            )
+            kept = ordered[:max_states]
+            states = {str(row.get("candidate_id")): row for row in kept if row.get("candidate_id")}
+            self._save_candidate_states(states)
+
+        if not self.candidates_archive_path.exists():
+            return
+        try:
+            lines = self.candidates_archive_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return
+        if len(lines) <= max_archive_lines:
+            return
+        trimmed = lines[-max_archive_lines:]
+        self.candidates_archive_path.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
 
     @staticmethod
     def _looks_successful(final_result: str) -> bool:

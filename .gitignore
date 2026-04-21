@@ -13,3 +13,11 @@ plan2.md
 plans/
 
 .venv/
+
+tests/
+
+# cache directories (any level)
+_cache/
+*_cache/
+__pycache__/
+.cache/
