@@ -3,9 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from nexusgate.memory.models import MemoryCandidate
+from nexusgate.memory.policies import SUCCESS_NEGATIVE_HINTS, SUCCESS_POSITIVE_HINTS
+from nexusgate.memory.selector import MemorySelector
 
 try:
     import chromadb
@@ -89,6 +94,7 @@ class _MemoryStore:
 
 class MemoryManager:
     SESSION_RECALL_SKILL_FILE = "session_memory_recall.md"
+    SKILL_MANIFEST_FILE = "skill_manifest.json"
     SKILL_INDEX_SESSION_ID = "__skills__"
     SESSION_RECALL_TRIGGER_TERMS = (
         "\u56de\u5fc6",
@@ -119,12 +125,17 @@ class MemoryManager:
         self.l3_dir.mkdir(parents=True, exist_ok=True)
         self.l4_dir = self.workspace / "l4"
         self.l4_dir.mkdir(parents=True, exist_ok=True)
+        self.candidates_dir = self.workspace / "candidates"
+        self.candidates_dir.mkdir(parents=True, exist_ok=True)
+        self.candidates_archive_path = self.candidates_dir / "candidates.jsonl"
         self.l4_archive_path = self.l4_dir / "archive.jsonl"
         self.sop_path = self.workspace / "memory_management_sop.md"
         self.l1_path = self.workspace / "global_mem_insight.txt"
         self.l2_path = self.workspace / "global_mem.txt"
         self._bootstrap_files()
         self.l0_rules = self.load_l0_sop()
+        self.selector = MemorySelector()
+        self.skill_manifest = self._load_skill_manifest()
         self.store = _MemoryStore(
             self.workspace / "chroma",
             collection_name=collection_name,
@@ -152,6 +163,24 @@ class MemoryManager:
             self.source_root / "memory" / "global_mem.txt",
             self.l2_path,
             "## [FACTS]\n",
+        )
+        self._copy_if_missing(
+            self.source_root / "memory" / self.SKILL_MANIFEST_FILE,
+            self.workspace / self.SKILL_MANIFEST_FILE,
+            json.dumps(
+                [
+                    {
+                        "name": "session_memory_recall",
+                        "path": "session_memory_recall.md",
+                        "triggers": ["回忆", "之前", "上次", "历史", "session", "l4", "context"],
+                        "task_types": ["retrieval-only", "debug", "planning", "chat"],
+                        "injection_mode": "summary",
+                        "max_chars": 600,
+                    }
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
         )
 
     @staticmethod
@@ -205,40 +234,105 @@ class MemoryManager:
                     return ""
         return ""
 
+    def _load_skill_manifest(self) -> list[dict[str, Any]]:
+        raw = self.load_l3_doc(self.SKILL_MANIFEST_FILE).strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return []
+
+        rows: list[dict[str, Any]]
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("skills"), list):
+            rows = payload["skills"]
+        else:
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            path = str(row.get("path") or "").strip()
+            if not name or not path:
+                continue
+            normalized.append(row)
+        return normalized
+
     def should_inject_session_recall(self, query: str) -> bool:
         lowered = (query or "").lower()
         return any(term in lowered for term in self.SESSION_RECALL_TRIGGER_TERMS)
 
     def _index_l3_skills(self) -> None:
-        payload = self._build_session_recall_skill_payload()
-        if not payload:
-            return
-        self.store.add(
-            layer="L3",
-            session_id=self.SKILL_INDEX_SESSION_ID,
-            text=payload,
-            evidence="tool:file_read",
-            source="skill_bootstrap",
-        )
+        for entry in self.skill_manifest:
+            payload = self._build_skill_payload(entry)
+            if not payload:
+                continue
+            self.store.add(
+                layer="L3",
+                session_id=self.SKILL_INDEX_SESSION_ID,
+                text=payload,
+                evidence="tool:file_read",
+                source=f"skill_bootstrap:{entry.get('name', 'unknown')}",
+            )
 
-    def _build_session_recall_skill_payload(self) -> str:
-        raw = self.load_l3_doc(self.SESSION_RECALL_SKILL_FILE).strip()
+    def _build_skill_payload(self, entry: dict[str, Any]) -> str:
+        raw = self._load_skill_raw(entry).strip()
         if not raw:
             return ""
         metadata, body = self._parse_skill_markdown(raw)
-        skill = metadata.get("key") or "session_memory_recall"
-        summary = metadata.get("one_line_summary") or metadata.get("description") or "session recall"
-        tags = metadata.get("tags") or "session,memory,recall"
+        skill = str(entry.get("name") or metadata.get("key") or "").strip()
+        if not skill:
+            return ""
+        summary = (
+            str(entry.get("summary") or "").strip()
+            or metadata.get("one_line_summary")
+            or metadata.get("description")
+            or "skill summary unavailable"
+        )
+        tags = self._to_csv(entry.get("tags")) or metadata.get("tags") or "skill"
+        task_types = self._to_csv(entry.get("task_types")) or "chat"
+        triggers = self._to_csv(entry.get("triggers")) or skill
         when = self._extract_markdown_section(body, "When to use")
         rules = self._extract_markdown_section(body, "Core rules")
         lines = [
             f"skill: {skill}",
             f"summary: {summary}",
             f"tags: {tags}",
+            f"task_types: {task_types}",
+            f"triggers: {triggers}",
             f"when: {when or 'recover prior conversation context'}",
             f"rules: {rules or 'only trust tool-verified artifacts'}",
         ]
         return "\n".join(lines)
+
+    def _load_skill_raw(self, entry: dict[str, Any]) -> str:
+        path_value = str(entry.get("path") or "").strip()
+        if not path_value:
+            return ""
+        path = Path(path_value)
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            candidates.extend(
+                [
+                    self.workspace / path,
+                    self.source_root / "memory" / path,
+                    self.l3_dir / path,
+                ]
+            )
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                return candidate.read_text(encoding="utf-8")
+            except Exception:
+                return ""
+        return ""
 
     @staticmethod
     def _parse_skill_markdown(raw: str) -> tuple[dict[str, str], str]:
@@ -287,15 +381,42 @@ class MemoryManager:
                 unique.append(block)
         return "\n\n".join(unique) if unique else "(empty)"
 
+    @staticmethod
+    def _to_csv(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return ", ".join(items)
+        return ""
+
+    def _select_global_skill_names(self, query: str) -> list[str]:
+        lowered = (query or "").lower()
+        task_type = self.selector.classify_task(query)
+        selected: list[str] = []
+        for entry in self.skill_manifest:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            task_types = [str(t).strip().lower() for t in entry.get("task_types", []) if str(t).strip()]
+            if task_types and task_type not in task_types and "*" not in task_types:
+                continue
+            triggers = [str(t).strip().lower() for t in entry.get("triggers", []) if str(t).strip()]
+            if triggers and not any(token in lowered for token in triggers):
+                continue
+            selected.append(name)
+        if self.should_inject_session_recall(query) and "session_memory_recall" not in selected:
+            selected.append("session_memory_recall")
+        return selected
+
     def _build_relevant_skills(self, session_id: str, query: str) -> str:
         session_skills = self.query_memory(session_id, query, layers=["L3"])
-        global_skills = "(empty)"
-        if self.should_inject_session_recall(query):
-            global_skills = self.query_memory(
-                self.SKILL_INDEX_SESSION_ID,
-                "session_memory_recall",
-                layers=["L3"],
-            )
+        global_blocks: list[str] = []
+        for skill_name in self._select_global_skill_names(query):
+            block = self.query_memory(self.SKILL_INDEX_SESSION_ID, skill_name, layers=["L3"])
+            if block != "(empty)":
+                global_blocks.append(block)
+        global_skills = self._merge_skill_blocks(*global_blocks)
         return self._merge_skill_blocks(session_skills, global_skills)
 
     def query_memory(self, session_id: str, query: str, layers: list[str]) -> str:
@@ -308,17 +429,20 @@ class MemoryManager:
         return "\n".join(rows) if rows else "(empty)"
 
     def build_memory_header(self, session_id: str, query: str) -> str:
-        l0_excerpt = "\n".join(self.l0_rules.splitlines()[:12]).strip()
-        l1_index = self.load_l1_index()
-        relevant_skills = self._build_relevant_skills(session_id, query)
-        session_recall_hints = self.query_memory(session_id, query, layers=["L4"])
-        relevant_memory = self.query_memory(session_id, query, layers=["L1", "L2"])
+        selected = self.selector.select(
+            user_text=query,
+            l0="\n".join(self.l0_rules.splitlines()[:12]).strip(),
+            l1=self.load_l1_index(),
+            l2=self.query_memory(session_id, query, layers=["L2"]),
+            l3=self._build_relevant_skills(session_id, query),
+            l4=self.query_memory(session_id, query, layers=["L4"]),
+        )
         return (
-            f"{l0_excerpt}\n\n"
-            f"<memory_index>\n{l1_index}\n</memory_index>\n\n"
-            f"<relevant_skills>\n{relevant_skills}\n</relevant_skills>\n\n"
-            f"<session_recall_hints>\n{session_recall_hints}\n</session_recall_hints>\n\n"
-            f"<relevant_memory>\n{relevant_memory}\n</relevant_memory>"
+            f"{selected.l0}\n\n"
+            f"<memory_index>\n{selected.l1}\n</memory_index>\n\n"
+            f"<relevant_skills>\n{selected.l3}\n</relevant_skills>\n\n"
+            f"<session_recall_hints>\n{selected.l4}\n</session_recall_hints>\n\n"
+            f"<relevant_memory>\n{selected.l2}\n</relevant_memory>"
         )
 
     def build_memory_system_prompt(self, session_id: str, query: str) -> str:
@@ -413,39 +537,182 @@ class MemoryManager:
         if not self.enabled:
             return
         self.archive_session(session_id=session_id, messages=messages)
-        if self._looks_successful(final_result):
-            summary = self._build_structured_l2_summary(messages=messages, final_result=final_result)
-            self.upsert_memory(
-                layer="L2",
-                session_id=session_id,
-                text=summary,
-                evidence="tool:success",
-                source="final_result",
+        candidates = self._extract_memory_candidates(
+            session_id=session_id,
+            messages=messages,
+            final_result=final_result,
+        )
+        self._persist_candidates(candidates)
+        self._commit_candidates(candidates)
+
+    def _extract_memory_candidates(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        final_result: str,
+    ) -> list[MemoryCandidate]:
+        now = datetime.now(timezone.utc).isoformat()
+        candidates: list[MemoryCandidate] = []
+
+        session_summary = self._build_session_summary(messages=messages, final_result=final_result)
+        if session_summary:
+            candidates.append(
+                MemoryCandidate(
+                    session_id=session_id,
+                    suggested_layer="L4",
+                    kind="session_summary",
+                    content=session_summary,
+                    evidence="tool:archive_success",
+                    source="session_summary",
+                    verified=False,
+                    created_at=now,
+                )
             )
-            self.upsert_memory(
-                layer="L1",
-                session_id=session_id,
-                text="recent_success -> L2",
-                evidence="tool:success",
-                source="l1_pointer",
+
+        if not self._looks_successful(final_result):
+            return candidates
+
+        for fact in self._extract_l2_fact_candidates(messages=messages, final_result=final_result):
+            candidates.append(
+                MemoryCandidate(
+                    session_id=session_id,
+                    suggested_layer="L2",
+                    kind="fact_candidate",
+                    content=fact,
+                    evidence="tool:success",
+                    source="stable_fact",
+                    verified=True,
+                    confidence=0.8,
+                    created_at=now,
+                )
             )
+
+        takeaway = self._build_l3_task_takeaways(messages=messages, final_result=final_result)
+        if takeaway:
+            candidates.append(
+                MemoryCandidate(
+                    session_id=session_id,
+                    suggested_layer="L3",
+                    kind="task_takeaway",
+                    content=takeaway,
+                    evidence="tool:success",
+                    source="task_takeaway",
+                    verified=True,
+                    confidence=0.7,
+                    created_at=now,
+                )
+            )
+
+        pointer = self._build_l1_pointer()
+        if pointer:
+            candidates.append(
+                MemoryCandidate(
+                    session_id=session_id,
+                    suggested_layer="L1",
+                    kind="index_pointer",
+                    content=pointer,
+                    evidence="tool:success",
+                    source="l1_pointer",
+                    verified=True,
+                    confidence=0.6,
+                    created_at=now,
+                )
+            )
+        return candidates
+
+    def _persist_candidates(self, candidates: list[MemoryCandidate]) -> None:
+        if not candidates:
+            return
+        with self.candidates_archive_path.open("a", encoding="utf-8") as handle:
+            for row in candidates:
+                handle.write(f"{json.dumps(asdict(row), ensure_ascii=False)}\n")
+
+    def _commit_candidates(self, candidates: list[MemoryCandidate]) -> None:
+        for row in candidates:
+            if not self._candidate_allowed(row):
+                continue
+            self.upsert_memory(
+                layer=row.suggested_layer,
+                session_id=row.session_id,
+                text=row.content,
+                evidence=row.evidence,
+                source=row.source,
+            )
+
+    def _candidate_allowed(self, row: MemoryCandidate) -> bool:
+        layer = row.suggested_layer.upper()
+        content = row.content.strip()
+        evidence = row.evidence.strip()
+        verified = row.verified
+        if not content:
+            return False
+        if layer in {"L1", "L2", "L3"}:
+            if not verified:
+                return False
+            return self.validate_memory_write(content, evidence)
+        if layer == "L4":
+            return True
+        return False
 
     @staticmethod
     def _looks_successful(final_result: str) -> bool:
-        hints = ("success", "done", "completed", "pass")
         lowered = final_result.lower()
-        return any(token in lowered for token in hints)
+        if any(token in lowered for token in SUCCESS_NEGATIVE_HINTS):
+            return False
+        return any(token in lowered for token in SUCCESS_POSITIVE_HINTS)
 
-    def _build_structured_l2_summary(self, messages: list[dict[str, Any]], final_result: str) -> str:
+    def _build_session_summary(self, messages: list[dict[str, Any]], final_result: str) -> str:
         latest_user = self._extract_latest_message(messages, "user")
         latest_assistant = self._extract_latest_message(messages, "assistant")
         parts = [
-            "Conversation summary:",
-            f"- User goal: {latest_user[:160] or 'unknown'}",
-            f"- Agent actions: {latest_assistant[:160] or 'unknown'}",
-            f"- Final result: {final_result[:160] or 'unknown'}",
+            f"[USER] {latest_user[:200] or 'unknown'}",
+            f"[Agent] {latest_assistant[:200] or 'unknown'}",
+            f"[RESULT] {final_result[:200] or 'unknown'}",
         ]
         return "\n".join(parts)
+
+    def _extract_l2_fact_candidates(self, messages: list[dict[str, Any]], final_result: str) -> list[str]:
+        pool = [final_result, self._extract_latest_message(messages, "assistant")]
+        facts: list[str] = []
+        patterns = [
+            r"(?:file|path)\s+([A-Za-z0-9_./\\-]+)",
+            r"(?:port|timeout|retries)\s*(?:is|=)\s*([A-Za-z0-9_.-]+)",
+            r"(?:config|env)\s*[:=]\s*([A-Za-z0-9_./\\-]+)",
+        ]
+        for text in pool:
+            lowered = text.lower()
+            if not lowered:
+                continue
+            for pattern in patterns:
+                for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                    value = match.strip()
+                    if not value:
+                        continue
+                    facts.append(f"stable_fact: {value}")
+            if "test passed" in lowered or "tests passed" in lowered:
+                facts.append("stable_fact: tests passed")
+        unique: list[str] = []
+        for row in facts:
+            if row not in unique:
+                unique.append(row)
+        return unique
+
+    def _build_l3_task_takeaways(self, messages: list[dict[str, Any]], final_result: str) -> str:
+        latest_user = self._extract_latest_message(messages, "user")
+        latest_assistant = self._extract_latest_message(messages, "assistant")
+        if not latest_user and not latest_assistant and not final_result:
+            return ""
+        return (
+            "task_takeaway: "
+            f"goal={latest_user[:80] or 'unknown'}; "
+            f"action={latest_assistant[:80] or 'unknown'}; "
+            f"result={final_result[:80] or 'unknown'}"
+        )
+
+    @staticmethod
+    def _build_l1_pointer() -> str:
+        return "memory_write_rules -> L2; session_recall -> L4; task_takeaway -> L3"
 
     @staticmethod
     def _extract_latest_message(messages: list[dict[str, Any]], role: str) -> str:

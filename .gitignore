@@ -1,0 +1,13 @@
+# env config
+.env
+.env.*
+!.env.example
+
+# local memory files
+memory/global_mem.txt
+memory/global_mem_insight.txt
+
+# planning docs
+plan.md
+plan2.md
+plans/
