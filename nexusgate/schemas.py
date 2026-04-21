@@ -32,6 +32,18 @@ class ChatCompletionRequest(BaseModel):
         return payload
 
 
+class NormalizedRequest(BaseModel):
+    api_style: str
+    session_id: str
+    user_text: str
+    messages: list[ChatMessage]
+    requested_model: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    stream: bool = False
+    tool_required: bool = False
+    response_mode: str = "chat"
+
+
 class HealthResponse(BaseModel):
     status: str
     app: str

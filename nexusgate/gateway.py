@@ -4,6 +4,8 @@ from typing import Any
 
 from litellm import completion
 
+from nexusgate.router import ProviderRouter
+
 
 class LiteLLMGateway:
     def __init__(
@@ -47,3 +49,27 @@ class LiteLLMGateway:
         kwargs["api_base"] = self.llmapi_base_url
         kwargs["api_key"] = self.llmapi_api_key
         return kwargs
+
+
+def route(
+    normalized_req: Any,
+    defaults: dict[str, Any],
+    *,
+    memory_pack_size: int = 0,
+    router: ProviderRouter | None = None,
+) -> dict[str, Any]:
+    provider_router = router or ProviderRouter()
+    decision = provider_router.route(
+        normalized_req=normalized_req,
+        memory_pack_size=memory_pack_size,
+        defaults=defaults,
+    )
+    return {
+        "provider": decision.provider,
+        "model": decision.model,
+        "api_base": decision.api_base,
+        "api_key": decision.api_key,
+        "render_mode": decision.render_mode,
+        "routing_reason": decision.routing_reason,
+        "fallbacks": decision.fallbacks,
+    }

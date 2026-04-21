@@ -12,9 +12,12 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, st
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from nexusgate.config import settings
+from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
-from nexusgate.schemas import ChatCompletionRequest
+from nexusgate.router import ProviderRouter
+from nexusgate.safety import apply_hallucination_guard, supported_claim_check
+from nexusgate.schemas import ChatCompletionRequest, NormalizedRequest
 
 
 L0_META_RULES = (
@@ -56,6 +59,7 @@ def create_app() -> FastAPI:
         top_k=settings.memory_top_k,
         use_chroma=settings.memory_use_chroma,
     )
+    provider_router = ProviderRouter()
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -75,30 +79,80 @@ def create_app() -> FastAPI:
             "sync_errors": sync_state.errors,
         }
 
-    def _run_completion(req: ChatCompletionRequest, data: dict[str, Any], background_tasks: BackgroundTasks) -> Any:
-        session_id = _resolve_session_id(req)
-        user_query = _extract_latest_user_query(req.messages)
+    def _run_completion(
+        req: ChatCompletionRequest,
+        data: dict[str, Any],
+        normalized_req: NormalizedRequest,
+        background_tasks: BackgroundTasks,
+    ) -> Any:
+        session_id = normalized_req.session_id
+        user_query = normalized_req.user_text
 
-        memory_context = memory.get_memory(session_id, user_query)
-        enhanced_messages = [
-            {"role": "system", "content": L0_META_RULES},
-            {"role": "system", "content": f"<nexus_context>\n{memory_context}\n</nexus_context>"},
-            *[message.model_dump(exclude_none=True) for message in req.messages],
-        ]
+        memory_pack = memory.build_memory_pack(session_id, user_query)
+        decision = route(
+            normalized_req=normalized_req,
+            defaults={
+                "model": req.model or settings.target_provider,
+                "api_base": settings.effective_target_base_url,
+                "api_key": settings.effective_target_api_key,
+            },
+            memory_pack_size=_estimate_pack_size(memory_pack),
+            router=provider_router,
+        )
+        enriched_messages, memory_pack = memory.enrich_from_normalized_request(
+            normalized_req=normalized_req,
+            provider_style=str(decision.get("render_mode") or "openai"),
+            memory_pack=memory_pack,
+        )
+        memory_context = memory.render_memory_for_provider(
+            pack=memory_pack,
+            provider_style=str(decision.get("render_mode") or "openai"),
+        )
+        enhanced_messages = [{"role": "system", "content": L0_META_RULES}, *enriched_messages]
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
-
-        try:
-            response = litellm.completion(**kwargs)
-        except Exception as exc:
+        if decision.get("api_base"):
+            kwargs["api_base"] = decision["api_base"]
+        if decision.get("api_key"):
+            kwargs["api_key"] = decision["api_key"]
+        attempt_models = [str(decision["model"])] + [str(item) for item in (decision.get("fallbacks") or [])]
+        deduped_models: list[str] = []
+        for model in attempt_models:
+            if model and model not in deduped_models:
+                deduped_models.append(model)
+        response = None
+        last_error: Exception | None = None
+        for model in deduped_models:
+            kwargs["model"] = model
+            started = time.perf_counter()
+            try:
+                response = litellm.completion(**kwargs)
+                provider_router.health.record_success(
+                    provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai")),
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                )
+                break
+            except Exception as exc:
+                provider_router.health.record_failure(
+                    provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai"))
+                )
+                last_error = exc
+        if response is None:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Upstream completion failed: {exc}",
-            ) from exc
+                detail=f"Upstream completion failed after fallbacks: {last_error}",
+            ) from last_error
 
-        raw_messages = [message.model_dump(exclude_none=True) for message in req.messages]
+        raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
         background_tasks.add_task(memory.distill_to_l4, session_id, raw_messages)
-        return response, req
+        safety_ctx = {
+            "session_id": session_id,
+            "memory_context": memory_context,
+            "user_text": user_query,
+            "metadata": normalized_req.metadata or {},
+            "citations": memory_pack.citations,
+        }
+        return response, req, safety_ctx
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
@@ -116,15 +170,18 @@ def create_app() -> FastAPI:
         _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
         data = await request.json()
         req = ChatCompletionRequest(**data)
-        response, req = _run_completion(req=req, data=data, background_tasks=background_tasks)
+        normalized_req = _normalize_chat_request(data=data, req=req)
+        response, req, safety_ctx = _run_completion(
+            req=req,
+            data=data,
+            normalized_req=normalized_req,
+            background_tasks=background_tasks,
+        )
 
         if req.stream:
             return StreamingResponse(response, media_type="text/event-stream")
-        if hasattr(response, "model_dump"):
-            return response.model_dump()
-        if isinstance(response, dict):
-            return response
-        return dict(response)
+        payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
+        return _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
 
     @app.post("/v1/responses")
     async def responses_api(
@@ -143,8 +200,9 @@ def create_app() -> FastAPI:
         data = await request.json()
         openai_data = _responses_request_to_openai(data)
         req = ChatCompletionRequest(**openai_data)
-        session_id = _resolve_session_id(req)
-        raw_messages = [message.model_dump(exclude_none=True) for message in req.messages]
+        normalized_req = _normalize_responses_request(data=data, req=req)
+        session_id = normalized_req.session_id
+        raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
 
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
@@ -162,7 +220,12 @@ def create_app() -> FastAPI:
             )
             return passthrough
 
-        response, req = _run_completion(req=req, data=openai_data, background_tasks=background_tasks)
+        response, req, safety_ctx = _run_completion(
+            req=req,
+            data=openai_data,
+            normalized_req=normalized_req,
+            background_tasks=background_tasks,
+        )
 
         if req.stream:
             return StreamingResponse(
@@ -171,13 +234,19 @@ def create_app() -> FastAPI:
             )
 
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
+        payload = _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
         background_tasks.add_task(
             memory.start_memory_update,
             session_id,
             raw_messages,
             _responses_response_output_text(payload),
         )
-        return _responses_response_from_openai(payload=payload, model=req.model or settings.target_provider)
+        return _responses_response_from_openai(
+            payload=payload,
+            model=req.model or settings.target_provider,
+            citations=safety_ctx.get("citations") or [],
+            grounding=safety_ctx.get("grounding") or {},
+        )
 
     @app.post("/v1/messages")
     async def anthropic_messages(
@@ -197,7 +266,13 @@ def create_app() -> FastAPI:
         data = await request.json()
         openai_data = _anthropic_request_to_openai(data)
         req = ChatCompletionRequest(**openai_data)
-        response, req = _run_completion(req=req, data=openai_data, background_tasks=background_tasks)
+        normalized_req = _normalize_messages_request(data=data, req=req)
+        response, req, safety_ctx = _run_completion(
+            req=req,
+            data=openai_data,
+            normalized_req=normalized_req,
+            background_tasks=background_tasks,
+        )
 
         if req.stream:
             return StreamingResponse(
@@ -206,7 +281,13 @@ def create_app() -> FastAPI:
             )
 
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
-        return _anthropic_response_from_openai(payload=payload, model=req.model or settings.target_provider)
+        payload = _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
+        return _anthropic_response_from_openai(
+            payload=payload,
+            model=req.model or settings.target_provider,
+            citations=safety_ctx.get("citations") or [],
+            grounding=safety_ctx.get("grounding") or {},
+        )
 
     return app
 
@@ -247,11 +328,55 @@ def _extract_auth_token(authorization: str | None) -> str | None:
 
 
 def _resolve_session_id(req: ChatCompletionRequest) -> str:
-    if req.session_id:
+    if req.session_id and req.session_id != "global":
         return req.session_id
     if req.metadata and req.metadata.get("session_id"):
         return str(req.metadata["session_id"])
+    if req.session_id:
+        return req.session_id
     return req.user or "global"
+
+
+def _normalize_chat_request(data: dict[str, Any], req: ChatCompletionRequest) -> NormalizedRequest:
+    return NormalizedRequest(
+        api_style="chat_completions",
+        session_id=_resolve_session_id(req),
+        user_text=_extract_latest_user_query(req.messages),
+        messages=req.messages,
+        requested_model=req.model or "auto",
+        metadata=req.metadata or {},
+        stream=bool(req.stream),
+        tool_required=bool(data.get("tools")),
+        response_mode="chat",
+    )
+
+
+def _normalize_responses_request(data: dict[str, Any], req: ChatCompletionRequest) -> NormalizedRequest:
+    return NormalizedRequest(
+        api_style="responses",
+        session_id=_resolve_session_id(req),
+        user_text=_extract_latest_user_query(req.messages),
+        messages=req.messages,
+        requested_model=req.model or "auto",
+        metadata=req.metadata or {},
+        stream=bool(req.stream),
+        tool_required=bool(data.get("tools")),
+        response_mode="responses",
+    )
+
+
+def _normalize_messages_request(data: dict[str, Any], req: ChatCompletionRequest) -> NormalizedRequest:
+    return NormalizedRequest(
+        api_style="messages",
+        session_id=_resolve_session_id(req),
+        user_text=_extract_latest_user_query(req.messages),
+        messages=req.messages,
+        requested_model=req.model or "auto",
+        metadata=req.metadata or {},
+        stream=bool(req.stream),
+        tool_required=bool(data.get("tools")),
+        response_mode="messages",
+    )
 
 
 def _extract_latest_user_query(messages: list[Any]) -> str:
@@ -262,6 +387,26 @@ def _extract_latest_user_query(messages: list[Any]) -> str:
             return message.content
         return json.dumps(message.content, ensure_ascii=False)
     return ""
+
+
+def _estimate_pack_size(pack: Any) -> int:
+    parts = [
+        str(getattr(pack, "l0", "")),
+        str(getattr(pack, "l1", "")),
+        str(getattr(pack, "l2", "")),
+        str(getattr(pack, "l3", "")),
+        str(getattr(pack, "l4", "")),
+    ]
+    return sum(len(part) for part in parts)
+
+
+def _provider_from_model(model: str, fallback: str = "openai") -> str:
+    lowered = (model or "").lower()
+    if "claude" in lowered or lowered.startswith("anthropic/"):
+        return "anthropic"
+    if lowered.startswith("openai/") or lowered.startswith("gpt-"):
+        return "openai"
+    return fallback
 
 
 def _message_content_text(message: dict[str, Any]) -> str:
@@ -397,7 +542,12 @@ def _content_block_to_text(block: Any) -> str:
     return str(block)
 
 
-def _anthropic_response_from_openai(payload: dict[str, Any], model: str) -> dict[str, Any]:
+def _anthropic_response_from_openai(
+    payload: dict[str, Any],
+    model: str,
+    citations: list[dict[str, Any]] | None = None,
+    grounding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     text = _extract_openai_text(payload)
     usage = payload.get("usage") or {}
     input_tokens = int(usage.get("prompt_tokens") or 0)
@@ -414,6 +564,8 @@ def _anthropic_response_from_openai(payload: dict[str, Any], model: str) -> dict
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
         },
+        "citations": citations or [],
+        "grounding": grounding or {},
     }
 
 
@@ -436,7 +588,46 @@ def _extract_openai_text(payload: dict[str, Any]) -> str:
     return str(content)
 
 
-def _responses_response_from_openai(payload: dict[str, Any], model: str) -> dict[str, Any]:
+def _apply_grounding_to_openai_payload(payload: dict[str, Any], safety_ctx: dict[str, Any]) -> dict[str, Any]:
+    text = _extract_openai_text(payload)
+    source_blobs = [
+        str(safety_ctx.get("user_text") or ""),
+        str(safety_ctx.get("memory_context") or ""),
+    ]
+    check = supported_claim_check(answer_text=text, sources=source_blobs)
+    strict = _is_high_risk_metadata(safety_ctx.get("metadata") or {})
+    grounded_text = apply_hallucination_guard(answer_text=text, check=check, strict=strict)
+    safety_ctx["grounding"] = check
+    if grounded_text == text:
+        return payload
+    patched = dict(payload)
+    choices = patched.get("choices") or []
+    if not choices:
+        return patched
+    first = dict(choices[0])
+    message = dict(first.get("message") or {})
+    message["content"] = grounded_text
+    first["message"] = message
+    choices = list(choices)
+    choices[0] = first
+    patched["choices"] = choices
+    return patched
+
+
+def _is_high_risk_metadata(metadata: dict[str, Any]) -> bool:
+    risk_level = str(metadata.get("risk_level") or "").lower()
+    if risk_level in {"high", "critical"}:
+        return True
+    task_type = str(metadata.get("task_type") or "").lower()
+    return task_type in {"debug", "compliance", "medical", "legal", "finance"}
+
+
+def _responses_response_from_openai(
+    payload: dict[str, Any],
+    model: str,
+    citations: list[dict[str, Any]] | None = None,
+    grounding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     text = _extract_openai_text(payload)
     usage = payload.get("usage") or {}
     input_tokens = int(usage.get("prompt_tokens") or 0)
@@ -470,6 +661,8 @@ def _responses_response_from_openai(payload: dict[str, Any], model: str) -> dict
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
         },
+        "citations": citations or [],
+        "grounding": grounding or {},
     }
 
 

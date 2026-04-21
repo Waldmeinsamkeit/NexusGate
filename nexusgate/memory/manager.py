@@ -8,9 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nexusgate.memory.models import MemoryCandidate
+from nexusgate.memory.models import MemoryCandidate, MemoryPack
 from nexusgate.memory.policies import SUCCESS_NEGATIVE_HINTS, SUCCESS_POSITIVE_HINTS
+from nexusgate.memory.schema import MemoryItem as StructuredMemoryItem
+from nexusgate.memory.schema import MemoryScope, MemoryType
 from nexusgate.memory.selector import MemorySelector
+from nexusgate.memory.write_policy import MemoryWritePolicy
 
 try:
     import chromadb
@@ -130,9 +133,12 @@ class MemoryManager:
         self.candidates_archive_path = self.candidates_dir / "candidates.jsonl"
         self.candidates_state_path = self.candidates_dir / "candidate_states.json"
         self.l4_archive_path = self.l4_dir / "archive.jsonl"
+        self.structured_memory_path = self.workspace / "structured_memory.jsonl"
         self.sop_path = self.workspace / "memory_management_sop.md"
         self.l1_path = self.workspace / "global_mem_insight.txt"
         self.l2_path = self.workspace / "global_mem.txt"
+        self.write_policy = MemoryWritePolicy()
+        self.structured_items: list[StructuredMemoryItem] = []
         self._bootstrap_files()
         self.l0_rules = self.load_l0_sop()
         self.selector = MemorySelector()
@@ -143,6 +149,7 @@ class MemoryManager:
             use_chroma=use_chroma,
         )
         self._hydrate_l4_from_file()
+        self._load_structured_items()
         self._index_l3_skills()
 
     def _bootstrap_files(self) -> None:
@@ -420,16 +427,89 @@ class MemoryManager:
         global_skills = self._merge_skill_blocks(*global_blocks)
         return self._merge_skill_blocks(session_skills, global_skills)
 
+    def _load_structured_items(self) -> None:
+        if not self.structured_memory_path.exists():
+            return
+        rows: list[StructuredMemoryItem] = []
+        try:
+            lines = self.structured_memory_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                rows.append(StructuredMemoryItem(**raw))
+            except Exception:
+                continue
+        self.structured_items = rows
+
+    def _append_structured_item(self, candidate: MemoryCandidate) -> None:
+        item = StructuredMemoryItem(
+            memory_id=candidate.candidate_id or self._candidate_id(candidate),
+            layer=candidate.suggested_layer.upper(),
+            memory_type=candidate.memory_type or candidate.kind or "unknown",
+            scope=candidate.scope or MemoryScope.SESSION,
+            content=candidate.content,
+            evidence=candidate.evidence,
+            evidence_ref=candidate.evidence_ref,
+            verified=candidate.verified,
+            confidence=candidate.confidence,
+            dedupe_key=candidate.dedupe_key or self._default_dedupe_key(candidate.content),
+            session_id=candidate.session_id,
+            source=candidate.source,
+        )
+        self.structured_items = [row for row in self.structured_items if row.memory_id != item.memory_id]
+        self.structured_items.append(item)
+        with self.structured_memory_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{json.dumps(asdict(item), ensure_ascii=False)}\n")
+
+    @staticmethod
+    def _default_dedupe_key(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", text.lower().strip())
+        return re.sub(r"[^a-z0-9\u4e00-\u9fff/._ -]+", "", normalized)
+
+    def _query_structured_memory(self, session_id: str, query: str, layers: list[str], limit: int) -> list[str]:
+        if not self.structured_items:
+            return []
+        lowered = (query or "").lower().strip()
+        candidates: list[tuple[float, StructuredMemoryItem]] = []
+        for row in self.structured_items:
+            if row.layer not in layers:
+                continue
+            if row.scope == MemoryScope.SESSION and row.session_id != session_id:
+                continue
+            score = row.confidence
+            if lowered and lowered in row.content.lower():
+                score += 2.0
+            if row.verified:
+                score += 1.0
+            candidates.append((score, row))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = [row for _, row in candidates[:limit]]
+        return [f"[{row.layer}] {row.content}" for row in selected]
+
     def query_memory(self, session_id: str, query: str, layers: list[str]) -> str:
-        rows = self.store.query(
+        rows = self._query_structured_memory(
+            session_id=session_id,
+            query=query,
+            layers=layers,
+            limit=self.top_k,
+        )
+        legacy_rows = self.store.query(
             query_text=query,
             layers=layers,
             session_id=session_id,
             limit=self.top_k,
         )
-        return "\n".join(rows) if rows else "(empty)"
+        ordered: list[str] = []
+        for row in [*rows, *legacy_rows]:
+            if row not in ordered:
+                ordered.append(row)
+        return "\n".join(ordered) if ordered else "(empty)"
 
-    def build_memory_header(self, session_id: str, query: str) -> str:
+    def build_memory_pack(self, session_id: str, query: str) -> MemoryPack:
         selected = self.selector.select(
             user_text=query,
             l0="\n".join(self.l0_rules.splitlines()[:12]).strip(),
@@ -438,13 +518,73 @@ class MemoryManager:
             l3=self._build_relevant_skills(session_id, query),
             l4=self.query_memory(session_id, query, layers=["L4"]),
         )
-        return (
-            f"{selected.l0}\n\n"
-            f"<memory_index>\n{selected.l1}\n</memory_index>\n\n"
-            f"<relevant_skills>\n{selected.l3}\n</relevant_skills>\n\n"
-            f"<session_recall_hints>\n{selected.l4}\n</session_recall_hints>\n\n"
-            f"<relevant_memory>\n{selected.l2}\n</relevant_memory>"
+        citations = self._build_pack_citations(
+            session_id=session_id,
+            l1=selected.l1,
+            l2=selected.l2,
+            l3=selected.l3,
+            l4=selected.l4,
         )
+        return MemoryPack(
+            task_type=selected.task_type,
+            budget=self.selector.budget_for_task(selected.task_type),
+            l0=selected.l0,
+            l1=selected.l1,
+            l2=selected.l2,
+            l3=selected.l3,
+            l4=selected.l4,
+            citations=citations,
+        )
+
+    @staticmethod
+    def _build_pack_citations(
+        *,
+        session_id: str,
+        l1: str,
+        l2: str,
+        l3: str,
+        l4: str,
+        max_items: int = 6,
+    ) -> list[dict[str, str]]:
+        citations: list[dict[str, str]] = []
+        blocks = [("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4)]
+        for layer, text in blocks:
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                content = line.strip()
+                if not content or content == "(empty)":
+                    continue
+                citations.append(
+                    {
+                        "memory_ref": f"{session_id}:{layer}:{line_no}",
+                        "snippet": content[:180],
+                        "source_type": "memory",
+                    }
+                )
+                if len(citations) >= max_items:
+                    return citations
+        return citations
+
+    @staticmethod
+    def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
+        if provider_style == "anthropic_messages":
+            return (
+                f"{pack.l0}\n\n"
+                f"<anthropic_memory_index>\n{pack.l1}\n</anthropic_memory_index>\n\n"
+                f"<anthropic_relevant_skills>\n{pack.l3}\n</anthropic_relevant_skills>\n\n"
+                f"<anthropic_session_recall_hints>\n{pack.l4}\n</anthropic_session_recall_hints>\n\n"
+                f"<anthropic_relevant_memory>\n{pack.l2}\n</anthropic_relevant_memory>"
+            )
+        return (
+            f"{pack.l0}\n\n"
+            f"<memory_index>\n{pack.l1}\n</memory_index>\n\n"
+            f"<relevant_skills>\n{pack.l3}\n</relevant_skills>\n\n"
+            f"<session_recall_hints>\n{pack.l4}\n</session_recall_hints>\n\n"
+            f"<relevant_memory>\n{pack.l2}\n</relevant_memory>"
+        )
+
+    def build_memory_header(self, session_id: str, query: str) -> str:
+        pack = self.build_memory_pack(session_id=session_id, query=query)
+        return self.render_memory_for_provider(pack=pack, provider_style="openai")
 
     def build_memory_system_prompt(self, session_id: str, query: str) -> str:
         return self.build_memory_header(session_id=session_id, query=query)
@@ -452,14 +592,65 @@ class MemoryManager:
     def get_memory(self, session_id: str, query: str) -> str:
         return self.build_memory_header(session_id=session_id, query=query)
 
-    def enrich_messages(self, messages: list[dict[str, Any]], metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    def enrich_from_normalized_request(
+        self,
+        normalized_req: Any,
+        provider_style: str = "openai",
+        memory_pack: MemoryPack | None = None,
+    ) -> tuple[list[dict[str, Any]], MemoryPack]:
+        if not self.enabled:
+            normalized_messages = self._normalize_message_rows(getattr(normalized_req, "messages", []))
+            return normalized_messages, MemoryPack(
+                task_type="chat",
+                budget={},
+                l0="",
+                l1="(empty)",
+                l2="(empty)",
+                l3="(empty)",
+                l4="(empty)",
+                citations=[],
+            )
+        session_id = str(getattr(normalized_req, "session_id", "") or "default")
+        normalized_messages = self._normalize_message_rows(getattr(normalized_req, "messages", []))
+        query = str(getattr(normalized_req, "user_text", "") or "").strip() or self._extract_latest_user_query(
+            normalized_messages
+        )
+        resolved_pack = memory_pack or self.build_memory_pack(session_id=session_id, query=query)
+        memory_header = self.render_memory_for_provider(resolved_pack, provider_style=provider_style)
+        memory_msg = {"role": "system", "content": f"<nexus_context>\n{memory_header}\n</nexus_context>"}
+        return [memory_msg, *normalized_messages], resolved_pack
+
+    def enrich_messages(
+        self,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None,
+        *,
+        session_id: str | None = None,
+        query: str | None = None,
+    ) -> list[dict[str, Any]]:
         if not self.enabled:
             return messages
-        session_id = (metadata or {}).get("session_id", "default")
-        query = (metadata or {}).get("query") or self._extract_latest_user_query(messages)
-        memory_header = self.build_memory_system_prompt(session_id=session_id, query=query)
+        resolved_session_id = session_id or str((metadata or {}).get("session_id") or "default")
+        resolved_query = query or (metadata or {}).get("query") or self._extract_latest_user_query(messages)
+        memory_header = self.build_memory_system_prompt(
+            session_id=resolved_session_id,
+            query=resolved_query,
+        )
         memory_msg = {"role": "system", "content": f"<nexus_context>\n{memory_header}\n</nexus_context>"}
         return [memory_msg, *messages]
+
+    @staticmethod
+    def _normalize_message_rows(messages: list[Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for message in messages:
+            if hasattr(message, "model_dump"):
+                rows.append(message.model_dump(exclude_none=True))
+                continue
+            if isinstance(message, dict):
+                rows.append(dict(message))
+                continue
+            rows.append({"role": "user", "content": str(message)})
+        return rows
 
     @staticmethod
     def _extract_latest_user_query(messages: list[dict[str, Any]]) -> str:
@@ -564,10 +755,14 @@ class MemoryManager:
                     session_id=session_id,
                     suggested_layer="L4",
                     kind="session_summary",
+                    memory_type=MemoryType.SESSION_SUMMARY,
+                    scope=MemoryScope.SESSION,
                     content=session_summary,
                     evidence="tool:archive_success",
+                    evidence_ref=f"session:{session_id}",
                     source="session_summary",
                     verified=False,
+                    dedupe_key=self._default_dedupe_key(session_summary),
                     created_at=now,
                 )
             )
@@ -581,10 +776,14 @@ class MemoryManager:
                     session_id=session_id,
                     suggested_layer="L2",
                     kind="fact_candidate",
-                    content=fact,
+                    memory_type=fact["memory_type"],
+                    scope=MemoryScope.SESSION,
+                    content=fact["content"],
                     evidence="tool:success",
+                    evidence_ref=fact["evidence_ref"],
                     source="stable_fact",
                     verified=True,
+                    dedupe_key=fact["dedupe_key"],
                     confidence=0.8,
                     created_at=now,
                 )
@@ -597,10 +796,14 @@ class MemoryManager:
                     session_id=session_id,
                     suggested_layer="L3",
                     kind="task_takeaway",
-                    content=takeaway,
+                    memory_type=takeaway["memory_type"],
+                    scope=MemoryScope.SESSION,
+                    content=takeaway["content"],
                     evidence="tool:success",
+                    evidence_ref=takeaway["evidence_ref"],
                     source="task_takeaway",
                     verified=True,
+                    dedupe_key=takeaway["dedupe_key"],
                     confidence=0.7,
                     created_at=now,
                 )
@@ -613,10 +816,14 @@ class MemoryManager:
                     session_id=session_id,
                     suggested_layer="L1",
                     kind="index_pointer",
+                    memory_type=MemoryType.INDEX_POINTER,
+                    scope=MemoryScope.GLOBAL,
                     content=pointer,
                     evidence="tool:success",
+                    evidence_ref="policy:memory_write_rules",
                     source="l1_pointer",
                     verified=True,
+                    dedupe_key=self._default_dedupe_key(pointer),
                     confidence=0.6,
                     created_at=now,
                 )
@@ -629,19 +836,46 @@ class MemoryManager:
         states = self._load_candidate_states()
         now = datetime.now(timezone.utc).isoformat()
         pending: list[MemoryCandidate] = []
-        seen_ids: set[str] = set()
+        pending_index: dict[str, int] = {}
+        seen_dedupe: dict[tuple[str, str, str], str] = {}
+        for key, value in states.items():
+            dedupe_key = str(value.get("dedupe_key") or "")
+            layer = str(value.get("suggested_layer") or "").upper()
+            scope = str(value.get("scope") or MemoryScope.SESSION)
+            if not dedupe_key or not layer:
+                continue
+            seen_dedupe[(layer, scope, dedupe_key)] = key
         for row in candidates:
             row.candidate_id = self._candidate_id(row)
-            if row.candidate_id in seen_ids:
+            existing_pending_idx = pending_index.get(row.candidate_id)
+            if existing_pending_idx is not None:
+                if pending[existing_pending_idx].confidence >= row.confidence:
+                    continue
+                if not row.created_at:
+                    row.created_at = now
+                row.dedupe_key = row.dedupe_key or self._default_dedupe_key(row.content)
+                row.status = "pending"
+                row.updated_at = now
+                pending[existing_pending_idx] = row
+                states[row.candidate_id] = asdict(row)
                 continue
-            seen_ids.add(row.candidate_id)
-            if row.candidate_id in states:
-                continue
+            dedupe_key = row.dedupe_key or self._default_dedupe_key(row.content)
+            dedupe_slot = (row.suggested_layer.upper(), row.scope or MemoryScope.SESSION, dedupe_key)
+            existing_id = seen_dedupe.get(dedupe_slot)
+            if existing_id:
+                existing = states.get(existing_id, {})
+                existing_conf = float(existing.get("confidence") or 0.0)
+                if existing_conf >= row.confidence:
+                    continue
+                states.pop(existing_id, None)
             if not row.created_at:
                 row.created_at = now
+            row.dedupe_key = dedupe_key
             row.status = "pending"
             row.updated_at = now
             states[row.candidate_id] = asdict(row)
+            seen_dedupe[dedupe_slot] = row.candidate_id
+            pending_index[row.candidate_id] = len(pending)
             pending.append(row)
         self._save_candidate_states(states)
         self._append_candidate_archive(pending)
@@ -668,6 +902,7 @@ class MemoryManager:
                 evidence=row.evidence,
                 source=row.source,
             )
+            self._append_structured_item(row)
             row.status = "committed"
             row.updated_at = now
             states[row.candidate_id] = asdict(row)
@@ -676,27 +911,21 @@ class MemoryManager:
         self._append_candidate_archive(finished)
 
     def _candidate_allowed(self, row: MemoryCandidate) -> bool:
-        layer = row.suggested_layer.upper()
-        content = row.content.strip()
-        evidence = row.evidence.strip()
-        verified = row.verified
-        if not content:
+        if not self.write_policy.validate_candidate(row):
             return False
+        layer = row.suggested_layer.upper()
         if layer in {"L1", "L2", "L3"}:
-            if not verified:
-                return False
-            return self.validate_memory_write(content, evidence)
-        if layer == "L4":
-            return True
-        return False
+            return self.validate_memory_write(row.content.strip(), row.evidence.strip())
+        return layer == "L4"
 
     def _candidate_id(self, row: MemoryCandidate) -> str:
-        normalized = re.sub(r"\s+", " ", row.content.strip().lower())
+        normalized = row.dedupe_key or self._default_dedupe_key(row.content)
         payload = "|".join(
             [
                 row.session_id,
                 row.suggested_layer.upper(),
-                row.kind.strip().lower(),
+                (row.memory_type or row.kind).strip().lower(),
+                (row.scope or MemoryScope.SESSION).strip().lower(),
                 normalized,
             ]
         )
@@ -766,9 +995,9 @@ class MemoryManager:
         ]
         return "\n".join(parts)
 
-    def _extract_l2_fact_candidates(self, messages: list[dict[str, Any]], final_result: str) -> list[str]:
+    def _extract_l2_fact_candidates(self, messages: list[dict[str, Any]], final_result: str) -> list[dict[str, str]]:
         pool = [final_result, self._extract_latest_message(messages, "assistant")]
-        facts: list[str] = []
+        facts: list[dict[str, str]] = []
         patterns = [
             r"(?:file|path)\s+([A-Za-z0-9_./\\-]+)",
             r"(?:port|timeout|retries)\s*(?:is|=)\s*([A-Za-z0-9_.-]+)",
@@ -783,26 +1012,52 @@ class MemoryManager:
                     value = match.strip()
                     if not value:
                         continue
-                    facts.append(f"stable_fact: {value}")
+                    content = f"stable_fact: {value}"
+                    facts.append(
+                        {
+                            "memory_type": MemoryType.STABLE_FACT,
+                            "content": content,
+                            "evidence_ref": f"text_match:{value}",
+                            "dedupe_key": self._default_dedupe_key(content),
+                        }
+                    )
             if "test passed" in lowered or "tests passed" in lowered:
-                facts.append("stable_fact: tests passed")
-        unique: list[str] = []
+                content = "stable_fact: tests passed"
+                facts.append(
+                    {
+                        "memory_type": MemoryType.STABLE_FACT,
+                        "content": content,
+                        "evidence_ref": "result:test_passed",
+                        "dedupe_key": self._default_dedupe_key(content),
+                    }
+                )
+        unique: list[dict[str, str]] = []
+        seen: set[str] = set()
         for row in facts:
-            if row not in unique:
-                unique.append(row)
+            key = row["dedupe_key"]
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
         return unique
 
-    def _build_l3_task_takeaways(self, messages: list[dict[str, Any]], final_result: str) -> str:
+    def _build_l3_task_takeaways(self, messages: list[dict[str, Any]], final_result: str) -> dict[str, str] | None:
         latest_user = self._extract_latest_message(messages, "user")
         latest_assistant = self._extract_latest_message(messages, "assistant")
         if not latest_user and not latest_assistant and not final_result:
-            return ""
-        return (
+            return None
+        content = (
             "task_takeaway: "
             f"goal={latest_user[:80] or 'unknown'}; "
             f"action={latest_assistant[:80] or 'unknown'}; "
             f"result={final_result[:80] or 'unknown'}"
         )
+        return {
+            "memory_type": MemoryType.LESSON,
+            "content": content,
+            "evidence_ref": "result:final_summary",
+            "dedupe_key": self._default_dedupe_key(content),
+        }
 
     @staticmethod
     def _build_l1_pointer() -> str:

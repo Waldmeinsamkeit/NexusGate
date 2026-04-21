@@ -1,4 +1,4 @@
-# NexusGate-Core
+# NexusGate
 
 具备本地记忆能力的 LLM 网关，提供 OpenAI 兼容 API。
 

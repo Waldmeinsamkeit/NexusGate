@@ -12,6 +12,10 @@ class MemoryCandidate:
     verified: bool
     session_id: str
     kind: str = ""
+    memory_type: str = ""
+    scope: str = "session"
+    evidence_ref: str = ""
+    dedupe_key: str = ""
     confidence: float = 0.0
     created_at: str = ""
     candidate_id: str = ""
@@ -48,3 +52,15 @@ class LayerBudgets:
     l2: int = 1200
     l3: int = 1200
     l4: int = 600
+
+
+@dataclass(slots=True)
+class MemoryPack:
+    task_type: str
+    budget: dict[str, int]
+    l0: str
+    l1: str
+    l2: str
+    l3: str
+    l4: str
+    citations: list[dict[str, str]]
