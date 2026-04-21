@@ -14,7 +14,9 @@ class MemoryCandidate:
     kind: str = ""
     memory_type: str = ""
     scope: str = "session"
+    project_id: str = ""
     evidence_ref: str = ""
+    evidence_type: str = ""
     dedupe_key: str = ""
     confidence: float = 0.0
     created_at: str = ""
@@ -22,17 +24,24 @@ class MemoryCandidate:
     status: str = "pending"
     updated_at: str = ""
     rejected_reason: str = ""
+    index_status: str = "pending"
+    turn_range: str = ""
 
 
 @dataclass(slots=True)
-class MemoryItem:
+class ScoredMemory:
     layer: str
     text: str
+    memory_id: str = ""
     evidence: str = ""
     source: str = ""
     verified: bool = False
     score: float = 0.0
     recency: float = 0.0
+    scope: str = ""
+    session_id: str = ""
+    project_id: str = ""
+    updated_at: str = ""
 
 
 @dataclass(slots=True)
@@ -64,3 +73,8 @@ class MemoryPack:
     l3: str
     l4: str
     citations: list[dict[str, str]]
+    selected_ids: list[str]
+
+
+# Backward compatibility alias for existing scoring/selector tests.
+MemoryItem = ScoredMemory

@@ -47,6 +47,34 @@ SUCCESS_NEGATIVE_HINTS = (
 
 EVIDENCE_PRIORITY_HINTS = ("tool:", "shell", "file", "archive", "success", "pass", "ok")
 
+SOURCE_RELIABILITY_WEIGHTS = {
+    "tool:file_read": 1.2,
+    "tool:test_result": 1.4,
+    "tool:runtime_state": 1.3,
+    "session_summary": 0.7,
+    "manual": 0.6,
+}
+
+OPERATIONAL_NOISE_HINTS = (
+    "<environment_context>",
+    "<nexus_context>",
+    "system prompt",
+    "agents.md",
+    "按规则继续",
+    "我先去读",
+    "稍后继续",
+)
+
+VOLATILE_HINTS = (
+    "timestamp",
+    "request id",
+    "trace id",
+    "tmp",
+    "temp",
+    "cursor",
+    "pid",
+)
+
 
 def budget_for_task(task_type: str, base: LayerBudgets) -> dict[str, int]:
     factors = TASK_LAYER_BUDGET_FACTORS.get(task_type, TASK_LAYER_BUDGET_FACTORS["chat"])

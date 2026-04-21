@@ -8,107 +8,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nexusgate.memory.models import MemoryCandidate, MemoryPack
+from nexusgate.memory.events import MemoryEvent, MemoryEventLogger
+from nexusgate.memory.index import ChromaIndex, MemoryBackendStatus, MemoryIndex, NullIndex
+from nexusgate.memory.models import MemoryCandidate, MemoryPack, ScoredMemory
 from nexusgate.memory.policies import SUCCESS_NEGATIVE_HINTS, SUCCESS_POSITIVE_HINTS
-from nexusgate.memory.schema import MemoryItem as StructuredMemoryItem
-from nexusgate.memory.schema import MemoryScope, MemoryType
+from nexusgate.memory.query_service import MemoryQueryService
+from nexusgate.memory.repository import StructuredMemoryRepository
+from nexusgate.memory.schema import MemoryCitation, MemoryRecord, MemoryScope, MemoryType, PendingMemoryRecord, QueryFilters
+from nexusgate.memory.scoring import MemoryScorer
 from nexusgate.memory.selector import MemorySelector
+from nexusgate.memory.summarizer import MemorySummarizer
 from nexusgate.memory.write_policy import MemoryWritePolicy
-
-try:
-    import chromadb
-    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-except ImportError:  # pragma: no cover
-    chromadb = None
-    SentenceTransformerEmbeddingFunction = None
-
-
-class _MemoryStore:
-    def __init__(
-        self,
-        db_path: Path,
-        collection_name: str,
-        use_chroma: bool,
-        embed_model_name: str = "all-MiniLM-L6-v2",
-    ) -> None:
-        self._docs: list[dict[str, Any]] = []
-        self._collection = None
-        if not use_chroma or chromadb is None:
-            return
-
-        try:
-            db_path.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(path=str(db_path))
-            embed_fn = None
-            if SentenceTransformerEmbeddingFunction is not None:
-                embed_fn = SentenceTransformerEmbeddingFunction(model_name=embed_model_name)
-            if embed_fn is not None:
-                self._collection = client.get_or_create_collection(
-                    name=collection_name,
-                    embedding_function=embed_fn,
-                )
-                return
-            self._collection = client.get_or_create_collection(name=collection_name)
-        except BaseException:
-            self._collection = None
-
-    def add(self, *, layer: str, session_id: str, text: str, evidence: str, source: str) -> None:
-        item_id = hashlib.sha1(f"{layer}:{session_id}:{text}".encode("utf-8")).hexdigest()
-        metadata = {
-            "layer": layer,
-            "session_id": session_id,
-            "evidence": evidence,
-            "source": source,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if self._collection is not None:
-            self._collection.upsert(ids=[item_id], documents=[text], metadatas=[metadata])
-            return
-        self._docs = [doc for doc in self._docs if doc["id"] != item_id]
-        self._docs.append({"id": item_id, "text": text, "metadata": metadata})
-
-    def query(self, *, query_text: str, layers: list[str], session_id: str | None, limit: int) -> list[str]:
-        if self._collection is not None:
-            where: dict[str, Any] = {"layer": {"$in": layers}}
-            if session_id:
-                where = {"$and": [where, {"session_id": session_id}]}
-            result = self._collection.query(
-                query_texts=[query_text or "recent memory"],
-                n_results=limit,
-                where=where,
-            )
-            docs = (result.get("documents") or [[]])[0]
-            metas = (result.get("metadatas") or [[]])[0]
-            return [f"[{meta.get('layer', 'L?')}] {doc}" for doc, meta in zip(docs, metas)]
-
-        candidates = []
-        for row in self._docs:
-            meta = row["metadata"]
-            if meta.get("layer") not in layers:
-                continue
-            if session_id and meta.get("session_id") != session_id:
-                continue
-            score = 2 if query_text and query_text in row["text"] else 1
-            candidates.append((score, row))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        sliced = [row for _, row in candidates[:limit]]
-        return [f"[{row['metadata'].get('layer', 'L?')}] {row['text']}" for row in sliced]
 
 
 class MemoryManager:
     SESSION_RECALL_SKILL_FILE = "session_memory_recall.md"
     SKILL_MANIFEST_FILE = "skill_manifest.json"
     SKILL_INDEX_SESSION_ID = "__skills__"
-    SESSION_RECALL_TRIGGER_TERMS = (
-        "\u56de\u5fc6",
-        "\u4e4b\u524d",
-        "\u4e0a\u6b21",
-        "\u5386\u53f2",
-        "\u4e0a\u4e0b\u6587",
-        "session",
-        "raw session",
-        "l4",
-    )
+    SESSION_RECALL_TRIGGER_TERMS = ("回忆", "之前", "上次", "历史", "session", "raw session", "l4")
 
     def __init__(
         self,
@@ -118,11 +35,20 @@ class MemoryManager:
         collection_name: str = "nexusgate_memory",
         top_k: int = 6,
         use_chroma: bool = True,
+        *,
+        workspace: Path | None = None,
+        repository: StructuredMemoryRepository | None = None,
+        index: MemoryIndex | None = None,
+        query_service: MemoryQueryService | None = None,
+        summarizer: MemorySummarizer | None = None,
+        write_policy: MemoryWritePolicy | None = None,
+        event_logger: MemoryEventLogger | None = None,
+        selector: MemorySelector | None = None,
     ) -> None:
         self.enabled = enabled
         self.top_k = top_k
         self.source_root = Path(source_root)
-        self.workspace = Path(store_path)
+        self.workspace = workspace or Path(store_path)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.l3_dir = self.workspace / "l3"
         self.l3_dir.mkdir(parents=True, exist_ok=True)
@@ -130,27 +56,44 @@ class MemoryManager:
         self.l4_dir.mkdir(parents=True, exist_ok=True)
         self.candidates_dir = self.workspace / "candidates"
         self.candidates_dir.mkdir(parents=True, exist_ok=True)
+
         self.candidates_archive_path = self.candidates_dir / "candidates.jsonl"
         self.candidates_state_path = self.candidates_dir / "candidate_states.json"
+        self.candidate_events_path = self.candidates_dir / "candidate_events.jsonl"
         self.l4_archive_path = self.l4_dir / "archive.jsonl"
         self.structured_memory_path = self.workspace / "structured_memory.jsonl"
         self.sop_path = self.workspace / "memory_management_sop.md"
         self.l1_path = self.workspace / "global_mem_insight.txt"
         self.l2_path = self.workspace / "global_mem.txt"
-        self.write_policy = MemoryWritePolicy()
-        self.structured_items: list[StructuredMemoryItem] = []
+
         self._bootstrap_files()
         self.l0_rules = self.load_l0_sop()
-        self.selector = MemorySelector()
-        self.skill_manifest = self._load_skill_manifest()
-        self.store = _MemoryStore(
-            self.workspace / "chroma",
-            collection_name=collection_name,
-            use_chroma=use_chroma,
+        self.write_policy = write_policy or MemoryWritePolicy()
+        self.selector = selector or MemorySelector()
+        self.repository = repository or StructuredMemoryRepository(self.structured_memory_path)
+        if index is not None:
+            self.index = index
+        elif use_chroma:
+            self.index = ChromaIndex(
+                persist_dir=self.workspace / "chroma",
+                collection_name=collection_name,
+                embedding_model="all-MiniLM-L6-v2",
+            )
+        else:
+            self.index = NullIndex()
+        self.query_service = query_service or MemoryQueryService(
+            repository=self.repository,
+            index=self.index,
+            scorer=MemoryScorer(),
         )
-        self._hydrate_l4_from_file()
-        self._load_structured_items()
+        self.summarizer = summarizer or MemorySummarizer(write_policy=self.write_policy)
+        self.event_logger = event_logger or MemoryEventLogger(self.candidate_events_path)
+        self.skill_manifest = self._load_skill_manifest()
         self._index_l3_skills()
+
+    @property
+    def backend_status(self) -> MemoryBackendStatus:
+        return self.index.health()
 
     def _bootstrap_files(self) -> None:
         self._copy_if_missing(
@@ -158,20 +101,9 @@ class MemoryManager:
             self.sop_path,
             "No Execution, No Memory.\nDo not store volatile state.\n",
         )
-        l1_seed = self._load_template(
-            self.source_root / "assets" / "insight_fixed_structure.txt",
-            "# [Global Memory Insight]\n",
-        )
-        self._copy_if_missing(
-            self.source_root / "assets" / "global_mem_insight_template.txt",
-            self.l1_path,
-            l1_seed,
-        )
-        self._copy_if_missing(
-            self.source_root / "memory" / "global_mem.txt",
-            self.l2_path,
-            "## [FACTS]\n",
-        )
+        l1_seed = self._load_template(self.source_root / "assets" / "insight_fixed_structure.txt", "# [Global Memory Insight]\n")
+        self._copy_if_missing(self.source_root / "assets" / "global_mem_insight_template.txt", self.l1_path, l1_seed)
+        self._copy_if_missing(self.source_root / "memory" / "global_mem.txt", self.l2_path, "## [FACTS]\n")
         self._copy_if_missing(
             self.source_root / "memory" / self.SKILL_MANIFEST_FILE,
             self.workspace / self.SKILL_MANIFEST_FILE,
@@ -193,9 +125,7 @@ class MemoryManager:
 
     @staticmethod
     def _load_template(path: Path, default_value: str) -> str:
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return default_value
+        return path.read_text(encoding="utf-8") if path.exists() else default_value
 
     @staticmethod
     def _copy_if_missing(src: Path, dst: Path, fallback: str) -> None:
@@ -235,11 +165,12 @@ class MemoryManager:
     def load_l3_doc(self, name: str) -> str:
         for root in (self.workspace, self.source_root / "memory", self.l3_dir):
             path = root / name
-            if path.exists():
-                try:
-                    return path.read_text(encoding="utf-8")
-                except Exception:
-                    return ""
+            if not path.exists():
+                continue
+            try:
+                return path.read_text(encoding="utf-8")
+            except Exception:
+                return ""
         return ""
 
     def _load_skill_manifest(self) -> list[dict[str, Any]]:
@@ -250,24 +181,15 @@ class MemoryManager:
             payload = json.loads(raw)
         except Exception:
             return []
-
-        rows: list[dict[str, Any]]
-        if isinstance(payload, list):
-            rows = payload
-        elif isinstance(payload, dict) and isinstance(payload.get("skills"), list):
-            rows = payload["skills"]
-        else:
-            return []
-
+        rows = payload if isinstance(payload, list) else payload.get("skills", []) if isinstance(payload, dict) else []
         normalized: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
             name = str(row.get("name") or "").strip()
             path = str(row.get("path") or "").strip()
-            if not name or not path:
-                continue
-            normalized.append(row)
+            if name and path:
+                normalized.append(row)
         return normalized
 
     def should_inject_session_recall(self, query: str) -> bool:
@@ -275,17 +197,34 @@ class MemoryManager:
         return any(term in lowered for term in self.SESSION_RECALL_TRIGGER_TERMS)
 
     def _index_l3_skills(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        records: list[MemoryRecord] = []
         for entry in self.skill_manifest:
             payload = self._build_skill_payload(entry)
             if not payload:
                 continue
-            self.store.add(
-                layer="L3",
-                session_id=self.SKILL_INDEX_SESSION_ID,
-                text=payload,
-                evidence="tool:file_read",
-                source=f"skill_bootstrap:{entry.get('name', 'unknown')}",
+            memory_id = hashlib.sha1(f"skill:{entry.get('name')}:{payload}".encode("utf-8")).hexdigest()
+            records.append(
+                MemoryRecord(
+                    memory_id=memory_id,
+                    layer="L3",
+                    memory_type=MemoryType.PROCEDURE,
+                    scope=MemoryScope.GLOBAL,
+                    content=payload,
+                    evidence="tool:file_read",
+                    evidence_ref=f"skill:{entry.get('name')}",
+                    verified=True,
+                    confidence=0.7,
+                    dedupe_key=self._default_dedupe_key(payload),
+                    session_id=self.SKILL_INDEX_SESSION_ID,
+                    source=f"skill_bootstrap:{entry.get('name', 'unknown')}",
+                    created_at=now,
+                    updated_at=now,
+                )
             )
+        self.repository.upsert_many(records)
+        if records:
+            self.index.upsert(records)
 
     def _build_skill_payload(self, entry: dict[str, Any]) -> str:
         raw = self._load_skill_raw(entry).strip()
@@ -295,12 +234,7 @@ class MemoryManager:
         skill = str(entry.get("name") or metadata.get("key") or "").strip()
         if not skill:
             return ""
-        summary = (
-            str(entry.get("summary") or "").strip()
-            or metadata.get("one_line_summary")
-            or metadata.get("description")
-            or "skill summary unavailable"
-        )
+        summary = str(entry.get("summary") or "").strip() or metadata.get("one_line_summary") or metadata.get("description") or "skill summary unavailable"
         tags = self._to_csv(entry.get("tags")) or metadata.get("tags") or "skill"
         task_types = self._to_csv(entry.get("task_types")) or "chat"
         triggers = self._to_csv(entry.get("triggers")) or skill
@@ -322,17 +256,7 @@ class MemoryManager:
         if not path_value:
             return ""
         path = Path(path_value)
-        candidates: list[Path] = []
-        if path.is_absolute():
-            candidates.append(path)
-        else:
-            candidates.extend(
-                [
-                    self.workspace / path,
-                    self.source_root / "memory" / path,
-                    self.l3_dir / path,
-                ]
-            )
+        candidates = [path] if path.is_absolute() else [self.workspace / path, self.source_root / "memory" / path, self.l3_dir / path]
         for candidate in candidates:
             if not candidate.exists():
                 continue
@@ -349,8 +273,7 @@ class MemoryManager:
         parts = raw.split("---", 2)
         if len(parts) < 3:
             return {}, raw
-        frontmatter = parts[1]
-        body = parts[2].strip()
+        frontmatter, body = parts[1], parts[2].strip()
         metadata: dict[str, str] = {}
         current_key = ""
         current_list: list[str] = []
@@ -376,8 +299,7 @@ class MemoryManager:
         match = re.search(pattern, body)
         if not match:
             return ""
-        text = " ".join(line.strip() for line in match.group(1).splitlines() if line.strip())
-        return text[:320]
+        return " ".join(line.strip() for line in match.group(1).splitlines() if line.strip())[:320]
 
     @staticmethod
     def _merge_skill_blocks(*blocks: str) -> str:
@@ -394,8 +316,7 @@ class MemoryManager:
         if isinstance(value, str):
             return value.strip()
         if isinstance(value, list):
-            items = [str(item).strip() for item in value if str(item).strip()]
-            return ", ".join(items)
+            return ", ".join(str(item).strip() for item in value if str(item).strip())
         return ""
 
     def _select_global_skill_names(self, query: str) -> list[str]:
@@ -424,107 +345,65 @@ class MemoryManager:
             block = self.query_memory(self.SKILL_INDEX_SESSION_ID, skill_name, layers=["L3"])
             if block != "(empty)":
                 global_blocks.append(block)
-        global_skills = self._merge_skill_blocks(*global_blocks)
-        return self._merge_skill_blocks(session_skills, global_skills)
-
-    def _load_structured_items(self) -> None:
-        if not self.structured_memory_path.exists():
-            return
-        rows: list[StructuredMemoryItem] = []
-        try:
-            lines = self.structured_memory_path.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            return
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-                rows.append(StructuredMemoryItem(**raw))
-            except Exception:
-                continue
-        self.structured_items = rows
-
-    def _append_structured_item(self, candidate: MemoryCandidate) -> None:
-        item = StructuredMemoryItem(
-            memory_id=candidate.candidate_id or self._candidate_id(candidate),
-            layer=candidate.suggested_layer.upper(),
-            memory_type=candidate.memory_type or candidate.kind or "unknown",
-            scope=candidate.scope or MemoryScope.SESSION,
-            content=candidate.content,
-            evidence=candidate.evidence,
-            evidence_ref=candidate.evidence_ref,
-            verified=candidate.verified,
-            confidence=candidate.confidence,
-            dedupe_key=candidate.dedupe_key or self._default_dedupe_key(candidate.content),
-            session_id=candidate.session_id,
-            source=candidate.source,
-        )
-        self.structured_items = [row for row in self.structured_items if row.memory_id != item.memory_id]
-        self.structured_items.append(item)
-        with self.structured_memory_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{json.dumps(asdict(item), ensure_ascii=False)}\n")
+        return self._merge_skill_blocks(session_skills, self._merge_skill_blocks(*global_blocks))
 
     @staticmethod
     def _default_dedupe_key(text: str) -> str:
         normalized = re.sub(r"\s+", " ", text.lower().strip())
         return re.sub(r"[^a-z0-9\u4e00-\u9fff/._ -]+", "", normalized)
 
-    def _query_structured_memory(self, session_id: str, query: str, layers: list[str], limit: int) -> list[str]:
-        if not self.structured_items:
-            return []
-        lowered = (query or "").lower().strip()
-        candidates: list[tuple[float, StructuredMemoryItem]] = []
-        for row in self.structured_items:
-            if row.layer not in layers:
-                continue
-            if row.scope == MemoryScope.SESSION and row.session_id != session_id:
-                continue
-            score = row.confidence
-            if lowered and lowered in row.content.lower():
-                score += 2.0
-            if row.verified:
-                score += 1.0
-            candidates.append((score, row))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        selected = [row for _, row in candidates[:limit]]
-        return [f"[{row.layer}] {row.content}" for row in selected]
+    def query_memory_records(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        layers: list[str],
+        project_id: str = "",
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
+        include_scopes = ["session", "project", "user", "global"]
+        if layers == ["L3"] and session_id != self.SKILL_INDEX_SESSION_ID:
+            include_scopes = ["session", "project", "user"]
+        filters = QueryFilters(layers=layers, session_id=session_id, project_id=project_id, include_scopes=include_scopes)
+        return self.query_service.query(query=query, filters=filters, limit=limit or self.top_k)
 
     def query_memory(self, session_id: str, query: str, layers: list[str]) -> str:
-        rows = self._query_structured_memory(
-            session_id=session_id,
-            query=query,
-            layers=layers,
-            limit=self.top_k,
-        )
-        legacy_rows = self.store.query(
-            query_text=query,
-            layers=layers,
-            session_id=session_id,
-            limit=self.top_k,
-        )
-        ordered: list[str] = []
-        for row in [*rows, *legacy_rows]:
-            if row not in ordered:
-                ordered.append(row)
-        return "\n".join(ordered) if ordered else "(empty)"
+        rows = self.query_memory_records(session_id=session_id, query=query, layers=layers, limit=self.top_k)
+        return "\n".join(f"[{row.layer}] {row.content}" for row in rows) if rows else "(empty)"
 
-    def build_memory_pack(self, session_id: str, query: str) -> MemoryPack:
+    def query_memory_text(self, session_id: str, query: str, layers: list[str]) -> str:
+        return self.query_memory(session_id=session_id, query=query, layers=layers)
+
+    def build_memory_pack(self, session_id: str, query: str, project_id: str = "") -> MemoryPack:
+        filters = QueryFilters(layers=["L1", "L2", "L3", "L4"], session_id=session_id, project_id=project_id)
+        records_by_layer = self.query_service.query_by_layers(query=query, filters=filters, limit_per_layer=self.top_k)
+        records_by_layer["L3"] = [
+            *records_by_layer.get("L3", []),
+            *self.query_memory_records(
+                session_id=self.SKILL_INDEX_SESSION_ID,
+                query=query,
+                layers=["L3"],
+                project_id=project_id,
+                limit=self.top_k,
+            ),
+        ]
+        scored_by_layer: dict[str, list[ScoredMemory]] = {}
+        scorer = MemoryScorer()
+        for layer, rows in records_by_layer.items():
+            scored_by_layer[layer] = scorer.score(
+                query=query,
+                candidates=rows,
+                task_type=self.selector.classify_task(query),
+                current_session_id=session_id,
+                current_project_id=project_id,
+            )
         selected = self.selector.select(
             user_text=query,
             l0="\n".join(self.l0_rules.splitlines()[:12]).strip(),
-            l1=self.load_l1_index(),
-            l2=self.query_memory(session_id, query, layers=["L2"]),
-            l3=self._build_relevant_skills(session_id, query),
-            l4=self.query_memory(session_id, query, layers=["L4"]),
+            items_by_layer=scored_by_layer,
         )
-        citations = self._build_pack_citations(
-            session_id=session_id,
-            l1=selected.l1,
-            l2=selected.l2,
-            l3=selected.l3,
-            l4=selected.l4,
-        )
+        selected_records = [row for layer in ("L1", "L2", "L3", "L4") for row in records_by_layer.get(layer, [])]
+        citations = self._build_pack_citations(records=selected_records)
         return MemoryPack(
             task_type=selected.task_type,
             budget=self.selector.budget_for_task(selected.task_type),
@@ -534,34 +413,33 @@ class MemoryManager:
             l3=selected.l3,
             l4=selected.l4,
             citations=citations,
+            selected_ids=[row.memory_id for row in selected_records[: self.top_k * 4]],
         )
 
     @staticmethod
-    def _build_pack_citations(
-        *,
-        session_id: str,
-        l1: str,
-        l2: str,
-        l3: str,
-        l4: str,
-        max_items: int = 6,
-    ) -> list[dict[str, str]]:
+    def _build_pack_citations(*, records: list[MemoryRecord], max_items: int = 6) -> list[dict[str, str]]:
         citations: list[dict[str, str]] = []
-        blocks = [("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4)]
-        for layer, text in blocks:
-            for line_no, line in enumerate(text.splitlines(), start=1):
-                content = line.strip()
-                if not content or content == "(empty)":
-                    continue
-                citations.append(
-                    {
-                        "memory_ref": f"{session_id}:{layer}:{line_no}",
-                        "snippet": content[:180],
-                        "source_type": "memory",
-                    }
-                )
-                if len(citations) >= max_items:
-                    return citations
+        for row in records:
+            if not row.content.strip():
+                continue
+            citation = MemoryCitation(
+                memory_id=row.memory_id,
+                layer=row.layer,
+                snippet=row.content[:180],
+                evidence_type=row.evidence_type,
+                evidence_ref=row.evidence_ref,
+                source=row.source,
+            )
+            citations.append(
+                {
+                    "memory_ref": citation.memory_id,
+                    "layer": citation.layer,
+                    "snippet": citation.snippet,
+                    "source_type": "memory",
+                }
+            )
+            if len(citations) >= max_items:
+                break
         return citations
 
     @staticmethod
@@ -583,8 +461,7 @@ class MemoryManager:
         )
 
     def build_memory_header(self, session_id: str, query: str) -> str:
-        pack = self.build_memory_pack(session_id=session_id, query=query)
-        return self.render_memory_for_provider(pack=pack, provider_style="openai")
+        return self.render_memory_for_provider(pack=self.build_memory_pack(session_id=session_id, query=query), provider_style="openai")
 
     def build_memory_system_prompt(self, session_id: str, query: str) -> str:
         return self.build_memory_header(session_id=session_id, query=query)
@@ -598,23 +475,11 @@ class MemoryManager:
         provider_style: str = "openai",
         memory_pack: MemoryPack | None = None,
     ) -> tuple[list[dict[str, Any]], MemoryPack]:
-        if not self.enabled:
-            normalized_messages = self._normalize_message_rows(getattr(normalized_req, "messages", []))
-            return normalized_messages, MemoryPack(
-                task_type="chat",
-                budget={},
-                l0="",
-                l1="(empty)",
-                l2="(empty)",
-                l3="(empty)",
-                l4="(empty)",
-                citations=[],
-            )
-        session_id = str(getattr(normalized_req, "session_id", "") or "default")
         normalized_messages = self._normalize_message_rows(getattr(normalized_req, "messages", []))
-        query = str(getattr(normalized_req, "user_text", "") or "").strip() or self._extract_latest_user_query(
-            normalized_messages
-        )
+        if not self.enabled:
+            return normalized_messages, MemoryPack("chat", {}, "", "(empty)", "(empty)", "(empty)", "(empty)", [], [])
+        session_id = str(getattr(normalized_req, "session_id", "") or "default")
+        query = str(getattr(normalized_req, "user_text", "") or "").strip() or self._extract_latest_user_query(normalized_messages)
         resolved_pack = memory_pack or self.build_memory_pack(session_id=session_id, query=query)
         memory_header = self.render_memory_for_provider(resolved_pack, provider_style=provider_style)
         memory_msg = {"role": "system", "content": f"<nexus_context>\n{memory_header}\n</nexus_context>"}
@@ -632,10 +497,7 @@ class MemoryManager:
             return messages
         resolved_session_id = session_id or str((metadata or {}).get("session_id") or "default")
         resolved_query = query or (metadata or {}).get("query") or self._extract_latest_user_query(messages)
-        memory_header = self.build_memory_system_prompt(
-            session_id=resolved_session_id,
-            query=resolved_query,
-        )
+        memory_header = self.build_memory_system_prompt(session_id=resolved_session_id, query=resolved_query)
         memory_msg = {"role": "system", "content": f"<nexus_context>\n{memory_header}\n</nexus_context>"}
         return [memory_msg, *messages]
 
@@ -645,21 +507,19 @@ class MemoryManager:
         for message in messages:
             if hasattr(message, "model_dump"):
                 rows.append(message.model_dump(exclude_none=True))
-                continue
-            if isinstance(message, dict):
+            elif isinstance(message, dict):
                 rows.append(dict(message))
-                continue
-            rows.append({"role": "user", "content": str(message)})
+            else:
+                rows.append({"role": "user", "content": str(message)})
         return rows
 
     @staticmethod
     def _extract_latest_user_query(messages: list[dict[str, Any]]) -> str:
         for msg in reversed(messages):
-            if msg.get("role") == "user":
-                content = msg.get("content")
-                if isinstance(content, str):
-                    return content
-                return json.dumps(content, ensure_ascii=False)
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
         return "default_query"
 
     def classify_memory_item(self, item: dict[str, Any]) -> str:
@@ -674,11 +534,88 @@ class MemoryManager:
             return "L4"
         return "drop"
 
-    def upsert_memory(self, layer: str, session_id: str, text: str, evidence: str, source: str = "manual") -> bool:
-        if not self.validate_memory_write(text, evidence):
+    def upsert_memory(
+        self,
+        layer: str | None = None,
+        session_id: str | None = None,
+        text: str | None = None,
+        evidence: str | None = None,
+        source: str = "manual",
+        *,
+        pending: PendingMemoryRecord | None = None,
+    ) -> bool:
+        if pending is None:
+            pending = PendingMemoryRecord(
+                layer=layer or "L4",
+                memory_type=MemoryType.SESSION_SUMMARY if (layer or "").upper() == "L4" else MemoryType.STABLE_FACT,
+                scope=MemoryScope.SESSION if (layer or "").upper() != "L1" else MemoryScope.GLOBAL,
+                content=text or "",
+                evidence=evidence or "",
+                evidence_ref=f"legacy:{layer or 'L4'}",
+                verified=(layer or "").upper() in {"L1", "L2", "L3"},
+                session_id=session_id or "",
+                source=source,
+                dedupe_key=self._default_dedupe_key(text or ""),
+            )
+        result = self.write_policy.validate_pending(pending)
+        if not result.accepted:
             return False
-        self.store.add(layer=layer, session_id=session_id, text=text, evidence=evidence, source=source)
-        self._sync_files(layer=layer, text=text)
+        now = datetime.now(timezone.utc).isoformat()
+        memory_id = hashlib.sha1(
+            "|".join(
+                [
+                    pending.session_id,
+                    result.normalized_layer,
+                    (pending.memory_type or "unknown").strip().lower(),
+                    result.normalized_scope,
+                    pending.dedupe_key or self._default_dedupe_key(result.normalized_content),
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        row = MemoryRecord(
+            memory_id=memory_id,
+            layer=result.normalized_layer,
+            memory_type=pending.memory_type or MemoryType.SESSION_SUMMARY,
+            scope=result.normalized_scope,
+            content=result.normalized_content,
+            evidence=pending.evidence,
+            evidence_ref=pending.evidence_ref,
+            evidence_type=pending.evidence_type or self.write_policy.infer_evidence_type(pending.evidence),
+            verified=pending.verified,
+            confidence=pending.confidence,
+            dedupe_key=pending.dedupe_key or self._default_dedupe_key(result.normalized_content),
+            session_id=pending.session_id,
+            project_id=pending.project_id,
+            source=pending.source or source,
+            tags=list(pending.tags),
+            created_at=now,
+            updated_at=now,
+            last_accessed_at=now,
+        )
+        self.repository.upsert(row)
+        try:
+            self.index.upsert([row])
+            self.event_logger.append(
+                MemoryEvent(
+                    event_type="index_sync_completed",
+                    memory_id=row.memory_id,
+                    session_id=row.session_id,
+                    layer=row.layer,
+                    status="completed",
+                )
+            )
+        except Exception as exc:
+            self.event_logger.append(
+                MemoryEvent(
+                    event_type="index_sync_failed",
+                    memory_id=row.memory_id,
+                    session_id=row.session_id,
+                    layer=row.layer,
+                    status="failed",
+                    payload={"error": str(exc)},
+                )
+            )
+        self._sync_files(layer=row.layer, text=row.content)
         return True
 
     def _sync_files(self, layer: str, text: str) -> None:
@@ -695,32 +632,50 @@ class MemoryManager:
         path.write_text(f"{content.rstrip()}\n{line}\n", encoding="utf-8")
 
     def extract_key_history(self, messages: list[dict[str, Any]]) -> list[str]:
-        history: list[str] = []
+        rows: list[str] = []
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
             text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
             text = text.replace("\n", " ").strip()
             if role == "user":
-                history.append(f"[USER] {text[:240]}")
+                rows.append(f"[USER] {text[:240]}")
             elif role == "assistant":
-                history.append(f"[Agent] {text[:240]}")
-        return history
+                rows.append(f"[Agent] {text[:240]}")
+        return rows
 
     def archive_raw_session(self, messages: list[dict[str, Any]]) -> str:
         return "\n".join(self.extract_key_history(messages))
 
-    def archive_session(self, session_id: str, messages: list[dict[str, Any]]) -> None:
-        summary = self.archive_raw_session(messages)
-        if summary:
-            self.upsert_memory(
-                layer="L4",
-                session_id=session_id,
-                text=summary,
-                evidence="tool:archive_success",
-                source="archive_session",
+    def archive_session(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        final_result: str = "",
+        project_id: str = "",
+    ) -> None:
+        summary = self.summarizer.build_session_summary(session_id=session_id, messages=messages, final_result=final_result)
+        if not summary:
+            return
+        pending = PendingMemoryRecord(
+            layer="L4",
+            memory_type=MemoryType.SESSION_SUMMARY,
+            scope=MemoryScope.SESSION,
+            content=summary,
+            evidence="tool:archive_success",
+            evidence_ref=f"session:{session_id}",
+            verified=False,
+            session_id=session_id,
+            project_id=project_id,
+            source="session_summary",
+            dedupe_key=self._default_dedupe_key(summary),
+        )
+        if self.upsert_memory(pending=pending):
+            memory_id = hashlib.sha1(f"{session_id}:{pending.dedupe_key}:L4".encode("utf-8")).hexdigest()
+            self._append_l4_archive(session_id=session_id, memory_id=memory_id, summary=summary)
+            self.event_logger.append(
+                MemoryEvent(event_type="session_archived", memory_id=memory_id, session_id=session_id, layer="L4", status="completed")
             )
-            self._append_l4_archive(session_id=session_id, summary=summary)
 
     def distill_to_l4(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         self.archive_session(session_id=session_id, messages=messages)
@@ -728,12 +683,8 @@ class MemoryManager:
     def start_memory_update(self, session_id: str, messages: list[dict[str, Any]], final_result: str) -> None:
         if not self.enabled:
             return
-        self.archive_session(session_id=session_id, messages=messages)
-        candidates = self._extract_memory_candidates(
-            session_id=session_id,
-            messages=messages,
-            final_result=final_result,
-        )
+        self.archive_session(session_id=session_id, messages=messages, final_result=final_result)
+        candidates = self._extract_memory_candidates(session_id=session_id, messages=messages, final_result=final_result)
         pending = self._persist_candidates(candidates)
         self._commit_candidates(pending)
         self._gc_candidate_pool()
@@ -747,84 +698,63 @@ class MemoryManager:
     ) -> list[MemoryCandidate]:
         now = datetime.now(timezone.utc).isoformat()
         candidates: list[MemoryCandidate] = []
-
-        session_summary = self._build_session_summary(messages=messages, final_result=final_result)
-        if session_summary:
-            candidates.append(
-                MemoryCandidate(
-                    session_id=session_id,
-                    suggested_layer="L4",
-                    kind="session_summary",
-                    memory_type=MemoryType.SESSION_SUMMARY,
-                    scope=MemoryScope.SESSION,
-                    content=session_summary,
-                    evidence="tool:archive_success",
-                    evidence_ref=f"session:{session_id}",
-                    source="session_summary",
-                    verified=False,
-                    dedupe_key=self._default_dedupe_key(session_summary),
-                    created_at=now,
-                )
-            )
-
         if not self._looks_successful(final_result):
             return candidates
-
-        for fact in self._extract_l2_fact_candidates(messages=messages, final_result=final_result):
+        for fact in self.summarizer.extract_fact_candidates(session_id=session_id, messages=messages, final_result=final_result):
             candidates.append(
                 MemoryCandidate(
-                    session_id=session_id,
-                    suggested_layer="L2",
+                    session_id=fact.session_id,
+                    suggested_layer=fact.layer,
                     kind="fact_candidate",
-                    memory_type=fact["memory_type"],
-                    scope=MemoryScope.SESSION,
-                    content=fact["content"],
-                    evidence="tool:success",
-                    evidence_ref=fact["evidence_ref"],
-                    source="stable_fact",
-                    verified=True,
-                    dedupe_key=fact["dedupe_key"],
-                    confidence=0.8,
+                    memory_type=fact.memory_type,
+                    scope=fact.scope,
+                    project_id=fact.project_id,
+                    content=fact.content,
+                    evidence=fact.evidence,
+                    evidence_ref=fact.evidence_ref,
+                    source=fact.source,
+                    verified=fact.verified,
+                    dedupe_key=fact.dedupe_key,
+                    confidence=fact.confidence,
                     created_at=now,
                 )
             )
-
-        takeaway = self._build_l3_task_takeaways(messages=messages, final_result=final_result)
-        if takeaway:
+        takeaway = self.summarizer.build_task_takeaway(session_id=session_id, messages=messages, final_result=final_result)
+        if takeaway is not None:
             candidates.append(
                 MemoryCandidate(
-                    session_id=session_id,
-                    suggested_layer="L3",
+                    session_id=takeaway.session_id,
+                    suggested_layer=takeaway.layer,
                     kind="task_takeaway",
-                    memory_type=takeaway["memory_type"],
-                    scope=MemoryScope.SESSION,
-                    content=takeaway["content"],
-                    evidence="tool:success",
-                    evidence_ref=takeaway["evidence_ref"],
-                    source="task_takeaway",
-                    verified=True,
-                    dedupe_key=takeaway["dedupe_key"],
-                    confidence=0.7,
+                    memory_type=takeaway.memory_type,
+                    scope=takeaway.scope,
+                    project_id=takeaway.project_id,
+                    content=takeaway.content,
+                    evidence=takeaway.evidence,
+                    evidence_ref=takeaway.evidence_ref,
+                    source=takeaway.source,
+                    verified=takeaway.verified,
+                    dedupe_key=takeaway.dedupe_key,
+                    confidence=takeaway.confidence,
                     created_at=now,
                 )
             )
-
-        pointer = self._build_l1_pointer()
-        if pointer:
+        pointer = self.summarizer.build_l1_pointer()
+        if pointer is not None:
             candidates.append(
                 MemoryCandidate(
                     session_id=session_id,
-                    suggested_layer="L1",
+                    suggested_layer=pointer.layer,
                     kind="index_pointer",
-                    memory_type=MemoryType.INDEX_POINTER,
-                    scope=MemoryScope.GLOBAL,
-                    content=pointer,
-                    evidence="tool:success",
-                    evidence_ref="policy:memory_write_rules",
-                    source="l1_pointer",
-                    verified=True,
-                    dedupe_key=self._default_dedupe_key(pointer),
-                    confidence=0.6,
+                    memory_type=pointer.memory_type,
+                    scope=pointer.scope,
+                    content=pointer.content,
+                    evidence=pointer.evidence,
+                    evidence_ref=pointer.evidence_ref,
+                    source=pointer.source,
+                    verified=pointer.verified,
+                    dedupe_key=pointer.dedupe_key,
+                    confidence=pointer.confidence,
                     created_at=now,
                 )
             )
@@ -836,46 +766,30 @@ class MemoryManager:
         states = self._load_candidate_states()
         now = datetime.now(timezone.utc).isoformat()
         pending: list[MemoryCandidate] = []
-        pending_index: dict[str, int] = {}
         seen_dedupe: dict[tuple[str, str, str], str] = {}
         for key, value in states.items():
             dedupe_key = str(value.get("dedupe_key") or "")
             layer = str(value.get("suggested_layer") or "").upper()
             scope = str(value.get("scope") or MemoryScope.SESSION)
-            if not dedupe_key or not layer:
-                continue
-            seen_dedupe[(layer, scope, dedupe_key)] = key
+            if dedupe_key and layer:
+                seen_dedupe[(layer, scope, dedupe_key)] = key
         for row in candidates:
             row.candidate_id = self._candidate_id(row)
-            existing_pending_idx = pending_index.get(row.candidate_id)
-            if existing_pending_idx is not None:
-                if pending[existing_pending_idx].confidence >= row.confidence:
-                    continue
-                if not row.created_at:
-                    row.created_at = now
-                row.dedupe_key = row.dedupe_key or self._default_dedupe_key(row.content)
-                row.status = "pending"
-                row.updated_at = now
-                pending[existing_pending_idx] = row
-                states[row.candidate_id] = asdict(row)
-                continue
             dedupe_key = row.dedupe_key or self._default_dedupe_key(row.content)
-            dedupe_slot = (row.suggested_layer.upper(), row.scope or MemoryScope.SESSION, dedupe_key)
-            existing_id = seen_dedupe.get(dedupe_slot)
+            slot = (row.suggested_layer.upper(), row.scope or MemoryScope.SESSION, dedupe_key)
+            existing_id = seen_dedupe.get(slot)
             if existing_id:
                 existing = states.get(existing_id, {})
                 existing_conf = float(existing.get("confidence") or 0.0)
                 if existing_conf >= row.confidence:
                     continue
                 states.pop(existing_id, None)
-            if not row.created_at:
-                row.created_at = now
             row.dedupe_key = dedupe_key
             row.status = "pending"
             row.updated_at = now
+            row.created_at = row.created_at or now
             states[row.candidate_id] = asdict(row)
-            seen_dedupe[dedupe_slot] = row.candidate_id
-            pending_index[row.candidate_id] = len(pending)
+            seen_dedupe[slot] = row.candidate_id
             pending.append(row)
         self._save_candidate_states(states)
         self._append_candidate_archive(pending)
@@ -888,35 +802,58 @@ class MemoryManager:
         finished: list[MemoryCandidate] = []
         for row in candidates:
             now = datetime.now(timezone.utc).isoformat()
-            if not self._candidate_allowed(row):
+            validation = self.write_policy.validate_candidate(row)
+            if not validation.accepted:
                 row.status = "rejected"
                 row.rejected_reason = "validation_failed"
                 row.updated_at = now
+                row.index_status = "pending"
                 states[row.candidate_id] = asdict(row)
+                self.event_logger.append(
+                    MemoryEvent(
+                        event_type="candidate_rejected",
+                        candidate_id=row.candidate_id,
+                        session_id=row.session_id,
+                        layer=row.suggested_layer,
+                        status="rejected",
+                        payload={"reason": row.rejected_reason},
+                    )
+                )
                 finished.append(row)
                 continue
-            self.upsert_memory(
+            pending = PendingMemoryRecord(
                 layer=row.suggested_layer,
-                session_id=row.session_id,
-                text=row.content,
+                memory_type=row.memory_type or row.kind or "unknown",
+                scope=row.scope,
+                content=row.content,
                 evidence=row.evidence,
+                evidence_ref=row.evidence_ref,
+                evidence_type=row.evidence_type,
+                verified=row.verified,
+                confidence=row.confidence,
+                session_id=row.session_id,
+                project_id=row.project_id,
                 source=row.source,
+                dedupe_key=row.dedupe_key,
             )
-            self._append_structured_item(row)
-            row.status = "committed"
+            accepted = self.upsert_memory(pending=pending)
+            row.status = "committed" if accepted else "rejected"
+            row.rejected_reason = "" if accepted else "validation_failed"
             row.updated_at = now
+            row.index_status = "completed" if accepted else "pending"
             states[row.candidate_id] = asdict(row)
+            self.event_logger.append(
+                MemoryEvent(
+                    event_type="candidate_committed" if accepted else "candidate_rejected",
+                    candidate_id=row.candidate_id,
+                    session_id=row.session_id,
+                    layer=row.suggested_layer,
+                    status=row.status,
+                )
+            )
             finished.append(row)
         self._save_candidate_states(states)
         self._append_candidate_archive(finished)
-
-    def _candidate_allowed(self, row: MemoryCandidate) -> bool:
-        if not self.write_policy.validate_candidate(row):
-            return False
-        layer = row.suggested_layer.upper()
-        if layer in {"L1", "L2", "L3"}:
-            return self.validate_memory_write(row.content.strip(), row.evidence.strip())
-        return layer == "L4"
 
     def _candidate_id(self, row: MemoryCandidate) -> str:
         normalized = row.dedupe_key or self._default_dedupe_key(row.content)
@@ -938,15 +875,10 @@ class MemoryManager:
             payload = json.loads(self.candidates_state_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
-        if isinstance(payload, dict):
-            return payload
-        return {}
+        return payload if isinstance(payload, dict) else {}
 
     def _save_candidate_states(self, states: dict[str, dict[str, Any]]) -> None:
-        self.candidates_state_path.write_text(
-            json.dumps(states, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self.candidates_state_path.write_text(json.dumps(states, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _append_candidate_archive(self, candidates: list[MemoryCandidate]) -> None:
         if not candidates:
@@ -958,15 +890,10 @@ class MemoryManager:
     def _gc_candidate_pool(self, max_states: int = 2000, max_archive_lines: int = 4000) -> None:
         states = self._load_candidate_states()
         if len(states) > max_states:
-            ordered = sorted(
-                states.values(),
-                key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
-                reverse=True,
-            )
+            ordered = sorted(states.values(), key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
             kept = ordered[:max_states]
             states = {str(row.get("candidate_id")): row for row in kept if row.get("candidate_id")}
             self._save_candidate_states(states)
-
         if not self.candidates_archive_path.exists():
             return
         try:
@@ -975,8 +902,7 @@ class MemoryManager:
             return
         if len(lines) <= max_archive_lines:
             return
-        trimmed = lines[-max_archive_lines:]
-        self.candidates_archive_path.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
+        self.candidates_archive_path.write_text("\n".join(lines[-max_archive_lines:]) + "\n", encoding="utf-8")
 
     @staticmethod
     def _looks_successful(final_result: str) -> bool:
@@ -985,140 +911,22 @@ class MemoryManager:
             return False
         return any(token in lowered for token in SUCCESS_POSITIVE_HINTS)
 
-    def _build_session_summary(self, messages: list[dict[str, Any]], final_result: str) -> str:
-        latest_user = self._extract_latest_message(messages, "user")
-        latest_assistant = self._extract_latest_message(messages, "assistant")
-        parts = [
-            f"[USER] {latest_user[:200] or 'unknown'}",
-            f"[Agent] {latest_assistant[:200] or 'unknown'}",
-            f"[RESULT] {final_result[:200] or 'unknown'}",
-        ]
-        return "\n".join(parts)
-
-    def _extract_l2_fact_candidates(self, messages: list[dict[str, Any]], final_result: str) -> list[dict[str, str]]:
-        pool = [final_result, self._extract_latest_message(messages, "assistant")]
-        facts: list[dict[str, str]] = []
-        patterns = [
-            r"(?:file|path)\s+([A-Za-z0-9_./\\-]+)",
-            r"(?:port|timeout|retries)\s*(?:is|=)\s*([A-Za-z0-9_.-]+)",
-            r"(?:config|env)\s*[:=]\s*([A-Za-z0-9_./\\-]+)",
-        ]
-        for text in pool:
-            lowered = text.lower()
-            if not lowered:
-                continue
-            for pattern in patterns:
-                for match in re.findall(pattern, text, flags=re.IGNORECASE):
-                    value = match.strip()
-                    if not value:
-                        continue
-                    content = f"stable_fact: {value}"
-                    facts.append(
-                        {
-                            "memory_type": MemoryType.STABLE_FACT,
-                            "content": content,
-                            "evidence_ref": f"text_match:{value}",
-                            "dedupe_key": self._default_dedupe_key(content),
-                        }
-                    )
-            if "test passed" in lowered or "tests passed" in lowered:
-                content = "stable_fact: tests passed"
-                facts.append(
-                    {
-                        "memory_type": MemoryType.STABLE_FACT,
-                        "content": content,
-                        "evidence_ref": "result:test_passed",
-                        "dedupe_key": self._default_dedupe_key(content),
-                    }
-                )
-        unique: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for row in facts:
-            key = row["dedupe_key"]
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(row)
-        return unique
-
-    def _build_l3_task_takeaways(self, messages: list[dict[str, Any]], final_result: str) -> dict[str, str] | None:
-        latest_user = self._extract_latest_message(messages, "user")
-        latest_assistant = self._extract_latest_message(messages, "assistant")
-        if not latest_user and not latest_assistant and not final_result:
-            return None
-        content = (
-            "task_takeaway: "
-            f"goal={latest_user[:80] or 'unknown'}; "
-            f"action={latest_assistant[:80] or 'unknown'}; "
-            f"result={final_result[:80] or 'unknown'}"
-        )
-        return {
-            "memory_type": MemoryType.LESSON,
-            "content": content,
-            "evidence_ref": "result:final_summary",
-            "dedupe_key": self._default_dedupe_key(content),
-        }
-
-    @staticmethod
-    def _build_l1_pointer() -> str:
-        return "memory_write_rules -> L2; session_recall -> L4; task_takeaway -> L3"
-
-    @staticmethod
-    def _extract_latest_message(messages: list[dict[str, Any]], role: str) -> str:
-        for msg in reversed(messages):
-            if msg.get("role") != role:
-                continue
-            content = msg.get("content")
-            if isinstance(content, str):
-                return content.replace("\n", " ").strip()
-            return json.dumps(content, ensure_ascii=False)
-        return ""
-
-    def persist_turn(self, request_payload: dict[str, Any], response_payload: dict[str, Any]) -> None:
+    def persist_turn(self, request_payload: dict[str, Any], response_payload: dict[str, Any], *, project_id: str = "") -> None:
         metadata = request_payload.get("metadata") or {}
-        session_id = metadata.get("session_id", "default")
+        session_id = str(metadata.get("session_id", "default"))
         messages = request_payload.get("messages") or []
         final_text = self._extract_response_text(response_payload)
         self.start_memory_update(session_id=session_id, messages=messages, final_result=final_text)
 
-    def _append_l4_archive(self, session_id: str, summary: str) -> None:
+    def _append_l4_archive(self, *, session_id: str, memory_id: str, summary: str) -> None:
         row = {
             "session_id": session_id,
+            "memory_id": memory_id,
             "summary": summary,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        line = json.dumps(row, ensure_ascii=False)
-        if not self.l4_archive_path.exists():
-            self.l4_archive_path.write_text(f"{line}\n", encoding="utf-8")
-            return
         with self.l4_archive_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{line}\n")
-
-    def _hydrate_l4_from_file(self) -> None:
-        if not self.l4_archive_path.exists():
-            return
-        try:
-            lines = self.l4_archive_path.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            return
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            session_id = str(row.get("session_id") or "default")
-            summary = str(row.get("summary") or "").strip()
-            if not summary:
-                continue
-            self.store.add(
-                layer="L4",
-                session_id=session_id,
-                text=summary,
-                evidence="tool:archive_replay",
-                source="archive_file",
-            )
+            handle.write(f"{json.dumps(row, ensure_ascii=False)}\n")
 
     @staticmethod
     def _extract_response_text(response_payload: dict[str, Any]) -> str:
@@ -1126,9 +934,6 @@ class MemoryManager:
             choices = response_payload.get("choices") or []
             message = (choices[0].get("message") or {}) if choices else {}
             content = message.get("content") or ""
-            if isinstance(content, str):
-                return content
-            return json.dumps(content, ensure_ascii=False)
+            return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
         except Exception:
             return ""
-
