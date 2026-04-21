@@ -10,4 +10,17 @@ memory/global_mem_insight.txt
 # planning docs
 plan.md
 plan2.md
-plans/
+
+# runtime cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+cache/
+.cache/
+
+# docs
+docs/
