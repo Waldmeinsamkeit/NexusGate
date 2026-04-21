@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -88,12 +89,13 @@ class _MemoryStore:
 
 class MemoryManager:
     SESSION_RECALL_SKILL_FILE = "session_memory_recall.md"
+    SKILL_INDEX_SESSION_ID = "__skills__"
     SESSION_RECALL_TRIGGER_TERMS = (
-        "回忆",
-        "之前",
-        "上次",
-        "历史",
-        "上下文",
+        "\u56de\u5fc6",
+        "\u4e4b\u524d",
+        "\u4e0a\u6b21",
+        "\u5386\u53f2",
+        "\u4e0a\u4e0b\u6587",
         "session",
         "raw session",
         "l4",
@@ -129,12 +131,13 @@ class MemoryManager:
             use_chroma=use_chroma,
         )
         self._hydrate_l4_from_file()
+        self._index_l3_skills()
 
     def _bootstrap_files(self) -> None:
         self._copy_if_missing(
             self.source_root / "memory" / "memory_management_sop.md",
             self.sop_path,
-            "No Execution, No Memory.\n禁止存储易变状态。\n",
+            "No Execution, No Memory.\nDo not store volatile state.\n",
         )
         l1_seed = self._load_template(
             self.source_root / "assets" / "insight_fixed_structure.txt",
@@ -172,7 +175,7 @@ class MemoryManager:
     def validate_memory_write(self, candidate_text: str, evidence: str) -> bool:
         if not candidate_text.strip() or not evidence.strip():
             return False
-        blocked = ("session id", "timestamp", "pid", "临时", "tmp", "当前时间")
+        blocked = ("session id", "timestamp", "pid", "temp", "tmp", "current time")
         lowered = candidate_text.lower()
         if any(token in lowered for token in blocked):
             return False
@@ -206,26 +209,94 @@ class MemoryManager:
         lowered = (query or "").lower()
         return any(term in lowered for term in self.SESSION_RECALL_TRIGGER_TERMS)
 
-    def _load_session_recall_skill(self) -> str:
-        try:
-            return self.load_l3_doc(self.SESSION_RECALL_SKILL_FILE).strip()
-        except Exception:
+    def _index_l3_skills(self) -> None:
+        payload = self._build_session_recall_skill_payload()
+        if not payload:
+            return
+        self.store.add(
+            layer="L3",
+            session_id=self.SKILL_INDEX_SESSION_ID,
+            text=payload,
+            evidence="tool:file_read",
+            source="skill_bootstrap",
+        )
+
+    def _build_session_recall_skill_payload(self) -> str:
+        raw = self.load_l3_doc(self.SESSION_RECALL_SKILL_FILE).strip()
+        if not raw:
             return ""
+        metadata, body = self._parse_skill_markdown(raw)
+        skill = metadata.get("key") or "session_memory_recall"
+        summary = metadata.get("one_line_summary") or metadata.get("description") or "session recall"
+        tags = metadata.get("tags") or "session,memory,recall"
+        when = self._extract_markdown_section(body, "When to use")
+        rules = self._extract_markdown_section(body, "Core rules")
+        lines = [
+            f"skill: {skill}",
+            f"summary: {summary}",
+            f"tags: {tags}",
+            f"when: {when or 'recover prior conversation context'}",
+            f"rules: {rules or 'only trust tool-verified artifacts'}",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_skill_markdown(raw: str) -> tuple[dict[str, str], str]:
+        if not raw.startswith("---"):
+            return {}, raw
+        parts = raw.split("---", 2)
+        if len(parts) < 3:
+            return {}, raw
+        frontmatter = parts[1]
+        body = parts[2].strip()
+        metadata: dict[str, str] = {}
+        current_key = ""
+        current_list: list[str] = []
+        for line in frontmatter.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("- ") and current_key:
+                current_list.append(stripped[2:].strip())
+                metadata[current_key] = ", ".join(current_list)
+                continue
+            if ":" not in stripped:
+                continue
+            key, value = stripped.split(":", 1)
+            current_key = key.strip()
+            current_list = []
+            metadata[current_key] = value.strip()
+        return metadata, body
+
+    @staticmethod
+    def _extract_markdown_section(body: str, heading: str) -> str:
+        pattern = rf"(?ms)^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)"
+        match = re.search(pattern, body)
+        if not match:
+            return ""
+        text = " ".join(line.strip() for line in match.group(1).splitlines() if line.strip())
+        return text[:320]
+
+    @staticmethod
+    def _merge_skill_blocks(*blocks: str) -> str:
+        unique: list[str] = []
+        for block in blocks:
+            if not block or block == "(empty)":
+                continue
+            if block not in unique:
+                unique.append(block)
+        return "\n\n".join(unique) if unique else "(empty)"
 
     def _build_relevant_skills(self, session_id: str, query: str) -> str:
-        from_store = self.query_memory(session_id, query, layers=["L3"])
-        if not self.should_inject_session_recall(query):
-            return from_store
-
-        session_recall_skill = self._load_session_recall_skill()
-        if not session_recall_skill:
-            return from_store
-
-        parts: list[str] = []
-        if from_store and from_store != "(empty)":
-            parts.append(from_store)
-        parts.append(f"[L3][session_memory_recall]\n{session_recall_skill}")
-        return "\n\n".join(parts) if parts else "(empty)"
+        session_skills = self.query_memory(session_id, query, layers=["L3"])
+        global_skills = "(empty)"
+        if self.should_inject_session_recall(query):
+            global_skills = self.query_memory(
+                self.SKILL_INDEX_SESSION_ID,
+                "session_memory_recall",
+                layers=["L3"],
+            )
+        return self._merge_skill_blocks(session_skills, global_skills)
 
     def query_memory(self, session_id: str, query: str, layers: list[str]) -> str:
         rows = self.store.query(
@@ -361,7 +432,7 @@ class MemoryManager:
 
     @staticmethod
     def _looks_successful(final_result: str) -> bool:
-        hints = ("成功", "完成", "通过", "done", "success")
+        hints = ("success", "done", "completed", "pass")
         lowered = final_result.lower()
         return any(token in lowered for token in hints)
 
@@ -369,10 +440,10 @@ class MemoryManager:
         latest_user = self._extract_latest_message(messages, "user")
         latest_assistant = self._extract_latest_message(messages, "assistant")
         parts = [
-            "会话摘要:",
-            f"- 用户目标: {latest_user[:160] or '未知'}",
-            f"- 代理执行: {latest_assistant[:160] or '未知'}",
-            f"- 最终结果: {final_result[:160] or '未知'}",
+            "Conversation summary:",
+            f"- User goal: {latest_user[:160] or 'unknown'}",
+            f"- Agent actions: {latest_assistant[:160] or 'unknown'}",
+            f"- Final result: {final_result[:160] or 'unknown'}",
         ]
         return "\n".join(parts)
 
@@ -444,3 +515,4 @@ class MemoryManager:
             return json.dumps(content, ensure_ascii=False)
         except Exception:
             return ""
+
