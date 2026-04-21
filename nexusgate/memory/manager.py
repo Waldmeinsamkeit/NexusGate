@@ -111,7 +111,7 @@ class MemoryManager:
         self,
         enabled: bool = True,
         store_path: str = "memory",
-        source_root: str = "F:/repo/GenericAgent",
+        source_root: str = ".",
         collection_name: str = "nexusgate_memory",
         top_k: int = 6,
         use_chroma: bool = True,

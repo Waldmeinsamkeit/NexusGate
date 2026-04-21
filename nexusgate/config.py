@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     llmapi_provider_prefix: str = "openai/"
     memory_enabled: bool = True
     memory_store_path: str = Field(default="memory")
-    memory_source_root: str = Field(default="F:/repo/GenericAgent")
+    memory_source_root: str = Field(default=".")
     memory_collection_name: str = Field(default="nexusgate_memory")
     memory_top_k: int = 6
     memory_use_chroma: bool = False
