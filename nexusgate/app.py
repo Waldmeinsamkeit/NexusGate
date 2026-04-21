@@ -16,11 +16,6 @@ from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.schemas import ChatCompletionRequest
 
-try:
-    from llmlingua import PromptCompressor
-except ImportError:  # pragma: no cover
-    PromptCompressor = None
-
 
 L0_META_RULES = (
     "你是由 NexusGate-Core 增强的智能助手。"
@@ -61,17 +56,6 @@ def create_app() -> FastAPI:
         top_k=settings.memory_top_k,
         use_chroma=settings.memory_use_chroma,
     )
-    compressor = None
-    if PromptCompressor is not None:
-        try:
-            compressor = PromptCompressor(
-                model_name=settings.llmlingua_model_name,
-                use_llmlingua2=settings.llmlingua_use_llmlingua2,
-            )
-        except TypeError:
-            compressor = PromptCompressor(model_name=settings.llmlingua_model_name)
-        except Exception:
-            compressor = None
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -101,15 +85,6 @@ def create_app() -> FastAPI:
             {"role": "system", "content": f"<nexus_context>\n{memory_context}\n</nexus_context>"},
             *[message.model_dump(exclude_none=True) for message in req.messages],
         ]
-
-        if _should_compress(req=req, messages=enhanced_messages):
-            compressed = _compress_text(compressor, enhanced_messages)
-            if compressed:
-                enhanced_messages = [
-                    {"role": "system", "content": L0_META_RULES},
-                    {"role": "system", "content": f"<nexus_context>\n{compressed}\n</nexus_context>"},
-                    *[message.model_dump(exclude_none=True) for message in req.messages[-3:]],
-                ]
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
 
@@ -287,33 +262,6 @@ def _extract_latest_user_query(messages: list[Any]) -> str:
             return message.content
         return json.dumps(message.content, ensure_ascii=False)
     return ""
-
-
-def _should_compress(req: ChatCompletionRequest, messages: list[dict[str, Any]]) -> bool:
-    full_text = "\n".join(_message_content_text(msg) for msg in messages)
-    model = req.model or settings.target_provider
-    try:
-        token_count = litellm.token_counter(model=model, text=full_text)
-    except Exception:
-        return False
-    return token_count > settings.compress_threshold
-
-
-def _compress_text(compressor: Any, messages: list[dict[str, Any]]) -> str | None:
-    if compressor is None:
-        return None
-    full_text = "\n".join(_message_content_text(msg) for msg in messages)
-    try:
-        compressed = compressor.compress(
-            full_text,
-            rate=settings.llmlingua_compress_rate,
-            preserve=["system", "question"],
-        )
-        if isinstance(compressed, dict):
-            return str(compressed.get("compressed_prompt") or compressed.get("text") or "")
-        return str(compressed)
-    except Exception:
-        return None
 
 
 def _message_content_text(message: dict[str, Any]) -> str:

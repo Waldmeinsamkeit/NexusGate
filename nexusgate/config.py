@@ -21,10 +21,6 @@ class Settings(BaseSettings):
     target_provider: str = "claude-sonnet-4-5-20250929"
     target_base_url: str | None = None
     target_api_key: str | None = None
-    compress_threshold: int = 4000
-    llmlingua_model_name: str = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
-    llmlingua_use_llmlingua2: bool = True
-    llmlingua_compress_rate: float = 0.35
     llmapi_base_url: str | None = None
     llmapi_api_key: str | None = None
     llmapi_model_prefix: str = "llmapi/"

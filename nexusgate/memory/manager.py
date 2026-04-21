@@ -87,6 +87,18 @@ class _MemoryStore:
 
 
 class MemoryManager:
+    SESSION_RECALL_SKILL_FILE = "session_memory_recall.md"
+    SESSION_RECALL_TRIGGER_TERMS = (
+        "回忆",
+        "之前",
+        "上次",
+        "历史",
+        "上下文",
+        "session",
+        "raw session",
+        "l4",
+    )
+
     def __init__(
         self,
         enabled: bool = True,
@@ -181,11 +193,39 @@ class MemoryManager:
         return chunk.split("## [", maxsplit=1)[0].strip()
 
     def load_l3_doc(self, name: str) -> str:
-        for root in (self.source_root / "memory", self.l3_dir):
+        for root in (self.workspace, self.source_root / "memory", self.l3_dir):
             path = root / name
             if path.exists():
-                return path.read_text(encoding="utf-8")
+                try:
+                    return path.read_text(encoding="utf-8")
+                except Exception:
+                    return ""
         return ""
+
+    def should_inject_session_recall(self, query: str) -> bool:
+        lowered = (query or "").lower()
+        return any(term in lowered for term in self.SESSION_RECALL_TRIGGER_TERMS)
+
+    def _load_session_recall_skill(self) -> str:
+        try:
+            return self.load_l3_doc(self.SESSION_RECALL_SKILL_FILE).strip()
+        except Exception:
+            return ""
+
+    def _build_relevant_skills(self, session_id: str, query: str) -> str:
+        from_store = self.query_memory(session_id, query, layers=["L3"])
+        if not self.should_inject_session_recall(query):
+            return from_store
+
+        session_recall_skill = self._load_session_recall_skill()
+        if not session_recall_skill:
+            return from_store
+
+        parts: list[str] = []
+        if from_store and from_store != "(empty)":
+            parts.append(from_store)
+        parts.append(f"[L3][session_memory_recall]\n{session_recall_skill}")
+        return "\n\n".join(parts) if parts else "(empty)"
 
     def query_memory(self, session_id: str, query: str, layers: list[str]) -> str:
         rows = self.store.query(
@@ -199,11 +239,15 @@ class MemoryManager:
     def build_memory_header(self, session_id: str, query: str) -> str:
         l0_excerpt = "\n".join(self.l0_rules.splitlines()[:12]).strip()
         l1_index = self.load_l1_index()
-        relevant = self.query_memory(session_id, query, layers=["L1", "L2", "L3", "L4"])
+        relevant_skills = self._build_relevant_skills(session_id, query)
+        session_recall_hints = self.query_memory(session_id, query, layers=["L4"])
+        relevant_memory = self.query_memory(session_id, query, layers=["L1", "L2"])
         return (
             f"{l0_excerpt}\n\n"
             f"<memory_index>\n{l1_index}\n</memory_index>\n\n"
-            f"<relevant_memory>\n{relevant}\n</relevant_memory>"
+            f"<relevant_skills>\n{relevant_skills}\n</relevant_skills>\n\n"
+            f"<session_recall_hints>\n{session_recall_hints}\n</session_recall_hints>\n\n"
+            f"<relevant_memory>\n{relevant_memory}\n</relevant_memory>"
         )
 
     def build_memory_system_prompt(self, session_id: str, query: str) -> str:
@@ -299,10 +343,11 @@ class MemoryManager:
             return
         self.archive_session(session_id=session_id, messages=messages)
         if self._looks_successful(final_result):
+            summary = self._build_structured_l2_summary(messages=messages, final_result=final_result)
             self.upsert_memory(
                 layer="L2",
                 session_id=session_id,
-                text=f"会话结果: {final_result[:320]}",
+                text=summary,
                 evidence="tool:success",
                 source="final_result",
             )
@@ -319,6 +364,28 @@ class MemoryManager:
         hints = ("成功", "完成", "通过", "done", "success")
         lowered = final_result.lower()
         return any(token in lowered for token in hints)
+
+    def _build_structured_l2_summary(self, messages: list[dict[str, Any]], final_result: str) -> str:
+        latest_user = self._extract_latest_message(messages, "user")
+        latest_assistant = self._extract_latest_message(messages, "assistant")
+        parts = [
+            "会话摘要:",
+            f"- 用户目标: {latest_user[:160] or '未知'}",
+            f"- 代理执行: {latest_assistant[:160] or '未知'}",
+            f"- 最终结果: {final_result[:160] or '未知'}",
+        ]
+        return "\n".join(parts)
+
+    @staticmethod
+    def _extract_latest_message(messages: list[dict[str, Any]], role: str) -> str:
+        for msg in reversed(messages):
+            if msg.get("role") != role:
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content.replace("\n", " ").strip()
+            return json.dumps(content, ensure_ascii=False)
+        return ""
 
     def persist_turn(self, request_payload: dict[str, Any], response_payload: dict[str, Any]) -> None:
         metadata = request_payload.get("metadata") or {}
