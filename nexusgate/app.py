@@ -115,7 +115,12 @@ def create_app() -> FastAPI:
             kwargs["api_base"] = decision["api_base"]
         if decision.get("api_key"):
             kwargs["api_key"] = decision["api_key"]
-        attempt_models = [str(decision["model"])] + [str(item) for item in (decision.get("fallbacks") or [])]
+        if settings.effective_target_base_url and not kwargs.get("custom_llm_provider"):
+            kwargs["custom_llm_provider"] = "openai"
+        explicit_model_requested = bool((req.model or "").strip())
+        attempt_models = [str(decision["model"])]
+        if not explicit_model_requested:
+            attempt_models.extend(str(item) for item in (decision.get("fallbacks") or []))
         deduped_models: list[str] = []
         for model in attempt_models:
             if model and model not in deduped_models:
@@ -123,7 +128,10 @@ def create_app() -> FastAPI:
         response = None
         last_error: Exception | None = None
         for model in deduped_models:
-            kwargs["model"] = model
+            kwargs["model"] = _normalize_model_for_openai_compatible(
+                model=model,
+                openai_compatible=bool(settings.effective_target_base_url),
+            )
             started = time.perf_counter()
             try:
                 response = litellm.completion(**kwargs)
@@ -407,6 +415,15 @@ def _provider_from_model(model: str, fallback: str = "openai") -> str:
     if lowered.startswith("openai/") or lowered.startswith("gpt-"):
         return "openai"
     return fallback
+
+
+def _normalize_model_for_openai_compatible(model: str, openai_compatible: bool) -> str:
+    if not openai_compatible:
+        return model
+    lowered = (model or "").strip()
+    if lowered.lower().startswith("openai/"):
+        return lowered.split("/", 1)[1]
+    return lowered
 
 
 def _message_content_text(message: dict[str, Any]) -> str:

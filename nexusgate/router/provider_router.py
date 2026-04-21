@@ -36,7 +36,7 @@ class ProviderRouter:
             resolved = self.registry.resolve(requested_model)
             provider = resolved.provider if resolved else "openai"
             render_mode = resolved.render_mode if resolved else "openai"
-            fallbacks = self._fallback_models(primary_model=requested_model)
+            fallbacks = self._fallback_models(primary_model=requested_model, primary_provider=provider)
             api_base, api_key = self._resolve_connection(capability=resolved, defaults=defaults)
             return RouteDecision(
                 provider=provider,
@@ -58,7 +58,7 @@ class ProviderRouter:
         primary = candidates[0] if candidates else None
         if primary is None:
             model = str(defaults.get("model") or "")
-            fallbacks = self._fallback_models(primary_model=model)
+            fallbacks = self._fallback_models(primary_model=model, primary_provider="openai")
             return RouteDecision(
                 provider="openai",
                 model=model,
@@ -69,7 +69,7 @@ class ProviderRouter:
                 fallbacks=fallbacks,
             )
 
-        fallbacks = [row.model for row in candidates[1:4]]
+        fallbacks = [row.model for row in candidates[1:4] if row.provider == primary.provider]
         api_base, api_key = self._resolve_connection(capability=primary, defaults=defaults)
         return RouteDecision(
             provider=primary.provider,
@@ -110,8 +110,12 @@ class ProviderRouter:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [row for _, row in scored]
 
-    def _fallback_models(self, primary_model: str) -> list[str]:
-        ordered = [row.model for row in self.registry.all() if row.model != primary_model]
+    def _fallback_models(self, primary_model: str, primary_provider: str) -> list[str]:
+        ordered = [
+            row.model
+            for row in self.registry.all()
+            if row.model != primary_model and row.provider == primary_provider
+        ]
         return ordered[:3]
 
     @staticmethod

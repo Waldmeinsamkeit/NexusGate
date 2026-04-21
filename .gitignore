@@ -21,3 +21,9 @@ _cache/
 *_cache/
 __pycache__/
 .cache/
+memory/structured_memory.jsonl
+memory/candidates/candidate_states.json
+memory/candidates/candidates.jsonl
+memory/l4/archive.jsonl
+memory/l4/archive.jsonl
+memory/l4/archive.jsonl
