@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -112,11 +111,21 @@ def create_app() -> FastAPI:
             provider_style=str(decision.get("render_mode") or "openai"),
         )
         grounding_mode = str(decision.get("grounding_mode") or "balanced")
-        grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode)
+        grounding_policy = _derive_grounding_policy(
+            risk_profile=memory_pack.risk_profile,
+            pack_features=memory_pack.pack_features,
+            metadata=normalized_req.metadata or {},
+        )
+        grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode, grounding_policy=grounding_policy)
+        evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
         citation_block = _build_citation_system_block(memory_pack.citations)
         enhanced_messages = [
             {"role": "system", "content": L0_META_RULES},
             {"role": "system", "content": grounding_rules},
+            {"role": "system", "content": evidence_blocks["facts"]},
+            {"role": "system", "content": evidence_blocks["constraints"]},
+            {"role": "system", "content": evidence_blocks["procedures"]},
+            {"role": "system", "content": evidence_blocks["continuity"]},
             {"role": "system", "content": citation_block},
             *enriched_messages,
         ]
@@ -140,40 +149,161 @@ def create_app() -> FastAPI:
         response = None
         last_error: Exception | None = None
         fallback_events: list[dict[str, Any]] = []
-        for model in deduped_models:
+        for attempt_index, model in enumerate(deduped_models):
+            provider = _provider_from_model(model, fallback=str(decision.get("provider") or "openai"))
             kwargs["model"] = _normalize_model_for_openai_compatible(
                 model=model,
                 openai_compatible=bool(settings.effective_target_base_url),
             )
             current_messages = kwargs.get("messages") or []
-            for retry_index in range(2):
+            current_tools = kwargs.get("tools")
+            for retry_index in range(3):
                 started = time.perf_counter()
                 try:
                     kwargs["messages"] = current_messages
+                    if current_tools is not None:
+                        kwargs["tools"] = current_tools
                     response = litellm.completion(**kwargs)
                     provider_router.health.record_success(
-                        provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai")),
+                        provider=provider,
                         latency_ms=(time.perf_counter() - started) * 1000.0,
                     )
                     break
                 except Exception as exc:
-                    provider_router.health.record_failure(
-                        provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai"))
-                    )
+                    provider_router.health.record_failure(provider=provider)
                     failure_mode = _classify_upstream_failure(exc)
-                    fallback_events.append(
-                        {
-                            "model": model,
-                            "mode": failure_mode,
-                            "retry_index": retry_index,
-                            "error": str(exc)[:280],
-                        }
-                    )
                     last_error = exc
-                    # Context overflow fallback: keep canonical pack, trim render and retry once.
+                    recovery_action = "switch_model"
+                    same_provider_retry = False
+                    rerender_only = False
+                    switched_model = True
+                    partial_accepted = False
+                    backoff_ms = _provider_retry_backoff_ms(failure_mode=failure_mode, retry_index=retry_index)
+
+                    if failure_mode == "auth_or_config":
+                        recovery_action = "fast_fail_auth_or_config"
+                        switched_model = False
+                        fallback_events.append(
+                            _fallback_event_row(
+                                attempt_index=attempt_index,
+                                model=model,
+                                provider=provider,
+                                failure_mode=failure_mode,
+                                recovery_action=recovery_action,
+                                same_provider_retry=same_provider_retry,
+                                rerender_only=rerender_only,
+                                switched_model=switched_model,
+                                partial_accepted=partial_accepted,
+                                retry_index=retry_index,
+                                backoff_ms=backoff_ms,
+                                error=str(exc),
+                            )
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"Upstream auth_or_config error: {exc}",
+                        ) from exc
+
                     if failure_mode == "context_overflow" and retry_index == 0:
+                        recovery_action = "rerender_trim_retry"
+                        same_provider_retry = True
+                        rerender_only = True
+                        switched_model = False
                         current_messages = _trim_messages_for_context_overflow(current_messages)
+                        fallback_events.append(
+                            _fallback_event_row(
+                                attempt_index=attempt_index,
+                                model=model,
+                                provider=provider,
+                                failure_mode=failure_mode,
+                                recovery_action=recovery_action,
+                                same_provider_retry=same_provider_retry,
+                                rerender_only=rerender_only,
+                                switched_model=switched_model,
+                                partial_accepted=partial_accepted,
+                                retry_index=retry_index,
+                                backoff_ms=backoff_ms,
+                                error=str(exc),
+                            )
+                        )
                         continue
+
+                    if failure_mode == "tool_schema_mismatch" and retry_index == 0:
+                        recovery_action = "rerender_tool_mode_compatible"
+                        same_provider_retry = True
+                        rerender_only = True
+                        switched_model = False
+                        current_tools = []
+                        kwargs["tool_choice"] = "none"
+                        fallback_events.append(
+                            _fallback_event_row(
+                                attempt_index=attempt_index,
+                                model=model,
+                                provider=provider,
+                                failure_mode=failure_mode,
+                                recovery_action=recovery_action,
+                                same_provider_retry=same_provider_retry,
+                                rerender_only=rerender_only,
+                                switched_model=switched_model,
+                                partial_accepted=partial_accepted,
+                                retry_index=retry_index,
+                                backoff_ms=backoff_ms,
+                                error=str(exc),
+                            )
+                        )
+                        continue
+
+                    if failure_mode in {"transient_upstream", "stream_interrupted"} and retry_index == 0:
+                        recovery_action = "same_provider_retry"
+                        same_provider_retry = True
+                        switched_model = False
+                        fallback_events.append(
+                            _fallback_event_row(
+                                attempt_index=attempt_index,
+                                model=model,
+                                provider=provider,
+                                failure_mode=failure_mode,
+                                recovery_action=recovery_action,
+                                same_provider_retry=same_provider_retry,
+                                rerender_only=rerender_only,
+                                switched_model=switched_model,
+                                partial_accepted=partial_accepted,
+                                retry_index=retry_index,
+                                backoff_ms=backoff_ms,
+                                error=str(exc),
+                            )
+                        )
+                        continue
+
+                    if failure_mode == "rate_limit":
+                        recovery_action = "switch_provider_on_rate_limit"
+                    elif failure_mode == "context_overflow":
+                        recovery_action = "switch_model_bigger_context"
+                    elif failure_mode == "tool_schema_mismatch":
+                        recovery_action = "switch_model_tool_compatible"
+                    elif failure_mode == "stream_interrupted":
+                        recovery_action = "switch_model_after_stream_interrupt"
+                    elif failure_mode == "transient_upstream":
+                        recovery_action = "switch_model_after_transient"
+                    elif failure_mode == "unknown":
+                        recovery_action = "switch_model_unknown"
+
+                    fallback_events.append(
+                        _fallback_event_row(
+                            attempt_index=attempt_index,
+                            model=model,
+                            provider=provider,
+                            failure_mode=failure_mode,
+                            recovery_action=recovery_action,
+                            same_provider_retry=same_provider_retry,
+                            rerender_only=rerender_only,
+                            switched_model=switched_model,
+                            partial_accepted=partial_accepted,
+                            retry_index=retry_index,
+                            backoff_ms=backoff_ms,
+                            error=str(exc),
+                        )
+                    )
                     break
             if response is not None:
                 break
@@ -201,10 +331,12 @@ def create_app() -> FastAPI:
                     "fallback_chain": decision.get("fallback_chain") or decision.get("fallbacks") or [],
                     "context_budget": decision.get("context_budget"),
                     "grounding_mode": decision.get("grounding_mode"),
+                    "grounding_policy": grounding_policy,
                 },
                 "render": memory_pack.trim_report,
                 "fallback": fallback_events,
             },
+            "grounding_policy": grounding_policy,
         }
         return response, req, safety_ctx
 
@@ -446,14 +578,14 @@ def _extract_latest_user_query(messages: list[Any]) -> str:
 
 
 def _estimate_pack_size(pack: Any) -> int:
-    parts = [
+    canonical_parts = [
         str(getattr(pack, "l0", "")),
-        str(getattr(pack, "l1", "")),
-        str(getattr(pack, "l2", "")),
-        str(getattr(pack, "l3", "")),
-        str(getattr(pack, "l4", "")),
+        "\n".join(getattr(pack, "facts", []) or []),
+        "\n".join(getattr(pack, "procedures", []) or []),
+        "\n".join(getattr(pack, "continuity", []) or []),
+        "\n".join(getattr(pack, "constraints", []) or []),
     ]
-    return sum(len(part) for part in parts)
+    return sum(len(part) for part in canonical_parts if part)
 
 
 def _provider_from_model(model: str, fallback: str = "openai") -> str:
@@ -505,15 +637,58 @@ def _build_upstream_kwargs(
     return kwargs
 
 
-def _build_grounding_system_rules(grounding_mode: str) -> str:
+def _derive_grounding_policy(
+    *,
+    risk_profile: dict[str, Any],
+    pack_features: dict[str, Any],
+    metadata: dict[str, Any],
+) -> str:
+    task_type = str((metadata or {}).get("task_type") or "").lower()
+    risk_level = str((risk_profile or {}).get("risk_level") or "low")
+    verified_ratio = float((pack_features or {}).get("verified_ratio") or 0.0)
+    citation_density = float((pack_features or {}).get("citation_density") or 0.0)
+    if task_type in {"medical", "legal", "finance", "compliance"} or risk_level in {"high", "critical"}:
+        return "strict_citation"
+    if verified_ratio >= 0.75 and citation_density >= 0.4:
+        return "citation_preferred"
+    return "conservative_no_claim_extension"
+
+
+def _build_grounding_system_rules(grounding_mode: str, grounding_policy: str) -> str:
+    policy_line = f"Grounding policy: {grounding_policy}."
     if grounding_mode == "strict":
         return (
-            "Grounding mode: strict. Use only user input and cited memory facts. "
+            f"{policy_line} Grounding mode: strict. Use only user input and cited memory facts. "
             "If evidence is missing, say you do not know. Do not invent ports, paths, keys, or config values."
         )
     if grounding_mode == "relaxed":
-        return "Grounding mode: relaxed. Prefer cited memory, but reasonable inference is allowed when uncertainty is explicit."
-    return "Grounding mode: balanced. Prefer cited memory and clearly mark uncertainty when evidence is weak."
+        return (
+            f"{policy_line} Grounding mode: relaxed. Prefer cited memory, but reasonable inference is allowed "
+            "when uncertainty is explicit."
+        )
+    return (
+        f"{policy_line} Grounding mode: balanced. Prefer cited memory and clearly mark uncertainty when evidence is weak."
+    )
+
+
+def _build_evidence_policy_blocks(pack: Any) -> dict[str, str]:
+    facts = [str(item).strip() for item in (getattr(pack, "facts", []) or []) if str(item).strip()]
+    procedures = [str(item).strip() for item in (getattr(pack, "procedures", []) or []) if str(item).strip()]
+    continuity = [str(item).strip() for item in (getattr(pack, "continuity", []) or []) if str(item).strip()]
+    constraints = [str(item).strip() for item in (getattr(pack, "constraints", []) or []) if str(item).strip()]
+
+    def block(title: str, rows: list[str], fallback: str) -> str:
+        if not rows:
+            return f"{title}: {fallback}"
+        joined = "\n".join(f"- {row}" for row in rows[:8])
+        return f"{title}:\n{joined}"
+
+    return {
+        "facts": block("Citation-backed facts (safe for direct factual claims)", facts, "none"),
+        "procedures": block("Non-cited procedures (use conservatively, do not over-assert as fact)", procedures, "none"),
+        "continuity": block("Session continuity context (context only, not factual authority)", continuity, "none"),
+        "constraints": block("Hard constraints (must follow)", constraints, "none"),
+    }
 
 
 def _build_citation_system_block(citations: list[dict[str, Any]]) -> str:
@@ -531,11 +706,54 @@ def _classify_upstream_failure(exc: Exception) -> str:
     lowered = str(exc).lower()
     if any(token in lowered for token in ("context_length", "context window", "maximum context", "too many tokens")):
         return "context_overflow"
-    if any(token in lowered for token in ("tool", "function call", "does not support tools")):
-        return "tool_capability"
-    if any(token in lowered for token in ("timeout", "connection", "429", "503", "502", "service unavailable")):
-        return "provider_failure"
+    if any(token in lowered for token in ("rate limit", "too many requests", "quota", "429")):
+        return "rate_limit"
+    if any(token in lowered for token in ("401", "403", "unauthorized", "forbidden", "invalid api key", "missing api key", "config invalid")):
+        return "auth_or_config"
+    if any(token in lowered for token in ("tool schema", "function call", "does not support tools", "tool_choice", "invalid tools")):
+        return "tool_schema_mismatch"
+    if any(token in lowered for token in ("stream interrupted", "broken pipe", "incomplete chunk", "stream closed")):
+        return "stream_interrupted"
+    if any(token in lowered for token in ("timeout", "connection", "503", "502", "service unavailable", "temporarily unavailable")):
+        return "transient_upstream"
     return "unknown"
+
+
+def _provider_retry_backoff_ms(*, failure_mode: str, retry_index: int) -> int:
+    if failure_mode in {"transient_upstream", "rate_limit"}:
+        return min(200 * (retry_index + 1), 600)
+    return 0
+
+
+def _fallback_event_row(
+    *,
+    attempt_index: int,
+    model: str,
+    provider: str,
+    failure_mode: str,
+    recovery_action: str,
+    same_provider_retry: bool,
+    rerender_only: bool,
+    switched_model: bool,
+    partial_accepted: bool,
+    retry_index: int,
+    backoff_ms: int,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "attempt_index": attempt_index,
+        "retry_index": retry_index,
+        "model": model,
+        "provider": provider,
+        "failure_mode": failure_mode,
+        "recovery_action": recovery_action,
+        "same_provider_retry": same_provider_retry,
+        "rerender_only": rerender_only,
+        "switched_model": switched_model,
+        "partial_accepted": partial_accepted,
+        "backoff_ms": backoff_ms,
+        "error": error[:280],
+    }
 
 
 def _trim_messages_for_context_overflow(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -706,20 +924,22 @@ def _apply_grounding_to_openai_payload(payload: dict[str, Any], safety_ctx: dict
         str(safety_ctx.get("user_text") or ""),
         str(safety_ctx.get("memory_context") or ""),
     ]
-    check = supported_claim_check(answer_text=text, sources=source_blobs)
-    strict = _is_high_risk_metadata(safety_ctx.get("metadata") or {})
+    strict = _is_high_risk_metadata(safety_ctx.get("metadata") or {}) or (
+        str(safety_ctx.get("grounding_policy") or "") == "strict_citation"
+    )
+    check = supported_claim_check(answer_text=text, sources=source_blobs, strict=strict)
     grounded_text = apply_hallucination_guard(answer_text=text, check=check, strict=strict)
-    if bool(check.get("has_critical_unsupported")):
-        grounded_text = _degrade_critical_unsupported_claims(text=grounded_text, check=check)
-        safety_ctx.setdefault("trace", {}).setdefault("grounding", {})["action"] = "critical_degraded_template"
-    else:
-        safety_ctx.setdefault("trace", {}).setdefault("grounding", {})["action"] = "pass_through_or_warning"
+    action = str(check.get("degrade_action") or "pass_through")
+    safety_ctx.setdefault("trace", {}).setdefault("grounding", {})["action"] = action
     safety_ctx["grounding"] = check
     safety_ctx.setdefault("trace", {}).setdefault("grounding", {}).update(
         {
             "claim_count": len(check.get("claims") or []),
+            "supported_claim_count": len(check.get("supported_claim_ids") or []),
+            "unsupported_claim_count": len(check.get("unsupported_claim_ids") or []),
             "unsupported_ratio": float(check.get("unsupported_ratio") or 0.0),
-            "critical_unsupported_count": len(check.get("critical_unsupported_claims") or []),
+            "critical_unsupported_count": len(check.get("critical_unsupported_claim_ids") or []),
+            "degrade_action": action,
         }
     )
     if grounded_text == text:
@@ -747,19 +967,6 @@ def _is_high_risk_metadata(metadata: dict[str, Any]) -> bool:
         return True
     task_type = str(metadata.get("task_type") or "").lower()
     return task_type in {"debug", "compliance", "medical", "legal", "finance"}
-
-
-def _degrade_critical_unsupported_claims(text: str, check: dict[str, Any]) -> str:
-    critical_claims = [str(item).strip() for item in (check.get("critical_unsupported_claims") or []) if str(item).strip()]
-    if not critical_claims:
-        return text
-    degraded = text
-    for claim in critical_claims:
-        degraded = degraded.replace(claim, "")
-    degraded = re.sub(r"\n{3,}", "\n\n", degraded).strip()
-    if not degraded:
-        degraded = "I do not have enough grounded evidence to answer this reliably."
-    return f"{degraded}\n\nNote: Critical claims without evidence were removed."
 
 
 def _responses_response_from_openai(

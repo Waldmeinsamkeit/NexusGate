@@ -435,7 +435,7 @@ class MemoryManager:
         return kept, dropped
 
     @staticmethod
-    def _semantic_compress_layer(items: list[ScoredMemory], max_items: int, max_chars: int) -> list[ScoredMemory]:
+    def _semantic_compress_layer(items: list[ScoredMemory], max_items: int) -> list[ScoredMemory]:
         compressed: list[ScoredMemory] = []
         seen: set[str] = set()
         for row in items:
@@ -466,10 +466,10 @@ class MemoryManager:
 
     def _semantic_compress(self, scored_by_layer: dict[str, list[ScoredMemory]]) -> dict[str, list[ScoredMemory]]:
         return {
-            "L1": self._semantic_compress_layer(scored_by_layer.get("L1", []), max_items=self.top_k, max_chars=220),
-            "L2": self._semantic_compress_layer(scored_by_layer.get("L2", []), max_items=self.top_k, max_chars=260),
-            "L3": self._semantic_compress_layer(scored_by_layer.get("L3", []), max_items=self.top_k, max_chars=220),
-            "L4": self._semantic_compress_layer(scored_by_layer.get("L4", []), max_items=self.top_k, max_chars=160),
+            "L1": self._semantic_compress_layer(scored_by_layer.get("L1", []), max_items=self.top_k),
+            "L2": self._semantic_compress_layer(scored_by_layer.get("L2", []), max_items=self.top_k),
+            "L3": self._semantic_compress_layer(scored_by_layer.get("L3", []), max_items=self.top_k),
+            "L4": self._semantic_compress_layer(scored_by_layer.get("L4", []), max_items=self.top_k),
         }
 
     def _build_retrieval_result(
@@ -539,6 +539,31 @@ class MemoryManager:
         }
         return features, risk
 
+    @staticmethod
+    def _render_section_text(items: list[str]) -> str:
+        rows = [str(item).strip() for item in items if str(item).strip()]
+        return "\n".join(rows) if rows else "(empty)"
+
+    def _legacy_layers_from_sections(
+        self,
+        *,
+        facts: list[str],
+        procedures: list[str],
+        continuity: list[str],
+        constraints: list[str],
+    ) -> dict[str, str]:
+        l1 = self._render_section_text(constraints)
+        l2 = self._render_section_text(facts)
+        l3 = self._render_section_text(procedures)
+        l4 = self._render_section_text(continuity)
+        # Deprecated legacy layer fields; retained for compatibility only.
+        return {
+            "l1": l1,
+            "l2": l2,
+            "l3": l3,
+            "l4": l4,
+        }
+
     def build_memory_pack(self, session_id: str, query: str, project_id: str = "") -> MemoryPack:
         task_type = self.selector.classify_task(query)
         include_l4 = task_type in {"debug", "planning"} or self._contains_continuity_terms(query)
@@ -550,15 +575,20 @@ class MemoryManager:
             include_l4=include_l4,
         )
         compressed = self._semantic_compress(scored_by_layer)
-        budget = self.selector.budget_for_task(task_type)
-        selected_by_layer = self.selector.select_items_by_layer(compressed, budget)
-        selected = self.selector.select(
-            user_text=query,
-            l0="\n".join(self.l0_rules.splitlines()[:12]).strip(),
-            items_by_layer=compressed,
-        )
+        selected_by_layer = compressed
+        l0_text = "\n".join(self.l0_rules.splitlines()[:12]).strip()
         selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in selected_by_layer.get(layer, [])]
         citations = self._ensure_citations(self._build_pack_citations_from_scored(items=selected_items), query)
+        facts = [row.text for row in selected_by_layer.get("L2", [])]
+        procedures = [row.text for row in selected_by_layer.get("L3", [])]
+        continuity = [row.text for row in selected_by_layer.get("L4", [])]
+        constraints = [row.text for row in selected_by_layer.get("L1", [])]
+        legacy_layers = self._legacy_layers_from_sections(
+            facts=facts,
+            procedures=procedures,
+            continuity=continuity,
+            constraints=constraints,
+        )
         retrieval = self._build_retrieval_result(
             session_id=session_id,
             project_id=project_id,
@@ -569,26 +599,26 @@ class MemoryManager:
             stats=stats,
         )
         features, risk = self._build_pack_features(
-            facts=[row.text for row in selected_by_layer.get("L2", [])],
-            procedures=[row.text for row in selected_by_layer.get("L3", [])],
-            continuity=[row.text for row in selected_by_layer.get("L4", [])],
+            facts=facts,
+            procedures=procedures,
+            continuity=continuity,
             citations=citations,
             retrieval=retrieval,
         )
         return MemoryPack(
-            task_type=selected.task_type,
-            budget=self.selector.budget_for_task(selected.task_type),
-            l0=selected.l0,
-            l1=selected.l1,
-            l2=selected.l2,
-            l3=selected.l3,
-            l4=selected.l4,
+            task_type=task_type,
+            budget=self.selector.budget_for_task(task_type),
+            l0=l0_text,
+            l1=legacy_layers["l1"],
+            l2=legacy_layers["l2"],
+            l3=legacy_layers["l3"],
+            l4=legacy_layers["l4"],
             citations=citations,
             selected_ids=[row.memory_id for row in selected_items if row.memory_id][: self.top_k * 4],
-            facts=[row.text for row in selected_by_layer.get("L2", [])],
-            procedures=[row.text for row in selected_by_layer.get("L3", [])],
-            continuity=[row.text for row in selected_by_layer.get("L4", [])],
-            constraints=[row.text for row in selected_by_layer.get("L1", [])],
+            facts=facts,
+            procedures=procedures,
+            continuity=continuity,
+            constraints=constraints,
             risk_profile=risk,
             pack_features=features,
             estimated_tokens=int(features.get("estimated_tokens") or 0),
@@ -672,67 +702,157 @@ class MemoryManager:
         return 2200
 
     @staticmethod
+    def _block_priority(section: str) -> int:
+        # lower means higher retention priority
+        priorities = {"constraints": 0, "facts": 1, "procedures": 2, "continuity": 3}
+        return priorities.get(section, 9)
+
+    @staticmethod
+    def _build_render_blocks(pack: MemoryPack) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+
+        def add(section: str, rows: list[str]) -> None:
+            for idx, text in enumerate(rows):
+                normalized = str(text).strip()
+                if not normalized:
+                    continue
+                item_id = f"{section}:{idx}:{hashlib.sha1(normalized.encode('utf-8')).hexdigest()[:10]}"
+                citation_ids = [
+                    str(row.get("memory_ref"))
+                    for row in (pack.citations or [])
+                    if str(row.get("snippet") or "").strip() and str(row.get("snippet") or "")[:32] in normalized
+                ]
+                blocks.append(
+                    {
+                        "section": section,
+                        "item_id": item_id,
+                        "citation_ids": citation_ids,
+                        "priority": MemoryManager._block_priority(section),
+                        "text": normalized,
+                    }
+                )
+
+        add("constraints", list(pack.constraints or []))
+        add("facts", list(pack.facts or []))
+        add("procedures", list(pack.procedures or []))
+        add("continuity", list(pack.continuity or []))
+        return blocks
+
+    @staticmethod
+    def _render_sections_from_blocks(blocks: list[dict[str, Any]]) -> dict[str, str]:
+        grouped: dict[str, list[str]] = {"constraints": [], "facts": [], "procedures": [], "continuity": []}
+        for block in blocks:
+            section = str(block.get("section") or "")
+            text = str(block.get("text") or "").strip()
+            if section in grouped and text:
+                grouped[section].append(text)
+        return {
+            "constraints": "\n".join(grouped["constraints"]) if grouped["constraints"] else "(empty)",
+            "facts": "\n".join(grouped["facts"]) if grouped["facts"] else "(empty)",
+            "procedures": "\n".join(grouped["procedures"]) if grouped["procedures"] else "(empty)",
+            "continuity": "\n".join(grouped["continuity"]) if grouped["continuity"] else "(empty)",
+        }
+
+    @staticmethod
+    def _trim_candidate_index(blocks: list[dict[str, Any]]) -> int | None:
+        if not blocks:
+            return None
+        # drop the lowest-priority block, biasing to the last block for stable progressive trimming
+        ordered = sorted(
+            range(len(blocks)),
+            key=lambda i: (int(blocks[i].get("priority", 9)), i),
+            reverse=True,
+        )
+        return ordered[0] if ordered else None
+
+    @staticmethod
     def _apply_provider_trim(
         *,
-        blocks: dict[str, str],
+        blocks: list[dict[str, Any]],
         max_chars: int,
-    ) -> tuple[dict[str, str], dict[str, int | str]]:
-        total = sum(len(text) for text in blocks.values())
-        if total <= max_chars:
-            return blocks, {"trimmed_total_chars": 0, "final_total_chars": total, "mode": "no_trim"}
-        report: dict[str, int | str] = {"mode": "provider_aware_trim"}
-        min_keep = {"l1": 120, "l2": 220, "l3": 80, "l4": 0}
-        trim_order = ("l4", "l3", "l2", "l1")
-        trimmed = dict(blocks)
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        kept = [dict(row) for row in blocks]
+        dropped: list[dict[str, Any]] = []
 
-        def split_rows(text: str) -> list[str]:
-            if not text or text == "(empty)":
-                return []
-            return [row for row in text.splitlines() if row.strip()]
+        def total_chars(rows: list[dict[str, Any]]) -> int:
+            return sum(len(str(item.get("text") or "")) for item in rows)
 
-        remaining_excess = total - max_chars
-        for key in trim_order:
-            if remaining_excess <= 0:
+        before_chars = total_chars(kept)
+        before_tokens = before_chars // 4
+        trim_passes = 0
+        while kept and total_chars(kept) > max_chars:
+            idx = MemoryManager._trim_candidate_index(kept)
+            if idx is None:
                 break
-            rows = split_rows(trimmed[key])
-            if not rows:
-                continue
-            floor = min_keep[key]
-            while rows and remaining_excess > 0:
-                candidate = "\n".join(rows[:-1]) if len(rows) > 1 else "(empty)"
-                if candidate != "(empty)" and len(candidate) < floor:
-                    break
-                removed_text = rows[-1]
-                rows = rows[:-1]
-                trimmed[key] = candidate
-                cut = len(removed_text) + (1 if rows else 0)
-                report[f"trimmed_{key}_chars"] = int(report.get(f"trimmed_{key}_chars", 0)) + cut
-                remaining_excess -= cut
-        final_total = sum(len(text) for text in trimmed.values())
-        report["trimmed_total_chars"] = total - final_total
-        report["final_total_chars"] = final_total
-        return trimmed, report
+            candidate = kept.pop(idx)
+            candidate["drop_reason"] = "budget_trim_priority"
+            dropped.append(candidate)
+            trim_passes += 1
+
+        after_chars = total_chars(kept)
+        after_tokens = after_chars // 4
+        sections_after = MemoryManager._render_sections_from_blocks(kept)
+        dropped_by_section = {"facts": 0, "procedures": 0, "continuity": 0, "constraints": 0}
+        for row in dropped:
+            section = str(row.get("section") or "")
+            if section in dropped_by_section:
+                dropped_by_section[section] += len(str(row.get("text") or ""))
+
+        report: dict[str, Any] = {
+            "mode": "provider_aware_trim",
+            "final_render_strategy": "block_oriented_priority_trim",
+            "budget_before": max_chars,
+            "budget_after": max_chars,
+            "estimated_tokens_before": before_tokens,
+            "estimated_tokens_after": after_tokens,
+            "trimmed_total_chars": before_chars - after_chars,
+            "final_total_chars": after_chars,
+            "trim_passes": trim_passes,
+            "dropped_blocks": [str(row.get("item_id") or "") for row in dropped],
+            "dropped_block_ids": [str(row.get("item_id") or "") for row in dropped],
+            "drop_reason_by_block": {str(row.get("item_id") or ""): str(row.get("drop_reason") or "") for row in dropped},
+            "drop_reasons": [str(row.get("drop_reason") or "") for row in dropped],
+            "rendered_block_order": [str(row.get("item_id") or "") for row in kept],
+            "retained_counts_by_section": {
+                "facts": len([row for row in kept if row.get("section") == "facts"]),
+                "procedures": len([row for row in kept if row.get("section") == "procedures"]),
+                "continuity": len([row for row in kept if row.get("section") == "continuity"]),
+                "constraints": len([row for row in kept if row.get("section") == "constraints"]),
+            },
+            "retained_fact_ids": [str(row.get("item_id") or "") for row in kept if row.get("section") == "facts"],
+            "retained_procedure_ids": [str(row.get("item_id") or "") for row in kept if row.get("section") == "procedures"],
+            "retained_continuity_ids": [str(row.get("item_id") or "") for row in kept if row.get("section") == "continuity"],
+            "retained_constraint_ids": [str(row.get("item_id") or "") for row in kept if row.get("section") == "constraints"],
+            # compatibility fields used by existing tests
+            "trimmed_l1_chars": dropped_by_section["constraints"],
+            "trimmed_l2_chars": dropped_by_section["facts"],
+            "trimmed_l3_chars": dropped_by_section["procedures"],
+            "trimmed_l4_chars": dropped_by_section["continuity"],
+            "sections_after": sections_after,
+        }
+        return kept, report
 
     @staticmethod
     def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
         max_chars = MemoryManager._provider_char_budget(provider_style)
-        blocks = {"l1": pack.l1, "l2": pack.l2, "l3": pack.l3, "l4": pack.l4}
-        trimmed, report = MemoryManager._apply_provider_trim(blocks=blocks, max_chars=max_chars)
+        render_blocks = MemoryManager._build_render_blocks(pack)
+        kept_blocks, report = MemoryManager._apply_provider_trim(blocks=render_blocks, max_chars=max_chars)
         pack.trim_report = report
+        sections = MemoryManager._render_sections_from_blocks(kept_blocks)
         if provider_style == "anthropic_messages":
             return (
                 f"{pack.l0}\n\n"
-                f"<anthropic_memory_index>\n{trimmed['l1']}\n</anthropic_memory_index>\n\n"
-                f"<anthropic_relevant_skills>\n{trimmed['l3']}\n</anthropic_relevant_skills>\n\n"
-                f"<anthropic_session_recall_hints>\n{trimmed['l4']}\n</anthropic_session_recall_hints>\n\n"
-                f"<anthropic_relevant_memory>\n{trimmed['l2']}\n</anthropic_relevant_memory>"
+                f"<anthropic_memory_index>\n{sections['constraints']}\n</anthropic_memory_index>\n\n"
+                f"<anthropic_relevant_skills>\n{sections['procedures']}\n</anthropic_relevant_skills>\n\n"
+                f"<anthropic_session_recall_hints>\n{sections['continuity']}\n</anthropic_session_recall_hints>\n\n"
+                f"<anthropic_relevant_memory>\n{sections['facts']}\n</anthropic_relevant_memory>"
             )
         return (
             f"{pack.l0}\n\n"
-            f"<memory_index>\n{trimmed['l1']}\n</memory_index>\n\n"
-            f"<relevant_skills>\n{trimmed['l3']}\n</relevant_skills>\n\n"
-            f"<session_recall_hints>\n{trimmed['l4']}\n</session_recall_hints>\n\n"
-            f"<relevant_memory>\n{trimmed['l2']}\n</relevant_memory>"
+            f"<memory_index>\n{sections['constraints']}\n</memory_index>\n\n"
+            f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>\n\n"
+            f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>\n\n"
+            f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"
         )
 
     def build_memory_header(self, session_id: str, query: str) -> str:

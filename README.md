@@ -1,245 +1,230 @@
 # NexusGate
 
-具备本地记忆能力的 LLM 网关，提供 OpenAI 兼容接口，并在请求转发到上游模型前执行记忆检索、筛选、编排与受控写入。
+具备本地记忆能力的 LLM 网关，提供 OpenAI 兼容入口，并在请求转发到上游模型前完成：
 
-> 适合本地部署给 CLI、编码代理、自动化脚本或兼容 OpenAI API 的客户端使用。
+- 记忆检索与上下文注入
+- 跨 provider 路由与回退
+- 动态上下文压缩
+- 基于证据的幻觉抑制
+- 本地 API Key 管理与客户端配置同步
 
----
-
-## 功能特性
-
-- 统一网关入口，兼容多种客户端接入方式
-- 支持以下 API：
-  - `POST /v1/chat/completions`
-  - `POST /v1/responses`
-  - `POST /v1/messages`
-- 在上游补全前执行本地记忆检索与上下文注入
-- 分层记忆设计，区分稳定事实、可复用技能与会话归档
-- 支持官方模型提供方与 OpenAI 兼容第三方后端
-- 对高层记忆写入设置更严格的校验门禁
-- 适合作为本地“带记忆的模型入口层”
+它适合部署在本地或内网，作为 CLI、Agent、自动化脚本、IDE 插件、OpenAI 兼容客户端的统一接入层。
 
 ---
 
-## 工作方式
+## 1. 核心能力
 
-NexusGate 的核心流程如下：
+### 1.1 OpenAI 兼容网关入口
 
-```text
-Client
-  -> NexusGate
-    -> 请求标准化
-    -> 记忆检索 / 评分 / 去重 / 组装
-    -> 安全与事实约束处理
-    -> 转发到上游模型
-    -> 异步触发记忆更新 / 会话归档
-```
+当前支持以下接口：
 
-对于 `/v1/responses` 路由，当配置了第三方 OpenAI 兼容上游时，会尽量保持原始透传，以减少对 Codex 工具调用语义的破坏，例如：
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/messages`
+- `GET /health`
 
-- 编辑文件
-- 执行命令
-- 多轮 tool loop
-- 响应流式事件格式保真
+你可以把 NexusGate 当成一个本地 LLM API 聚合入口，对外暴露统一 Base URL，再由它决定记忆注入、路由、回退和安全控制。
 
 ---
 
-## 记忆分层设计
+### 1.2 分层记忆系统
 
-当前实现中的记忆语义可概括为：
+NexusGate 会围绕请求构建 `MemoryPack`，并将记忆分为稳定结构后再渲染到不同 provider：
 
-### L1 — 索引指针
-用于存放简短的主题提示、导航线索或路由提示。
+- `L0`：全局元规则 / 系统级约束
+- `constraints`：约束、规则、索引类信息
+- `procedures`：技能、步骤、可复用操作经验
+- `continuity`：会话连续性线索、任务上下文
+- `facts`：与当前任务相关的事实记忆
 
-适合：
-- 关键词索引
-- 轻量主题指针
-- 简短入口提示
+在注入模型前，系统会按 provider 风格渲染记忆：
 
-不适合：
-- 冗长总结
-- 步骤型流程说明
+- OpenAI 风格标签：
+  - `<memory_index>`
+  - `<relevant_skills>`
+  - `<session_recall_hints>`
+  - `<relevant_memory>`
 
-### L2 — 已验证的稳定事实
-用于存放可长期复用、且已经验证的具体事实。
-
-适合：
-- 已确认的配置项
-- 文件路径
-- 成功命令
-- 端口、模型名、接口行为等稳定结论
-
-不适合：
-- 普通闲聊内容
-- 泛化摘要
-- 未验证信息
-
-### L3 — 可复用任务结论 / 技能
-用于存放在编码、调试、重复任务中可复用的方法和经验。
-
-适合：
-- 修复模式
-- 调试套路
-- 稳定工作流结论
-- 任务级操作经验
-
-### L4 — 会话回溯 / 归档
-用于承载会话摘要、回溯上下文和归档型材料。
-
-特点：
-- 是当前会话回顾与压缩的主要承载层
-- 某些不适合进入 L2/L3 的内容，会以压缩归档形式进入这一层
+- Anthropic Messages 风格标签：
+  - `<anthropic_memory_index>`
+  - `<anthropic_relevant_skills>`
+  - `<anthropic_session_recall_hints>`
+  - `<anthropic_relevant_memory>`
 
 ---
 
-## 记忆写入原则
+### 1.3 动态上下文压缩
 
-当前写入策略是偏保守的：
+NexusGate 不是简单地“把所有记忆都塞进去”，而是会根据 provider 的上下文预算执行裁剪：
 
-- **L1 / L2 / L3 应以 verified 内容为主**
-- **L4 可以存储会话摘要与归档材料**
-- **L2 不存放泛化的会话总结**
-- **L1 不存放步骤化长流程**
-- 高层记忆在写入前会经过更严格的规则门禁
+- 先构建标准化 render blocks
+- 再执行 provider-aware trim
+- 保留 canonical section 结构
+- 生成 `trim_report`
+- 在上下文溢出时优先进行 rerender / trim retry，而不是盲目失败
 
-这样做的目标是：
-
-- 提高检索稳定性
-- 减少跨层污染
-- 避免“把临时对话误当长期事实”
+这让它更适合长对话、长任务、代理式工作流。
 
 ---
 
-## 记忆选择与组装
+### 1.4 跨 provider 路由与回退
 
-请求进入网关后，记忆并不是简单地“固定 top-k 拼接”，而是经过更清晰的选择流程：
+NexusGate 内置 `ProviderRouter`，可根据配置与请求特征进行路由，并在失败时回退。
 
-1. **任务分类**
-   - 识别当前请求更接近 coding、debugging、planning、retrieval 或 general chat
+当前实现具备这些行为：
 
-2. **预算分配**
-   - 按任务类型分配不同的记忆预算
-
-3. **候选评分**
-   - 综合多种信号排序，例如：
-     - term overlap
-     - task-type preference
-     - layer weight
-     - verification status
-
-4. **跨层去重**
-   - 去掉同一事实的低价值重复版本
-
-5. **最终组装**
-   - 形成发往上游模型的 memory context
+- 根据目标模型或上游配置决定 provider
+- 支持 direct provider 与 OpenAI-compatible backend 两种模式
+- 支持 fallback chain
+- 支持同 provider 重试
+- 支持上下文溢出后的 rerender trim retry
+- 支持工具模式不兼容时降级重试
+- 记录 provider 健康信息与部分回退事件
 
 ---
 
-## 支持的上游模式
+### 1.5 幻觉抑制与 grounding
 
-NexusGate 可以将请求路由到：
+在请求发往上游前，NexusGate 会附加 grounding 规则与证据块；在回答阶段，可结合支持性检查抑制幻觉。
 
-### 1) 官方模型提供方
-例如：
+当前已实现的安全相关能力包括：
 
-- OpenAI
-- Anthropic
+- 基于记忆事实与约束构建 evidence blocks
+- 通过 citation block 约束回答引用依据
+- 基于 claim support 进行检查
+- 输出 `unsupported_ratio`
+- 对 unsupported claims 执行 rewrite / degrade 策略
+- 在严格模式或高风险情况下更保守回答
+- 通过系统提示要求“未知就说不知道”
 
-### 2) OpenAI 兼容第三方后端
-例如：
-
-- LiteLLM Proxy
-- Bifrost
-- 其他 OpenAI-compatible 聚合服务
-
-如果设置了第三方 `TARGET_BASE_URL`，网关会优先使用该上游地址。
+这让网关更适合知识型问答、项目辅助、代理执行等容易出现“编造答案”的场景。
 
 ---
 
-## 项目结构
+## 2. 运行模式
 
-典型入口如下：
+NexusGate 支持两类上游模式。
 
-- 应用工厂：`nexusgate.app:create_app`
-- 默认启动模块：`nexus_gate_core:app`
+### 模式 A：直连 provider
+
+例如直连某个 provider 的模型：
+
+- `TARGET_PROVIDER=claude-sonnet-4-5-20250929`
+- 同时配置对应 provider 所需 API Key
+
+### 模式 B：转发到 OpenAI 兼容后端
+
+例如转发到自建聚合层、本地模型服务、第三方兼容接口：
+
+- `TARGET_PROVIDER=gpt-5.3-codex`
+- `TARGET_BASE_URL=http://localhost:11434/v1`
+- `TARGET_API_KEY=sk-anything`
+
+如果配置了 `TARGET_BASE_URL`，NexusGate 会以 OpenAI-compatible 模式请求上游。
 
 ---
 
-## 安装
+## 3. 安装
 
-### 1. 克隆仓库
+### 3.1 环境要求
+
+- Python 3.10+
+- 可访问的上游模型服务或 OpenAI-compatible 接口
+
+### 3.2 安装依赖
 
 ```bash
-git clone <your-repo-url>
-cd NexusGate
+pip install -r requirements.txt
 ```
-
-### 2. 安装依赖
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-当前依赖包括：
-
-- `fastapi`
-- `uvicorn`
-- `litellm`
-- `pydantic`
-- `pydantic-settings`
-- `chromadb`
-- `sentence-transformers`
 
 ---
 
-## 配置
+## 4. 配置
 
-建议先复制示例配置：
+项目根目录提供了 `.env.example`，可复制为 `.env` 后修改。
 
 ```bash
 cp .env.example .env
 ```
 
-Windows PowerShell：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-### `.env.example` 主要配置项
+### 4.1 基础配置
 
 ```env
-OPENAI_API_KEY=sk-xxx
-ANTHROPIC_API_KEY=sk-ant-xxx
-
 APP_NAME=NexusGate-Core
 APP_ENV=dev
 HOST=0.0.0.0
 PORT=8000
 REQUEST_TIMEOUT_SECONDS=120
+```
 
+### 4.2 本地鉴权
+
+```env
 LOCAL_API_KEY=ng-abc123
 API_KEY_REQUIRED=false
 LOCAL_API_KEY_STORE_PATH=~/.nexusgate/secrets.json
+```
 
-CLIENT_SYNC_ENABLED=true
-CODEX_CONFIG_PATH=C:/Users/Administrator/.codex/config.toml
-CLAUDE_SETTINGS_PATH=C:/Users/Administrator/.claude/settings.json
-CODEX_LOCAL_BASE_URL=http://127.0.0.1:8000/v1
-CLAUDE_LOCAL_BASE_URL=http://127.0.0.1:8000
+支持以下请求头之一：
 
-UPSTREAM_API_KEY_REQUIRED=true
-DEFAULT_MODEL=claude-sonnet-4-5-20250929
+- `Authorization: Bearer <token>`
+- `x-api-key: <token>`
+- `api-key: <token>`
+
+---
+
+### 4.3 上游 provider / OpenAI-compatible 配置
+
+```env
+OPENAI_API_KEY=sk-xxx
+ANTHROPIC_API_KEY=sk-ant-xxx
 
 TARGET_PROVIDER=gpt-5.3-codex
 TARGET_BASE_URL=https://your-openai-compatible-endpoint/v1
 TARGET_API_KEY=sk-upstream-xxx
+UPSTREAM_API_KEY_REQUIRED=true
+DEFAULT_MODEL=claude-sonnet-4-5-20250929
+```
 
+字段说明：
+
+- `TARGET_PROVIDER`：默认目标模型或 provider 入口
+- `TARGET_BASE_URL`：上游 OpenAI-compatible 接口地址；留空则走 provider direct 模式
+- `TARGET_API_KEY`：上游接口所需密钥
+- `DEFAULT_MODEL`：默认模型名
+- `UPSTREAM_API_KEY_REQUIRED`：是否强制要求上游 key
+
+---
+
+### 4.4 LLMAPI 兼容字段（legacy aliases）
+
+为兼容旧配置，当前仍保留：
+
+```env
 LLMAPI_BASE_URL=
 LLMAPI_API_KEY=
 LLMAPI_MODEL_PREFIX=llmapi/
 LLMAPI_PROVIDER_PREFIX=openai/
+```
 
+建议新部署优先使用：
+
+- `TARGET_BASE_URL`
+- `TARGET_API_KEY`
+- `TARGET_PROVIDER`
+
+如果你前端里要做“LLMAPI 的 API / Base URL 配置”，建议 UI 层这样处理：
+
+- 主展示名：`OpenAI-Compatible Upstream`
+- 兼容导入名：`LLMAPI (Legacy)`
+- 保存时统一写入 `TARGET_*`
+- 如检测到旧字段存在，则在界面中提示“已从 legacy alias 导入”
+
+---
+
+### 4.5 记忆配置
+
+```env
 MEMORY_ENABLED=true
 MEMORY_STORE_PATH=memory
 MEMORY_SOURCE_ROOT=.
@@ -247,91 +232,53 @@ MEMORY_COLLECTION_NAME=nexusgate_memory
 MEMORY_TOP_K=6
 ```
 
-### 关键配置说明
+字段说明：
 
-#### 网关监听
-- `HOST`：监听地址
-- `PORT`：监听端口
-
-#### 本地鉴权
-- `LOCAL_API_KEY`：客户端访问 NexusGate 时使用的本地密钥
-- `API_KEY_REQUIRED`：是否要求请求携带 Bearer Token
-- 如果设置了 `LOCAL_API_KEY`，请求需携带相同 token
-
-#### 上游模型
-- `TARGET_PROVIDER`：目标模型名或默认上游模型
-- `TARGET_BASE_URL`：第三方 OpenAI 兼容上游地址
-- `TARGET_API_KEY`：第三方上游密钥
-
-#### 兼容旧字段
-以下字段仍可作为兼容别名参与解析：
-
-- `LLMAPI_BASE_URL`
-- `LLMAPI_API_KEY`
-
-#### 记忆系统
-- `MEMORY_ENABLED`：是否启用记忆
-- `MEMORY_STORE_PATH`：本地记忆目录
-- `MEMORY_SOURCE_ROOT`：源码/工作目录根路径
-- `MEMORY_COLLECTION_NAME`：记忆集合名称
-- `MEMORY_TOP_K`：默认检索数量
+- `MEMORY_ENABLED`：是否启用记忆增强
+- `MEMORY_STORE_PATH`：本地记忆存储路径
+- `MEMORY_SOURCE_ROOT`：源代码 / 工作目录根路径
+- `MEMORY_COLLECTION_NAME`：记忆集合名
+- `MEMORY_TOP_K`：每次检索的记忆条数上限
 
 ---
 
-## 启动方式
+### 4.6 本地客户端同步配置
 
-### Linux / macOS
-
-```bash
-chmod +x run.sh
-./run.sh
+```env
+CLIENT_SYNC_ENABLED=true
+CODEX_CONFIG_PATH=C:/Users/Administrator/.codex/config.toml
+CLAUDE_SETTINGS_PATH=C:/Users/Administrator/.claude/settings.json
+CODEX_LOCAL_BASE_URL=http://127.0.0.1:8000/v1
+CLAUDE_LOCAL_BASE_URL=http://127.0.0.1:8000
 ```
 
-### Windows PowerShell
+用于把本地工具自动指向 NexusGate。
 
-```powershell
-./run.ps1
-```
+---
 
-### 直接使用 uvicorn
+## 5. 启动
 
-```bash
-python -m uvicorn nexus_gate_core:app --host 0.0.0.0 --port 8000
-```
-
-也可以使用工厂风格入口自行组织启动：
+### 5.1 使用应用工厂启动
 
 ```bash
 python -m uvicorn nexusgate.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
----
+### 5.2 兼容旧启动方式
 
-## 常见部署场景
-
-### 场景 A：转发到官方模型
+仓库中也保留了旧示例：
 
 ```bash
-export TARGET_PROVIDER=claude-sonnet-4-5-20250929
-export ANTHROPIC_API_KEY=sk-ant-xxx
-export OPENAI_API_KEY=sk-xxx
 python -m uvicorn nexus_gate_core:app --host 0.0.0.0 --port 8000
 ```
 
-### 场景 B：转发到 OpenAI 兼容第三方后端
-
-```bash
-export TARGET_PROVIDER=gpt-5.3-codex
-export TARGET_BASE_URL=http://localhost:11434/v1
-export TARGET_API_KEY=sk-anything
-python -m uvicorn nexus_gate_core:app --host 0.0.0.0 --port 8000
-```
+如新版本以 `nexusgate.app:create_app` 为准，建议优先采用应用工厂方式启动。
 
 ---
 
-## API 入口
+## 6. API 示例
 
-### 1) Chat Completions
+### 6.1 Chat Completions
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -345,7 +292,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-### 2) Responses API
+### 6.2 Responses API
 
 ```bash
 curl http://127.0.0.1:8000/v1/responses \
@@ -357,7 +304,7 @@ curl http://127.0.0.1:8000/v1/responses \
   }'
 ```
 
-### 3) Anthropic-style Messages
+### 6.3 Anthropic-style Messages
 
 ```bash
 curl http://127.0.0.1:8000/v1/messages \
@@ -372,23 +319,17 @@ curl http://127.0.0.1:8000/v1/messages \
   }'
 ```
 
-> 本地鉴权支持以下头部之一：
->
-> - `Authorization: Bearer <token>`
-> - `x-api-key: <token>`
-> - `api-key: <token>`
-
 ---
 
-## 客户端接入
+## 7. 客户端接入
 
-### OpenAI 兼容客户端
+### 7.1 OpenAI 兼容客户端
 
-- **Base URL:** `http://127.0.0.1:8000/v1`
-- **Model:** 使用你希望路由的模型名
-- **API Key:** 若启用了本地鉴权，则填 `LOCAL_API_KEY`
+- **Base URL**: `http://127.0.0.1:8000/v1`
+- **Model**: 你希望路由到的模型名
+- **API Key**: 如果启用了本地鉴权，则填写 `LOCAL_API_KEY`
 
-### Aider 示例
+### 7.2 Aider
 
 ```bash
 aider \
@@ -396,74 +337,290 @@ aider \
   --api-base http://127.0.0.1:8000/v1
 ```
 
-### Codex / Claude 本地配置
+### 7.3 Codex / Claude 本地配置
 
-配置中已经预留：
+可结合以下配置项自动接入：
 
 - `CODEX_CONFIG_PATH`
 - `CLAUDE_SETTINGS_PATH`
 - `CODEX_LOCAL_BASE_URL`
 - `CLAUDE_LOCAL_BASE_URL`
 
-用于将本地工具指向 NexusGate。
-
 ---
 
-## 健康检查
+## 8. 健康检查
 
 ```bash
 curl http://127.0.0.1:8000/health
 ```
 
+典型返回信息包含：
+
+- `status`
+- `upstream`
+- `upstream_mode`
+- `auth_mode`
+- `local_key_source`
+- `sync_status`
+- `synced_clients`
+- `sync_errors`
+
+这对于前端管理台很有用，可以直接做“系统状态总览”。
+
 ---
 
-## 测试
+## 9. 当前实现重点
 
-已验证的单元测试命令示例：
+基于当前代码，README 需要明确：它已经不只是一个“记忆拼接器”，而是一个具备多层控制逻辑的本地网关：
+
+- 有分层记忆与 provider-aware render
+- 有动态裁剪与 trim report
+- 有路由、回退、同 provider 重试
+- 有 grounding 与幻觉抑制
+- 有本地 key 与客户端同步能力
+- 有 OpenAI-compatible 与 provider-direct 双模式
+
+---
+
+## 10. 推荐前端管理台能力
+
+如果你准备为 NexusGate 做前端，建议至少覆盖以下模块。
+
+### 10.1 上游配置中心
+
+目标：解决你当前最关心的 “LLMAPI 的 API / Base URL 配置”。
+
+建议字段：
+
+- 配置名称
+- Provider 类型
+- Base URL
+- API Key
+- 默认模型
+- 是否启用
+- 是否作为默认上游
+- 兼容模式（Target / LLMAPI Legacy）
+- 连接测试按钮
+
+建议行为：
+
+- 新建配置时默认保存为 `TARGET_*`
+- 如果识别到 `LLMAPI_*`，在界面中以“旧版兼容配置”展示
+- 提供“从 .env 导入 / 导出”功能
+- 提供“测试连接 / 返回延迟 / 模型列表读取”能力
+
+---
+
+### 10.2 记忆结构可视化
+
+你明确提出要“记忆结构可视化、可编辑、可提取、可导出 md”，建议拆成四层视图：
+
+1. **MemoryPack 预览**
+   - 展示本次请求实际命中的 `constraints / procedures / continuity / facts`
+   - 展示 provider 渲染后的结果
+   - 展示 trim 前后差异
+
+2. **分层记忆浏览器**
+   - 按 L0 / constraints / procedures / continuity / facts 分栏
+   - 支持搜索、筛选、排序
+   - 支持按 session / topic / source 查看
+
+3. **命中证据面板**
+   - 展示某次回答依赖了哪些记忆条目
+   - 展示 citations / evidence blocks
+   - 展示 unsupported_ratio 和是否发生 rewrite
+
+4. **历史演化视图**
+   - 某个 session 的记忆如何从短期进入长期
+   - 哪些记忆被保留、被裁剪、被归档
+
+---
+
+### 10.3 记忆编辑器
+
+建议支持：
+
+- 单条编辑
+- 批量标签修改
+- 升/降级记忆层级
+- 合并重复记忆
+- 标记失效
+- 回滚历史版本
+- 人工锁定“高置信事实”
+- 设置“永不注入 / 仅某 provider 注入 / 仅某会话注入”
+
+这会比单纯文本编辑更贴近真实运维需求。
+
+---
+
+### 10.4 记忆提取工作台
+
+这里的“可提取”建议做成操作流，而不是单个按钮：
+
+- 从对话提取候选记忆
+- 从代码仓库提取候选技能/规则
+- 从运行日志提取候选故障经验
+- 人工审核后写入正式记忆库
+- 支持置信度阈值和去重建议
+
+建议 UI：
+
+- 左侧原始文本
+- 中间提取候选项
+- 右侧写入目标层级和最终结构化结果
+
+---
+
+### 10.5 Markdown 导出
+
+建议支持：
+
+- 导出某个 session 的记忆摘要为 `.md`
+- 导出某个主题的 facts / procedures / constraints
+- 导出某次 MemoryPack 渲染结果
+- 导出“问题-证据-答案-重写结果”审计报告
+- 导出系统配置快照
+
+Markdown 模板建议：
+
+- 标题
+- 导出时间
+- session / provider / model
+- 命中记忆
+- 被裁剪记忆
+- 引用证据
+- unsupported claims 与 rewrite 结果
+- 最终回答
+
+---
+
+### 10.6 路由与回退可观测性
+
+这是我额外建议你一定要加的功能。
+
+建议前端展示：
+
+- 本次请求命中了哪个 provider / model
+- fallback chain
+- 是否发生 same-provider retry
+- 是否发生 context overflow
+- 是否发生 rerender-only recovery
+- 每次尝试耗时
+- provider 健康度趋势
+- 错误类型分布
+
+这是把 NexusGate 做成“可运营网关”的关键。
+
+---
+
+### 10.7 幻觉抑制 / grounding 调试台
+
+建议展示：
+
+- grounding_mode
+- grounding_policy
+- evidence blocks
+- citation block
+- unsupported_ratio
+- 是否触发 rewrite / degrade
+- 最终输出和原始输出差异对比
+
+这对调试“为什么模型突然变保守 / 为什么说不知道”非常有价值。
+
+---
+
+### 10.8 本地客户端接入页
+
+建议提供：
+
+- 一键生成 OpenAI SDK 配置示例
+- 一键生成 Aider / Codex / Claude 接入说明
+- 展示当前 Base URL / API Key 状态
+- 自动检测本地配置文件是否已同步
+- 允许重新同步
+
+---
+
+## 11. 推荐前端信息架构
+
+如果你要做一个 Web 管理台，我建议菜单结构如下：
+
+- **概览 Dashboard**
+  - 服务状态
+  - 上游状态
+  - 请求量
+  - 错误率
+  - fallback 次数
+  - grounding 命中情况
+
+- **上游配置**
+  - TARGET / LLMAPI 配置管理
+  - API Key 管理
+  - 连通性测试
+
+- **记忆中心**
+  - 记忆列表
+  - 分层视图
+  - 结构化编辑器
+  - 提取工作台
+  - Markdown 导出
+
+- **请求追踪**
+  - 请求详情
+  - 命中记忆
+  - trim report
+  - 路由决策
+  - fallback 事件
+
+- **安全与 grounding**
+  - unsupported claims
+  - rewrite 记录
+  - 引用证据
+  - 风险策略
+
+- **客户端接入**
+  - OpenAI SDK
+  - Aider
+  - Codex
+  - Claude
+  - 配置同步
+
+- **系统设置**
+  - `.env` 编辑
+  - 密钥管理
+  - 存储路径
+  - 调试开关
+
+---
+
+## 12. 测试
+
+可按仓库内测试继续验证关键能力，例如：
 
 ```bash
 PYTHONPATH=. python -m unittest discover -s tests -p "test_memory_manager.py"
 ```
 
-在当前仓库环境中，该组 memory manager 测试已通过：
+建议后续补充的测试方向：
 
-- `Ran 16 tests`
-- `OK`
-
----
-
-## 当前状态
-
-当前代码库已经不再只是一个“简单的记忆注入网关”，而是更接近一个本地记忆增强的模型入口层：
-
-- selector / scoring / policy 逻辑已做更清晰拆分
-- 高层记忆写入门禁更严格
-- L4 继续承担会话回溯与归档主职责
-- `/v1/responses` 对 OpenAI 兼容上游优先采用保真透传策略
-- 文档正在逐步与真实实现语义对齐
+- 路由决策测试
+- fallback trace 测试
+- grounding rewrite 测试
+- OpenAI-compatible upstream 测试
+- 管理台 API 测试
 
 ---
 
-## 适用场景
+## 13. 适用场景
 
 - 本地 coding agent 网关
-- 给 CLI 工具增加会话记忆
-- 给 OpenAI 兼容客户端统一接入多个上游
-- 对代理任务保留任务级经验与历史上下文
-- 在本地实现“受控写入”的长期记忆层
+- 带记忆的 CLI / IDE 助手
+- 多模型统一接入层
+- 企业内部知识增强问答入口
+- 有审计与安全要求的代理执行环境
 
 ---
 
-## 参考
-
-- [GenericAgent](https://github.com/lsdefine/GenericAgent)  
-  记忆架构思路参考来源之一
-
-- [LiteLLM](https://github.com/BerriAI/litellm)  
-  用于兼容多种上游模型与 OpenAI-compatible 后端
-
----
-
-## License
+## 14. License
 
 本项目包含 `LICENSE` 文件，请按仓库中的实际许可证使用。
