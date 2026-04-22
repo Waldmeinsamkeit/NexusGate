@@ -97,6 +97,8 @@ def create_app() -> FastAPI:
                 "api_key": settings.effective_target_api_key,
             },
             memory_pack_size=_estimate_pack_size(memory_pack),
+            pack_features=memory_pack.pack_features,
+            risk_profile=memory_pack.risk_profile,
             router=provider_router,
         )
         enriched_messages, memory_pack = memory.enrich_from_normalized_request(
@@ -120,7 +122,8 @@ def create_app() -> FastAPI:
         explicit_model_requested = bool((req.model or "").strip())
         attempt_models = [str(decision["model"])]
         if not explicit_model_requested:
-            attempt_models.extend(str(item) for item in (decision.get("fallbacks") or []))
+            fallback_chain = decision.get("fallback_chain") or decision.get("fallbacks") or []
+            attempt_models.extend(str(item) for item in fallback_chain)
         deduped_models: list[str] = []
         for model in attempt_models:
             if model and model not in deduped_models:

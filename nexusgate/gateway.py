@@ -56,12 +56,16 @@ def route(
     defaults: dict[str, Any],
     *,
     memory_pack_size: int = 0,
+    pack_features: dict[str, Any] | None = None,
+    risk_profile: dict[str, Any] | None = None,
     router: ProviderRouter | None = None,
 ) -> dict[str, Any]:
     provider_router = router or ProviderRouter()
     decision = provider_router.route(
         normalized_req=normalized_req,
         memory_pack_size=memory_pack_size,
+        pack_features=pack_features,
+        risk_profile=risk_profile,
         defaults=defaults,
     )
     return {
@@ -72,4 +76,9 @@ def route(
         "render_mode": decision.render_mode,
         "routing_reason": decision.routing_reason,
         "fallbacks": decision.fallbacks,
+        "reason_codes": decision.reason_codes,
+        "fallback_chain": decision.fallback_chain,
+        "context_budget": decision.context_budget,
+        "grounding_mode": decision.grounding_mode,
+        "tool_mode": decision.tool_mode,
     }
