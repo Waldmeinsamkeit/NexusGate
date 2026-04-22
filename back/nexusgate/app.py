@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from datetime import datetime, timezone
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -162,6 +164,9 @@ def create_app() -> FastAPI:
         if not auth_value and api_key:
             auth_value = f"Bearer {api_key}"
         _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        return await _build_admin_config_payload(sync_state=sync_state, local_key_source=local_key_source)
+
+    async def _build_admin_config_payload(*, sync_state: SyncStatus, local_key_source: str) -> dict[str, Any]:
         return {
             "app": {"name": settings.app_name, "env": settings.app_env},
             "target": {
@@ -182,6 +187,160 @@ def create_app() -> FastAPI:
                 "upstream_mode": "openai_compatible" if settings.effective_target_base_url else "provider_direct",
             },
             "health": await health(),
+        }
+
+    def _coerce_optional_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+
+    def _save_env_overrides(pairs: dict[str, str | None]) -> None:
+        env_path = Path(".env")
+        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+        index_map: dict[str, int] = {}
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key:
+                index_map[key] = idx
+        for key, value in pairs.items():
+            rendered = f"{key}={value or ''}"
+            if key in index_map:
+                lines[index_map[key]] = rendered
+            else:
+                lines.append(rendered)
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _apply_runtime_settings(pairs: dict[str, str | None]) -> None:
+        for key, value in pairs.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+            if key == "TARGET_PROVIDER":
+                settings.target_provider = value or settings.target_provider
+            elif key == "TARGET_BASE_URL":
+                settings.target_base_url = value
+            elif key == "TARGET_API_KEY":
+                settings.target_api_key = value
+            elif key == "DEFAULT_MODEL":
+                settings.default_model = value or settings.default_model
+            elif key == "LLMAPI_BASE_URL":
+                settings.llmapi_base_url = value
+            elif key == "LLMAPI_API_KEY":
+                settings.llmapi_api_key = value
+            elif key == "LLMAPI_MODEL_PREFIX":
+                settings.llmapi_model_prefix = value or "llmapi/"
+            elif key == "LLMAPI_PROVIDER_PREFIX":
+                settings.llmapi_provider_prefix = value or "openai/"
+
+    @app.put("/admin/config")
+    async def admin_update_config(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        payload = await request.json()
+        updates = {
+            "TARGET_PROVIDER": _coerce_optional_text(payload.get("target_provider")),
+            "TARGET_BASE_URL": _coerce_optional_text(payload.get("target_base_url")),
+            "TARGET_API_KEY": _coerce_optional_text(payload.get("target_api_key")),
+            "DEFAULT_MODEL": _coerce_optional_text(payload.get("default_model")),
+            "LLMAPI_BASE_URL": _coerce_optional_text(payload.get("llmapi_base_url")),
+            "LLMAPI_API_KEY": _coerce_optional_text(payload.get("llmapi_api_key")),
+            "LLMAPI_MODEL_PREFIX": _coerce_optional_text(payload.get("llmapi_model_prefix")),
+            "LLMAPI_PROVIDER_PREFIX": _coerce_optional_text(payload.get("llmapi_provider_prefix")),
+        }
+        _apply_runtime_settings(updates)
+        _save_env_overrides(updates)
+        return {
+            "status": "ok",
+            "updated_keys": [key for key, value in updates.items() if value is not None],
+            "config": await _build_admin_config_payload(sync_state=sync_state, local_key_source=local_key_source),
+        }
+
+    async def _probe_models_endpoint() -> tuple[bool, int, float, list[str], str]:
+        base_url = settings.effective_target_base_url
+        if not base_url:
+            return False, 0, 0.0, [], "TARGET_BASE_URL is empty; provider_direct mode has no /models probe endpoint."
+        url = f"{base_url.rstrip('/')}/models"
+        headers: dict[str, str] = {}
+        if settings.effective_target_api_key:
+            headers["Authorization"] = f"Bearer {settings.effective_target_api_key}"
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=headers)
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            names: list[str] = []
+            body = {}
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            data = body.get("data") if isinstance(body, dict) else []
+            if isinstance(data, list):
+                for row in data:
+                    if isinstance(row, dict):
+                        name = str(row.get("id") or "").strip()
+                        if name:
+                            names.append(name)
+            return resp.status_code < 400, int(resp.status_code), latency_ms, names, ""
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            return False, 0, latency_ms, [], str(exc)
+
+    @app.post("/admin/config/test")
+    async def admin_test_config(
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        ok, status_code, latency_ms, names, err = await _probe_models_endpoint()
+        return {
+            "ok": ok,
+            "status_code": status_code,
+            "latency_ms": int(latency_ms),
+            "model_count": len(names),
+            "sample_models": names[:8],
+            "error": err,
+        }
+
+    @app.get("/admin/config/models")
+    async def admin_config_models(
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        ok, status_code, latency_ms, names, err = await _probe_models_endpoint()
+        return {
+            "ok": ok,
+            "status_code": status_code,
+            "latency_ms": int(latency_ms),
+            "models": names,
+            "error": err,
         }
 
     @app.get("/admin/memories")
@@ -224,6 +383,228 @@ def create_app() -> FastAPI:
             "total": len(rows),
             "items": [row.to_dict() for row in rows],
         }
+
+    def _memory_versions(memory_id: str) -> list[Any]:
+        rows = [row for row in memory.repository.load_all() if row.memory_id == memory_id]
+        rows.sort(key=lambda row: (row.updated_at or row.created_at))
+        return rows
+
+    @app.post("/admin/memories/rollback")
+    async def admin_memories_rollback(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        payload = await request.json()
+        memory_id = str(payload.get("memory_id") or "").strip()
+        if not memory_id:
+            raise HTTPException(status_code=400, detail="memory_id is required")
+        rows = _memory_versions(memory_id)
+        if len(rows) < 2:
+            raise HTTPException(status_code=400, detail="No previous version to rollback")
+        version_index = payload.get("version_index")
+        if isinstance(version_index, int) and 0 <= version_index < len(rows):
+            base_row = rows[version_index]
+        else:
+            base_row = rows[-2]
+        now = datetime.now(timezone.utc).isoformat()
+        restored = base_row
+        restored.updated_at = now
+        restored.source = "admin:rollback"
+        restored.supersedes = rows[-1].memory_id
+        memory.repository.upsert(restored)
+        try:
+            memory.index.upsert([restored])
+        except Exception:
+            pass
+        return {
+            "status": "ok",
+            "memory_id": memory_id,
+            "rolled_back_from_version": len(rows) - 1,
+            "active": restored.to_dict(),
+        }
+
+    @app.post("/admin/memories/batch")
+    async def admin_memories_batch(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+
+        payload = await request.json()
+        memory_ids = payload.get("memory_ids") or []
+        operation = str(payload.get("operation") or "").strip()
+        if not isinstance(memory_ids, list) or not memory_ids:
+            raise HTTPException(status_code=400, detail="memory_ids is required")
+        if operation not in {"archive", "disable", "tag", "confidence"}:
+            raise HTTPException(status_code=400, detail="operation must be one of archive/disable/tag/confidence")
+
+        latest_map = memory.repository.load_latest_map()
+        now = datetime.now(timezone.utc).isoformat()
+        updated_rows: list[Any] = []
+        missing_ids: list[str] = []
+
+        for mid_raw in memory_ids:
+            mid = str(mid_raw).strip()
+            if not mid:
+                continue
+            row = latest_map.get(mid)
+            if row is None:
+                missing_ids.append(mid)
+                continue
+            item = row
+            if operation == "archive":
+                item.archived = True
+            elif operation == "disable":
+                item.verified = False
+            elif operation == "tag":
+                raw_tags = payload.get("tags")
+                if isinstance(raw_tags, list):
+                    item.tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+                elif isinstance(raw_tags, str):
+                    item.tags = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+            elif operation == "confidence":
+                try:
+                    item.confidence = float(payload.get("confidence"))
+                except Exception:
+                    item.confidence = item.confidence
+            item.updated_at = now
+            item.source = f"admin:batch:{operation}"
+            item.supersedes = row.memory_id
+            updated_rows.append(item)
+
+        memory.repository.upsert_many(updated_rows)
+        if updated_rows:
+            try:
+                memory.index.upsert(updated_rows)
+            except Exception:
+                pass
+        return {
+            "status": "ok",
+            "operation": operation,
+            "requested": len(memory_ids),
+            "updated": len(updated_rows),
+            "missing_ids": missing_ids,
+        }
+
+    @app.get("/admin/memories/{memory_id}")
+    async def admin_memory_detail(
+        memory_id: str,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        latest_map = memory.repository.load_latest_map()
+        row = latest_map.get(memory_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        versions = _memory_versions(memory_id)
+        history = [
+            {
+                "version_index": idx,
+                "updated_at": item.updated_at,
+                "source": item.source,
+                "archived": item.archived,
+                "content": item.content[:180],
+            }
+            for idx, item in enumerate(versions)
+        ]
+        return {
+            "item": row.to_dict(),
+            "history": history,
+            "history_count": len(history),
+        }
+
+    @app.put("/admin/memories/{memory_id}")
+    async def admin_memory_update(
+        memory_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        latest_map = memory.repository.load_latest_map()
+        row = latest_map.get(memory_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        payload = await request.json()
+        now = datetime.now(timezone.utc).isoformat()
+        updated = row
+        if "content" in payload:
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                raise HTTPException(status_code=400, detail="content cannot be empty")
+            updated.content = content
+        if "summary" in payload:
+            updated.summary = str(payload.get("summary") or "").strip()
+        if "verified" in payload:
+            updated.verified = bool(payload.get("verified"))
+        if "confidence" in payload:
+            try:
+                updated.confidence = float(payload.get("confidence"))
+            except Exception:
+                updated.confidence = updated.confidence
+        if "tags" in payload:
+            raw_tags = payload.get("tags")
+            if isinstance(raw_tags, list):
+                updated.tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+            elif isinstance(raw_tags, str):
+                updated.tags = [item.strip() for item in raw_tags.split(",") if item.strip()]
+        if "archived" in payload:
+            updated.archived = bool(payload.get("archived"))
+        updated.updated_at = now
+        updated.source = "admin:update"
+        updated.supersedes = row.memory_id
+        memory.repository.upsert(updated)
+        try:
+            memory.index.upsert([updated])
+        except Exception:
+            pass
+        return {"status": "ok", "item": updated.to_dict()}
+
+    @app.delete("/admin/memories/{memory_id}")
+    async def admin_memory_archive(
+        memory_id: str,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        ok = memory.repository.archive(memory_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"status": "ok", "memory_id": memory_id, "archived": True}
 
     @app.get("/admin/traces")
     async def admin_traces(
