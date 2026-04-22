@@ -49,62 +49,49 @@ class MemorySelector:
             "L3": self._parse_layer_items("L3", l3),
             "L4": self._parse_layer_items("L4", l4),
         }
-        l1_items = self.select_layer_items(source_items.get("L1", []), budget["L1"])
-        l2_items = self.select_layer_items(source_items.get("L2", []), budget["L2"])
-        l3_items = self.select_layer_items(source_items.get("L3", []), budget["L3"])
-        l4_items = self.select_layer_items(source_items.get("L4", []), budget["L4"])
+        selected_items = self.select_items_by_layer(source_items, budget)
         return MemoryContext(
             task_type=task_type,
             l0=self._trim(l0, self.budgets.l0),
-            l1=self.render_items(l1_items, budget["L1"]),
-            l2=self.render_items(l2_items, budget["L2"]),
-            l3=self.render_items(l3_items, budget["L3"]),
-            l4=self.render_items(l4_items, budget["L4"]),
+            l1=self.render_items(selected_items.get("L1", []), budget["L1"]),
+            l2=self.render_items(selected_items.get("L2", []), budget["L2"]),
+            l3=self.render_items(selected_items.get("L3", []), budget["L3"]),
+            l4=self.render_items(selected_items.get("L4", []), budget["L4"]),
         )
+
+    def select_items_by_layer(
+        self,
+        items_by_layer: dict[str, list[ScoredMemory]],
+        budget: dict[str, int],
+    ) -> dict[str, list[ScoredMemory]]:
+        return {
+            "L1": self.select_layer_items(items_by_layer.get("L1", []), budget.get("L1", 0)),
+            "L2": self.select_layer_items(items_by_layer.get("L2", []), budget.get("L2", 0)),
+            "L3": self.select_layer_items(items_by_layer.get("L3", []), budget.get("L3", 0)),
+            "L4": self.select_layer_items(items_by_layer.get("L4", []), budget.get("L4", 0)),
+        }
 
     @staticmethod
     def select_layer_items(items: list[ScoredMemory], budget: int) -> list[ScoredMemory]:
         selected: list[ScoredMemory] = []
         remaining = max(budget, 0)
         for item in items:
+            text = item.text.strip()
             if remaining <= 0:
                 break
-            if not item.text.strip():
+            if not text:
                 continue
-            clipped = item.text[:remaining]
-            selected.append(
-                ScoredMemory(
-                    memory_id=item.memory_id,
-                    layer=item.layer,
-                    text=clipped,
-                    evidence=item.evidence,
-                    source=item.source,
-                    verified=item.verified,
-                    score=item.score,
-                    recency=item.recency,
-                    scope=item.scope,
-                    session_id=item.session_id,
-                    project_id=item.project_id,
-                    updated_at=item.updated_at,
-                )
-            )
-            remaining -= len(clipped)
+            if len(text) > remaining:
+                continue
+            selected.append(item)
+            remaining -= len(text)
         return selected
 
     @staticmethod
     def render_items(items: list[ScoredMemory], budget: int) -> str:
         if not items or budget <= 0:
             return "(empty)"
-        rows: list[str] = []
-        remaining = budget
-        for item in items:
-            text = item.text.strip()
-            if not text or remaining <= 0:
-                continue
-            if len(text) > remaining:
-                text = text[:remaining]
-            rows.append(text)
-            remaining -= len(text)
+        rows = [item.text.strip() for item in items if item.text.strip()]
         return "\n".join(rows) if rows else "(empty)"
 
     def dedupe_items(self, items: list[ScoredMemory]) -> list[ScoredMemory]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -110,7 +111,15 @@ def create_app() -> FastAPI:
             pack=memory_pack,
             provider_style=str(decision.get("render_mode") or "openai"),
         )
-        enhanced_messages = [{"role": "system", "content": L0_META_RULES}, *enriched_messages]
+        grounding_mode = str(decision.get("grounding_mode") or "balanced")
+        grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode)
+        citation_block = _build_citation_system_block(memory_pack.citations)
+        enhanced_messages = [
+            {"role": "system", "content": L0_META_RULES},
+            {"role": "system", "content": grounding_rules},
+            {"role": "system", "content": citation_block},
+            *enriched_messages,
+        ]
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
         if decision.get("api_base"):
@@ -130,24 +139,44 @@ def create_app() -> FastAPI:
                 deduped_models.append(model)
         response = None
         last_error: Exception | None = None
+        fallback_events: list[dict[str, Any]] = []
         for model in deduped_models:
             kwargs["model"] = _normalize_model_for_openai_compatible(
                 model=model,
                 openai_compatible=bool(settings.effective_target_base_url),
             )
-            started = time.perf_counter()
-            try:
-                response = litellm.completion(**kwargs)
-                provider_router.health.record_success(
-                    provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai")),
-                    latency_ms=(time.perf_counter() - started) * 1000.0,
-                )
+            current_messages = kwargs.get("messages") or []
+            for retry_index in range(2):
+                started = time.perf_counter()
+                try:
+                    kwargs["messages"] = current_messages
+                    response = litellm.completion(**kwargs)
+                    provider_router.health.record_success(
+                        provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai")),
+                        latency_ms=(time.perf_counter() - started) * 1000.0,
+                    )
+                    break
+                except Exception as exc:
+                    provider_router.health.record_failure(
+                        provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai"))
+                    )
+                    failure_mode = _classify_upstream_failure(exc)
+                    fallback_events.append(
+                        {
+                            "model": model,
+                            "mode": failure_mode,
+                            "retry_index": retry_index,
+                            "error": str(exc)[:280],
+                        }
+                    )
+                    last_error = exc
+                    # Context overflow fallback: keep canonical pack, trim render and retry once.
+                    if failure_mode == "context_overflow" and retry_index == 0:
+                        current_messages = _trim_messages_for_context_overflow(current_messages)
+                        continue
+                    break
+            if response is not None:
                 break
-            except Exception as exc:
-                provider_router.health.record_failure(
-                    provider=_provider_from_model(model, fallback=str(decision.get("provider") or "openai"))
-                )
-                last_error = exc
         if response is None:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -162,6 +191,20 @@ def create_app() -> FastAPI:
             "user_text": user_query,
             "metadata": normalized_req.metadata or {},
             "citations": memory_pack.citations,
+            "trace": {
+                "retrieval": memory_pack.retrieval_trace,
+                "assembly": memory_pack.assembly_trace,
+                "routing": {
+                    "provider": decision.get("provider"),
+                    "model": decision.get("model"),
+                    "reason_codes": decision.get("reason_codes") or [],
+                    "fallback_chain": decision.get("fallback_chain") or decision.get("fallbacks") or [],
+                    "context_budget": decision.get("context_budget"),
+                    "grounding_mode": decision.get("grounding_mode"),
+                },
+                "render": memory_pack.trim_report,
+                "fallback": fallback_events,
+            },
         }
         return response, req, safety_ctx
 
@@ -257,6 +300,7 @@ def create_app() -> FastAPI:
             model=req.model or settings.target_provider,
             citations=safety_ctx.get("citations") or [],
             grounding=safety_ctx.get("grounding") or {},
+            trace=safety_ctx.get("trace") or {},
         )
 
     @app.post("/v1/messages")
@@ -298,6 +342,7 @@ def create_app() -> FastAPI:
             model=req.model or settings.target_provider,
             citations=safety_ctx.get("citations") or [],
             grounding=safety_ctx.get("grounding") or {},
+            trace=safety_ctx.get("trace") or {},
         )
 
     return app
@@ -460,6 +505,51 @@ def _build_upstream_kwargs(
     return kwargs
 
 
+def _build_grounding_system_rules(grounding_mode: str) -> str:
+    if grounding_mode == "strict":
+        return (
+            "Grounding mode: strict. Use only user input and cited memory facts. "
+            "If evidence is missing, say you do not know. Do not invent ports, paths, keys, or config values."
+        )
+    if grounding_mode == "relaxed":
+        return "Grounding mode: relaxed. Prefer cited memory, but reasonable inference is allowed when uncertainty is explicit."
+    return "Grounding mode: balanced. Prefer cited memory and clearly mark uncertainty when evidence is weak."
+
+
+def _build_citation_system_block(citations: list[dict[str, Any]]) -> str:
+    if not citations:
+        return "Citation refs: none"
+    rows = []
+    for row in citations[:6]:
+        ref = str(row.get("memory_ref") or "memory")
+        snippet = str(row.get("snippet") or "")[:120]
+        rows.append(f"- {ref}: {snippet}")
+    return "Citation refs:\n" + "\n".join(rows)
+
+
+def _classify_upstream_failure(exc: Exception) -> str:
+    lowered = str(exc).lower()
+    if any(token in lowered for token in ("context_length", "context window", "maximum context", "too many tokens")):
+        return "context_overflow"
+    if any(token in lowered for token in ("tool", "function call", "does not support tools")):
+        return "tool_capability"
+    if any(token in lowered for token in ("timeout", "connection", "429", "503", "502", "service unavailable")):
+        return "provider_failure"
+    return "unknown"
+
+
+def _trim_messages_for_context_overflow(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trimmed: list[dict[str, Any]] = []
+    for row in messages:
+        patched = dict(row)
+        if patched.get("role") == "system" and "<nexus_context>" in str(patched.get("content") or ""):
+            content = str(patched.get("content") or "")
+            keep = max(len(content) // 2, 600)
+            patched["content"] = content[:keep]
+        trimmed.append(patched)
+    return trimmed
+
+
 def _anthropic_request_to_openai(data: dict[str, Any]) -> dict[str, Any]:
     model = data.get("model") or settings.target_provider
     stream = bool(data.get("stream", False))
@@ -567,6 +657,7 @@ def _anthropic_response_from_openai(
     model: str,
     citations: list[dict[str, Any]] | None = None,
     grounding: dict[str, Any] | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     text = _extract_openai_text(payload)
     usage = payload.get("usage") or {}
@@ -586,6 +677,7 @@ def _anthropic_response_from_openai(
         },
         "citations": citations or [],
         "grounding": grounding or {},
+        "trace": trace or {},
     }
 
 
@@ -617,9 +709,23 @@ def _apply_grounding_to_openai_payload(payload: dict[str, Any], safety_ctx: dict
     check = supported_claim_check(answer_text=text, sources=source_blobs)
     strict = _is_high_risk_metadata(safety_ctx.get("metadata") or {})
     grounded_text = apply_hallucination_guard(answer_text=text, check=check, strict=strict)
+    if bool(check.get("has_critical_unsupported")):
+        grounded_text = _degrade_critical_unsupported_claims(text=grounded_text, check=check)
+        safety_ctx.setdefault("trace", {}).setdefault("grounding", {})["action"] = "critical_degraded_template"
+    else:
+        safety_ctx.setdefault("trace", {}).setdefault("grounding", {})["action"] = "pass_through_or_warning"
     safety_ctx["grounding"] = check
+    safety_ctx.setdefault("trace", {}).setdefault("grounding", {}).update(
+        {
+            "claim_count": len(check.get("claims") or []),
+            "unsupported_ratio": float(check.get("unsupported_ratio") or 0.0),
+            "critical_unsupported_count": len(check.get("critical_unsupported_claims") or []),
+        }
+    )
     if grounded_text == text:
-        return payload
+        patched = dict(payload)
+        patched["nexus_trace"] = safety_ctx.get("trace") or {}
+        return patched
     patched = dict(payload)
     choices = patched.get("choices") or []
     if not choices:
@@ -631,6 +737,7 @@ def _apply_grounding_to_openai_payload(payload: dict[str, Any], safety_ctx: dict
     choices = list(choices)
     choices[0] = first
     patched["choices"] = choices
+    patched["nexus_trace"] = safety_ctx.get("trace") or {}
     return patched
 
 
@@ -642,11 +749,25 @@ def _is_high_risk_metadata(metadata: dict[str, Any]) -> bool:
     return task_type in {"debug", "compliance", "medical", "legal", "finance"}
 
 
+def _degrade_critical_unsupported_claims(text: str, check: dict[str, Any]) -> str:
+    critical_claims = [str(item).strip() for item in (check.get("critical_unsupported_claims") or []) if str(item).strip()]
+    if not critical_claims:
+        return text
+    degraded = text
+    for claim in critical_claims:
+        degraded = degraded.replace(claim, "")
+    degraded = re.sub(r"\n{3,}", "\n\n", degraded).strip()
+    if not degraded:
+        degraded = "I do not have enough grounded evidence to answer this reliably."
+    return f"{degraded}\n\nNote: Critical claims without evidence were removed."
+
+
 def _responses_response_from_openai(
     payload: dict[str, Any],
     model: str,
     citations: list[dict[str, Any]] | None = None,
     grounding: dict[str, Any] | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     text = _extract_openai_text(payload)
     usage = payload.get("usage") or {}
@@ -683,6 +804,7 @@ def _responses_response_from_openai(
         },
         "citations": citations or [],
         "grounding": grounding or {},
+        "trace": trace or {},
     }
 
 

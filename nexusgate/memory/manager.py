@@ -444,11 +444,10 @@ class MemoryManager:
             if not normalized or key in seen:
                 continue
             seen.add(key)
-            clipped = row.text.strip()[:max_chars]
             compressed.append(
                 ScoredMemory(
                     layer=row.layer,
-                    text=clipped,
+                    text=row.text.strip(),
                     memory_id=row.memory_id,
                     evidence=row.evidence,
                     source=row.source,
@@ -551,12 +550,14 @@ class MemoryManager:
             include_l4=include_l4,
         )
         compressed = self._semantic_compress(scored_by_layer)
+        budget = self.selector.budget_for_task(task_type)
+        selected_by_layer = self.selector.select_items_by_layer(compressed, budget)
         selected = self.selector.select(
             user_text=query,
             l0="\n".join(self.l0_rules.splitlines()[:12]).strip(),
             items_by_layer=compressed,
         )
-        selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in compressed.get(layer, [])]
+        selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in selected_by_layer.get(layer, [])]
         citations = self._ensure_citations(self._build_pack_citations_from_scored(items=selected_items), query)
         retrieval = self._build_retrieval_result(
             session_id=session_id,
@@ -568,9 +569,9 @@ class MemoryManager:
             stats=stats,
         )
         features, risk = self._build_pack_features(
-            facts=[row.text for row in compressed.get("L2", [])],
-            procedures=[row.text for row in compressed.get("L3", [])],
-            continuity=[row.text for row in compressed.get("L4", [])],
+            facts=[row.text for row in selected_by_layer.get("L2", [])],
+            procedures=[row.text for row in selected_by_layer.get("L3", [])],
+            continuity=[row.text for row in selected_by_layer.get("L4", [])],
             citations=citations,
             retrieval=retrieval,
         )
@@ -584,10 +585,10 @@ class MemoryManager:
             l4=selected.l4,
             citations=citations,
             selected_ids=[row.memory_id for row in selected_items if row.memory_id][: self.top_k * 4],
-            facts=[row.text for row in compressed.get("L2", [])],
-            procedures=[row.text for row in compressed.get("L3", [])],
-            continuity=[row.text for row in compressed.get("L4", [])],
-            constraints=[row.text for row in compressed.get("L1", [])],
+            facts=[row.text for row in selected_by_layer.get("L2", [])],
+            procedures=[row.text for row in selected_by_layer.get("L3", [])],
+            continuity=[row.text for row in selected_by_layer.get("L4", [])],
+            constraints=[row.text for row in selected_by_layer.get("L1", [])],
             risk_profile=risk,
             pack_features=features,
             estimated_tokens=int(features.get("estimated_tokens") or 0),
@@ -682,20 +683,31 @@ class MemoryManager:
         report: dict[str, int | str] = {"mode": "provider_aware_trim"}
         min_keep = {"l1": 120, "l2": 220, "l3": 80, "l4": 0}
         trim_order = ("l4", "l3", "l2", "l1")
-        remaining_excess = total - max_chars
         trimmed = dict(blocks)
+
+        def split_rows(text: str) -> list[str]:
+            if not text or text == "(empty)":
+                return []
+            return [row for row in text.splitlines() if row.strip()]
+
+        remaining_excess = total - max_chars
         for key in trim_order:
             if remaining_excess <= 0:
                 break
-            original = trimmed[key]
-            floor = min_keep[key]
-            removable = max(len(original) - floor, 0)
-            cut = min(removable, remaining_excess)
-            if cut <= 0:
+            rows = split_rows(trimmed[key])
+            if not rows:
                 continue
-            trimmed[key] = original[: len(original) - cut]
-            report[f"trimmed_{key}_chars"] = cut
-            remaining_excess -= cut
+            floor = min_keep[key]
+            while rows and remaining_excess > 0:
+                candidate = "\n".join(rows[:-1]) if len(rows) > 1 else "(empty)"
+                if candidate != "(empty)" and len(candidate) < floor:
+                    break
+                removed_text = rows[-1]
+                rows = rows[:-1]
+                trimmed[key] = candidate
+                cut = len(removed_text) + (1 if rows else 0)
+                report[f"trimmed_{key}_chars"] = int(report.get(f"trimmed_{key}_chars", 0)) + cut
+                remaining_excess -= cut
         final_total = sum(len(text) for text in trimmed.values())
         report["trimmed_total_chars"] = total - final_total
         report["final_total_chars"] = final_total
