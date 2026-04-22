@@ -91,9 +91,19 @@ def create_app() -> FastAPI:
         stream: bool,
         trace: dict[str, Any],
         grounding: dict[str, Any] | None = None,
+        latency_ms: float | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> None:
         routing = trace.get("routing") or {}
         fallback_events = trace.get("fallback") or []
+        render = trace.get("render") or {}
+        estimated_before = int(render.get("estimated_tokens_before") or 0)
+        estimated_after = int(render.get("estimated_tokens_after") or 0)
+        prompt_tokens = int((usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0)
+        completion_tokens = int((usage or {}).get("completion_tokens") or (usage or {}).get("output_tokens") or 0)
+        total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens))
+        saved_estimated = max(estimated_before - estimated_after, 0)
+        saved_actual = max(estimated_before - prompt_tokens, 0) if prompt_tokens > 0 else 0
         row = {
             "request_id": request_id,
             "created_at": int(time.time()),
@@ -104,7 +114,20 @@ def create_app() -> FastAPI:
             "status": "streaming" if stream else "completed",
             "fallback_count": len(fallback_events),
             "has_trim": bool(trace.get("render")),
+            "latency_ms": int(latency_ms or 0),
             "unsupported_ratio": float((grounding or {}).get("unsupported_ratio") or 0.0),
+            "token_stats": {
+                "estimated_prompt_tokens": estimated_before,
+                "estimated_sent_tokens": estimated_after,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "saved_tokens_estimated": saved_estimated,
+                "saved_tokens_actual": saved_actual,
+                "saved_rate_estimated": round(float(saved_estimated) / float(max(estimated_before, 1)), 4) if estimated_before else 0.0,
+                "saved_rate_actual": round(float(saved_actual) / float(max(estimated_before, 1)), 4) if estimated_before and prompt_tokens else 0.0,
+                "usage_source": "upstream_usage" if prompt_tokens else "estimate_only",
+            },
             "trace": trace,
         }
         recent_traces.appendleft(row)
@@ -502,6 +525,7 @@ def create_app() -> FastAPI:
         x_api_key: str | None = Header(default=None, alias="x-api-key"),
         api_key: str | None = Header(default=None, alias="api-key"),
     ) -> Any:
+        started = time.perf_counter()
         auth_value = authorization
         if not auth_value and x_api_key:
             auth_value = f"Bearer {x_api_key}"
@@ -526,6 +550,7 @@ def create_app() -> FastAPI:
                 stream=True,
                 trace=safety_ctx.get("trace") or {},
                 grounding=safety_ctx.get("grounding"),
+                latency_ms=(time.perf_counter() - started) * 1000.0,
             )
             return StreamingResponse(response, media_type="text/event-stream")
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
@@ -537,6 +562,8 @@ def create_app() -> FastAPI:
             stream=False,
             trace=safety_ctx.get("trace") or {},
             grounding=safety_ctx.get("grounding"),
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            usage=patched.get("usage") if isinstance(patched, dict) else None,
         )
         return patched
 
@@ -548,6 +575,7 @@ def create_app() -> FastAPI:
         x_api_key: str | None = Header(default=None, alias="x-api-key"),
         api_key: str | None = Header(default=None, alias="api-key"),
     ) -> Any:
+        started = time.perf_counter()
         auth_value = authorization
         if not auth_value and x_api_key:
             auth_value = f"Bearer {x_api_key}"
@@ -582,7 +610,20 @@ def create_app() -> FastAPI:
                     "status": "passthrough",
                     "fallback_count": 0,
                     "has_trim": False,
+                    "latency_ms": int((time.perf_counter() - started) * 1000.0),
                     "unsupported_ratio": 0.0,
+                    "token_stats": {
+                        "estimated_prompt_tokens": 0,
+                        "estimated_sent_tokens": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "saved_tokens_estimated": 0,
+                        "saved_tokens_actual": 0,
+                        "saved_rate_estimated": 0.0,
+                        "saved_rate_actual": 0.0,
+                        "usage_source": "passthrough_unknown",
+                    },
                     "trace": {},
                 }
             )
@@ -614,6 +655,7 @@ def create_app() -> FastAPI:
                 stream=True,
                 trace=safety_ctx.get("trace") or {},
                 grounding=safety_ctx.get("grounding"),
+                latency_ms=(time.perf_counter() - started) * 1000.0,
             )
             return StreamingResponse(
                 _responses_stream_from_openai(response, model=req.model or settings.target_provider),
@@ -629,6 +671,8 @@ def create_app() -> FastAPI:
             stream=False,
             trace=safety_ctx.get("trace") or {},
             grounding=safety_ctx.get("grounding"),
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            usage=payload.get("usage") if isinstance(payload, dict) else None,
         )
         background_tasks.add_task(
             memory.start_memory_update,
@@ -652,6 +696,7 @@ def create_app() -> FastAPI:
         x_api_key: str | None = Header(default=None, alias="x-api-key"),
         api_key: str | None = Header(default=None, alias="api-key"),
     ) -> Any:
+        started = time.perf_counter()
         auth_value = authorization
         if x_api_key and not auth_value:
             auth_value = f"Bearer {x_api_key}"
@@ -678,6 +723,7 @@ def create_app() -> FastAPI:
                 stream=True,
                 trace=safety_ctx.get("trace") or {},
                 grounding=safety_ctx.get("grounding"),
+                latency_ms=(time.perf_counter() - started) * 1000.0,
             )
             return StreamingResponse(
                 _anthropic_stream_from_openai(response, model=req.model or settings.target_provider),
@@ -693,6 +739,8 @@ def create_app() -> FastAPI:
             stream=False,
             trace=safety_ctx.get("trace") or {},
             grounding=safety_ctx.get("grounding"),
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            usage=payload.get("usage") if isinstance(payload, dict) else None,
         )
         return _anthropic_response_from_openai(
             payload=payload,

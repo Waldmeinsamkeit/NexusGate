@@ -3,44 +3,36 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NexusGate 运维管理台</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <title>NexusGate 全局监控控制面板</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="bg-grid"></div>
-  <div class="bg-noise"></div>
-
-  <div class="app-shell">
-    <aside class="left-rail">
-      <div class="brand-block">
-        <h1>NexusGate</h1>
-        <p>Ops Console</p>
-      </div>
-      <nav id="nav" class="nav-list"></nav>
-      <div class="rail-tip card-soft">
-        <p class="muted">入口</p>
-        <p>优先从 <code>/admin/ui/</code> 访问，避免静态资源路径错误。</p>
+  <div class="bg-layer"></div>
+  <div class="shell">
+    <aside class="sidebar">
+      <h1>NexusGate</h1>
+      <p class="muted">Global Ops Panel</p>
+      <nav id="nav"></nav>
+      <div class="card hint">
+        <p class="muted">入口建议</p>
+        <p>请通过 <code>/admin/ui/</code> 访问，避免静态资源 404。</p>
       </div>
     </aside>
 
-    <main class="workspace">
-      <header class="global-header card-hard">
-        <div class="header-main">
-          <p class="section-kicker">NexusGate 运维型管理台</p>
-          <h2 id="page-title">Dashboard</h2>
-          <p id="page-desc" class="muted">查看服务状态、请求趋势与关键风险指标。</p>
+    <main class="main">
+      <header class="card header">
+        <div>
+          <p class="tiny">运维型全局监控控制面板</p>
+          <h2 id="page-title">全局监控控制面板</h2>
+          <p id="page-desc" class="muted">服务状态、路由行为、token 使用和节省量一屏观察。</p>
         </div>
-        <div class="header-badges" id="global-badges">
-          <span class="badge">provider: loading...</span>
-          <span class="badge">model: loading...</span>
-          <span class="badge warn">fallback: 0</span>
-        </div>
+        <div id="global-badges" class="badges"></div>
       </header>
 
-      <section class="connection card-soft" id="connection-panel"></section>
+      <section class="card conn" id="conn"></section>
 
       <section id="view-dashboard" class="view active"></section>
       <section id="view-upstream" class="view"></section>
@@ -51,6 +43,8 @@
     </main>
   </div>
 
-  <script src="app.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/views.js"></script>
+  <script src="js/main.js"></script>
 </body>
 </html>
