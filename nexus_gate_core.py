@@ -1,4 +1,2 @@
-from nexusgate.app import create_app
-
-app = create_app()
+from back.nexus_gate_core import app
 

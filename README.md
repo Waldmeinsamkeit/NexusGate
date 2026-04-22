@@ -1,51 +1,51 @@
-# NexusGate
+﻿# NexusGate
 
-具备本地记忆能力的 LLM 网关，提供 OpenAI 兼容入口，并在请求转发到上游模型前完成：
+鍏峰鏈湴璁板繂鑳藉姏鐨?LLM 缃戝叧锛屾彁渚?OpenAI 鍏煎鍏ュ彛锛屽苟鍦ㄨ姹傝浆鍙戝埌涓婃父妯″瀷鍓嶅畬鎴愶細
 
-- 记忆检索与上下文注入
-- 跨 provider 路由与回退
-- 动态上下文压缩
-- 基于证据的幻觉抑制
-- 本地 API Key 管理与客户端配置同步
+- 璁板繂妫€绱笌涓婁笅鏂囨敞鍏?
+- 璺?provider 璺敱涓庡洖閫€
+- 鍔ㄦ€佷笂涓嬫枃鍘嬬缉
+- 鍩轰簬璇佹嵁鐨勫够瑙夋姂鍒?
+- 鏈湴 API Key 绠＄悊涓庡鎴风閰嶇疆鍚屾
 
-它适合部署在本地或内网，作为 CLI、Agent、自动化脚本、IDE 插件、OpenAI 兼容客户端的统一接入层。
+瀹冮€傚悎閮ㄧ讲鍦ㄦ湰鍦版垨鍐呯綉锛屼綔涓?CLI銆丄gent銆佽嚜鍔ㄥ寲鑴氭湰銆両DE 鎻掍欢銆丱penAI 鍏煎瀹㈡埛绔殑缁熶竴鎺ュ叆灞傘€?
 
 ---
 
-## 1. 核心能力
+## 1. 鏍稿績鑳藉姏
 
-### 1.1 OpenAI 兼容网关入口
+### 1.1 OpenAI 鍏煎缃戝叧鍏ュ彛
 
-当前支持以下接口：
+褰撳墠鏀寔浠ヤ笅鎺ュ彛锛?
 
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/messages`
 - `GET /health`
 
-你可以把 NexusGate 当成一个本地 LLM API 聚合入口，对外暴露统一 Base URL，再由它决定记忆注入、路由、回退和安全控制。
+浣犲彲浠ユ妸 NexusGate 褰撴垚涓€涓湰鍦?LLM API 鑱氬悎鍏ュ彛锛屽澶栨毚闇茬粺涓€ Base URL锛屽啀鐢卞畠鍐冲畾璁板繂娉ㄥ叆銆佽矾鐢便€佸洖閫€鍜屽畨鍏ㄦ帶鍒躲€?
 
 ---
 
-### 1.2 分层记忆系统
+### 1.2 鍒嗗眰璁板繂绯荤粺
 
-NexusGate 会围绕请求构建 `MemoryPack`，并将记忆分为稳定结构后再渲染到不同 provider：
+NexusGate 浼氬洿缁曡姹傛瀯寤?`MemoryPack`锛屽苟灏嗚蹇嗗垎涓虹ǔ瀹氱粨鏋勫悗鍐嶆覆鏌撳埌涓嶅悓 provider锛?
 
-- `L0`：全局元规则 / 系统级约束
-- `constraints`：约束、规则、索引类信息
-- `procedures`：技能、步骤、可复用操作经验
-- `continuity`：会话连续性线索、任务上下文
-- `facts`：与当前任务相关的事实记忆
+- `L0`锛氬叏灞€鍏冭鍒?/ 绯荤粺绾х害鏉?
+- `constraints`锛氱害鏉熴€佽鍒欍€佺储寮曠被淇℃伅
+- `procedures`锛氭妧鑳姐€佹楠ゃ€佸彲澶嶇敤鎿嶄綔缁忛獙
+- `continuity`锛氫細璇濊繛缁€х嚎绱€佷换鍔′笂涓嬫枃
+- `facts`锛氫笌褰撳墠浠诲姟鐩稿叧鐨勪簨瀹炶蹇?
 
-在注入模型前，系统会按 provider 风格渲染记忆：
+鍦ㄦ敞鍏ユā鍨嬪墠锛岀郴缁熶細鎸?provider 椋庢牸娓叉煋璁板繂锛?
 
-- OpenAI 风格标签：
+- OpenAI 椋庢牸鏍囩锛?
   - `<memory_index>`
   - `<relevant_skills>`
   - `<session_recall_hints>`
   - `<relevant_memory>`
 
-- Anthropic Messages 风格标签：
+- Anthropic Messages 椋庢牸鏍囩锛?
   - `<anthropic_memory_index>`
   - `<anthropic_relevant_skills>`
   - `<anthropic_session_recall_hints>`
@@ -53,85 +53,85 @@ NexusGate 会围绕请求构建 `MemoryPack`，并将记忆分为稳定结构后
 
 ---
 
-### 1.3 动态上下文压缩
+### 1.3 鍔ㄦ€佷笂涓嬫枃鍘嬬缉
 
-NexusGate 不是简单地“把所有记忆都塞进去”，而是会根据 provider 的上下文预算执行裁剪：
+NexusGate 涓嶆槸绠€鍗曞湴鈥滄妸鎵€鏈夎蹇嗛兘濉炶繘鍘烩€濓紝鑰屾槸浼氭牴鎹?provider 鐨勪笂涓嬫枃棰勭畻鎵ц瑁佸壀锛?
 
-- 先构建标准化 render blocks
-- 再执行 provider-aware trim
-- 保留 canonical section 结构
-- 生成 `trim_report`
-- 在上下文溢出时优先进行 rerender / trim retry，而不是盲目失败
+- 鍏堟瀯寤烘爣鍑嗗寲 render blocks
+- 鍐嶆墽琛?provider-aware trim
+- 淇濈暀 canonical section 缁撴瀯
+- 鐢熸垚 `trim_report`
+- 鍦ㄤ笂涓嬫枃婧㈠嚭鏃朵紭鍏堣繘琛?rerender / trim retry锛岃€屼笉鏄洸鐩け璐?
 
-这让它更适合长对话、长任务、代理式工作流。
-
----
-
-### 1.4 跨 provider 路由与回退
-
-NexusGate 内置 `ProviderRouter`，可根据配置与请求特征进行路由，并在失败时回退。
-
-当前实现具备这些行为：
-
-- 根据目标模型或上游配置决定 provider
-- 支持 direct provider 与 OpenAI-compatible backend 两种模式
-- 支持 fallback chain
-- 支持同 provider 重试
-- 支持上下文溢出后的 rerender trim retry
-- 支持工具模式不兼容时降级重试
-- 记录 provider 健康信息与部分回退事件
+杩欒瀹冩洿閫傚悎闀垮璇濄€侀暱浠诲姟銆佷唬鐞嗗紡宸ヤ綔娴併€?
 
 ---
 
-### 1.5 幻觉抑制与 grounding
+### 1.4 璺?provider 璺敱涓庡洖閫€
 
-在请求发往上游前，NexusGate 会附加 grounding 规则与证据块；在回答阶段，可结合支持性检查抑制幻觉。
+NexusGate 鍐呯疆 `ProviderRouter`锛屽彲鏍规嵁閰嶇疆涓庤姹傜壒寰佽繘琛岃矾鐢憋紝骞跺湪澶辫触鏃跺洖閫€銆?
 
-当前已实现的安全相关能力包括：
+褰撳墠瀹炵幇鍏峰杩欎簺琛屼负锛?
 
-- 基于记忆事实与约束构建 evidence blocks
-- 通过 citation block 约束回答引用依据
-- 基于 claim support 进行检查
-- 输出 `unsupported_ratio`
-- 对 unsupported claims 执行 rewrite / degrade 策略
-- 在严格模式或高风险情况下更保守回答
-- 通过系统提示要求“未知就说不知道”
-
-这让网关更适合知识型问答、项目辅助、代理执行等容易出现“编造答案”的场景。
+- 鏍规嵁鐩爣妯″瀷鎴栦笂娓搁厤缃喅瀹?provider
+- 鏀寔 direct provider 涓?OpenAI-compatible backend 涓ょ妯″紡
+- 鏀寔 fallback chain
+- 鏀寔鍚?provider 閲嶈瘯
+- 鏀寔涓婁笅鏂囨孩鍑哄悗鐨?rerender trim retry
+- 鏀寔宸ュ叿妯″紡涓嶅吋瀹规椂闄嶇骇閲嶈瘯
+- 璁板綍 provider 鍋ュ悍淇℃伅涓庨儴鍒嗗洖閫€浜嬩欢
 
 ---
 
-## 2. 运行模式
+### 1.5 骞昏鎶戝埗涓?grounding
 
-NexusGate 支持两类上游模式。
+鍦ㄨ姹傚彂寰€涓婃父鍓嶏紝NexusGate 浼氶檮鍔?grounding 瑙勫垯涓庤瘉鎹潡锛涘湪鍥炵瓟闃舵锛屽彲缁撳悎鏀寔鎬ф鏌ユ姂鍒跺够瑙夈€?
 
-### 模式 A：直连 provider
+褰撳墠宸插疄鐜扮殑瀹夊叏鐩稿叧鑳藉姏鍖呮嫭锛?
 
-例如直连某个 provider 的模型：
+- 鍩轰簬璁板繂浜嬪疄涓庣害鏉熸瀯寤?evidence blocks
+- 閫氳繃 citation block 绾︽潫鍥炵瓟寮曠敤渚濇嵁
+- 鍩轰簬 claim support 杩涜妫€鏌?
+- 杈撳嚭 `unsupported_ratio`
+- 瀵?unsupported claims 鎵ц rewrite / degrade 绛栫暐
+- 鍦ㄤ弗鏍兼ā寮忔垨楂橀闄╂儏鍐典笅鏇翠繚瀹堝洖绛?
+- 閫氳繃绯荤粺鎻愮ず瑕佹眰鈥滄湭鐭ュ氨璇翠笉鐭ラ亾鈥?
+
+杩欒缃戝叧鏇撮€傚悎鐭ヨ瘑鍨嬮棶绛斻€侀」鐩緟鍔┿€佷唬鐞嗘墽琛岀瓑瀹规槗鍑虹幇鈥滅紪閫犵瓟妗堚€濈殑鍦烘櫙銆?
+
+---
+
+## 2. 杩愯妯″紡
+
+NexusGate 鏀寔涓ょ被涓婃父妯″紡銆?
+
+### 妯″紡 A锛氱洿杩?provider
+
+渚嬪鐩磋繛鏌愪釜 provider 鐨勬ā鍨嬶細
 
 - `TARGET_PROVIDER=claude-sonnet-4-5-20250929`
-- 同时配置对应 provider 所需 API Key
+- 鍚屾椂閰嶇疆瀵瑰簲 provider 鎵€闇€ API Key
 
-### 模式 B：转发到 OpenAI 兼容后端
+### 妯″紡 B锛氳浆鍙戝埌 OpenAI 鍏煎鍚庣
 
-例如转发到自建聚合层、本地模型服务、第三方兼容接口：
+渚嬪杞彂鍒拌嚜寤鸿仛鍚堝眰銆佹湰鍦版ā鍨嬫湇鍔°€佺涓夋柟鍏煎鎺ュ彛锛?
 
 - `TARGET_PROVIDER=gpt-5.3-codex`
 - `TARGET_BASE_URL=http://localhost:11434/v1`
 - `TARGET_API_KEY=sk-anything`
 
-如果配置了 `TARGET_BASE_URL`，NexusGate 会以 OpenAI-compatible 模式请求上游。
+濡傛灉閰嶇疆浜?`TARGET_BASE_URL`锛孨exusGate 浼氫互 OpenAI-compatible 妯″紡璇锋眰涓婃父銆?
 
 ---
 
-## 3. 安装
+## 3. 瀹夎
 
-### 3.1 环境要求
+### 3.1 鐜瑕佹眰
 
 - Python 3.10+
-- 可访问的上游模型服务或 OpenAI-compatible 接口
+- 鍙闂殑涓婃父妯″瀷鏈嶅姟鎴?OpenAI-compatible 鎺ュ彛
 
-### 3.2 安装依赖
+### 3.2 瀹夎渚濊禆
 
 ```bash
 pip install -r requirements.txt
@@ -139,15 +139,15 @@ pip install -r requirements.txt
 
 ---
 
-## 4. 配置
+## 4. 閰嶇疆
 
-项目根目录提供了 `.env.example`，可复制为 `.env` 后修改。
+椤圭洰鏍圭洰褰曟彁渚涗簡 `.env.example`锛屽彲澶嶅埗涓?`.env` 鍚庝慨鏀广€?
 
 ```bash
 cp .env.example .env
 ```
 
-### 4.1 基础配置
+### 4.1 鍩虹閰嶇疆
 
 ```env
 APP_NAME=NexusGate-Core
@@ -157,7 +157,7 @@ PORT=8000
 REQUEST_TIMEOUT_SECONDS=120
 ```
 
-### 4.2 本地鉴权
+### 4.2 鏈湴閴存潈
 
 ```env
 LOCAL_API_KEY=ng-abc123
@@ -165,7 +165,7 @@ API_KEY_REQUIRED=false
 LOCAL_API_KEY_STORE_PATH=~/.nexusgate/secrets.json
 ```
 
-支持以下请求头之一：
+鏀寔浠ヤ笅璇锋眰澶翠箣涓€锛?
 
 - `Authorization: Bearer <token>`
 - `x-api-key: <token>`
@@ -173,7 +173,7 @@ LOCAL_API_KEY_STORE_PATH=~/.nexusgate/secrets.json
 
 ---
 
-### 4.3 上游 provider / OpenAI-compatible 配置
+### 4.3 涓婃父 provider / OpenAI-compatible 閰嶇疆
 
 ```env
 OPENAI_API_KEY=sk-xxx
@@ -186,19 +186,19 @@ UPSTREAM_API_KEY_REQUIRED=true
 DEFAULT_MODEL=claude-sonnet-4-5-20250929
 ```
 
-字段说明：
+瀛楁璇存槑锛?
 
-- `TARGET_PROVIDER`：默认目标模型或 provider 入口
-- `TARGET_BASE_URL`：上游 OpenAI-compatible 接口地址；留空则走 provider direct 模式
-- `TARGET_API_KEY`：上游接口所需密钥
-- `DEFAULT_MODEL`：默认模型名
-- `UPSTREAM_API_KEY_REQUIRED`：是否强制要求上游 key
+- `TARGET_PROVIDER`锛氶粯璁ょ洰鏍囨ā鍨嬫垨 provider 鍏ュ彛
+- `TARGET_BASE_URL`锛氫笂娓?OpenAI-compatible 鎺ュ彛鍦板潃锛涚暀绌哄垯璧?provider direct 妯″紡
+- `TARGET_API_KEY`锛氫笂娓告帴鍙ｆ墍闇€瀵嗛挜
+- `DEFAULT_MODEL`锛氶粯璁ゆā鍨嬪悕
+- `UPSTREAM_API_KEY_REQUIRED`锛氭槸鍚﹀己鍒惰姹備笂娓?key
 
 ---
 
-### 4.4 LLMAPI 兼容字段（legacy aliases）
+### 4.4 LLMAPI 鍏煎瀛楁锛坙egacy aliases锛?
 
-为兼容旧配置，当前仍保留：
+涓哄吋瀹规棫閰嶇疆锛屽綋鍓嶄粛淇濈暀锛?
 
 ```env
 LLMAPI_BASE_URL=
@@ -207,22 +207,22 @@ LLMAPI_MODEL_PREFIX=llmapi/
 LLMAPI_PROVIDER_PREFIX=openai/
 ```
 
-建议新部署优先使用：
+寤鸿鏂伴儴缃蹭紭鍏堜娇鐢細
 
 - `TARGET_BASE_URL`
 - `TARGET_API_KEY`
 - `TARGET_PROVIDER`
 
-如果你前端里要做“LLMAPI 的 API / Base URL 配置”，建议 UI 层这样处理：
+濡傛灉浣犲墠绔噷瑕佸仛鈥淟LMAPI 鐨?API / Base URL 閰嶇疆鈥濓紝寤鸿 UI 灞傝繖鏍峰鐞嗭細
 
-- 主展示名：`OpenAI-Compatible Upstream`
-- 兼容导入名：`LLMAPI (Legacy)`
-- 保存时统一写入 `TARGET_*`
-- 如检测到旧字段存在，则在界面中提示“已从 legacy alias 导入”
+- 涓诲睍绀哄悕锛歚OpenAI-Compatible Upstream`
+- 鍏煎瀵煎叆鍚嶏細`LLMAPI (Legacy)`
+- 淇濆瓨鏃剁粺涓€鍐欏叆 `TARGET_*`
+- 濡傛娴嬪埌鏃у瓧娈靛瓨鍦紝鍒欏湪鐣岄潰涓彁绀衡€滃凡浠?legacy alias 瀵煎叆鈥?
 
 ---
 
-### 4.5 记忆配置
+### 4.5 璁板繂閰嶇疆
 
 ```env
 MEMORY_ENABLED=true
@@ -232,17 +232,17 @@ MEMORY_COLLECTION_NAME=nexusgate_memory
 MEMORY_TOP_K=6
 ```
 
-字段说明：
+瀛楁璇存槑锛?
 
-- `MEMORY_ENABLED`：是否启用记忆增强
-- `MEMORY_STORE_PATH`：本地记忆存储路径
-- `MEMORY_SOURCE_ROOT`：源代码 / 工作目录根路径
-- `MEMORY_COLLECTION_NAME`：记忆集合名
-- `MEMORY_TOP_K`：每次检索的记忆条数上限
+- `MEMORY_ENABLED`锛氭槸鍚﹀惎鐢ㄨ蹇嗗寮?
+- `MEMORY_STORE_PATH`锛氭湰鍦拌蹇嗗瓨鍌ㄨ矾寰?
+- `MEMORY_SOURCE_ROOT`锛氭簮浠ｇ爜 / 宸ヤ綔鐩綍鏍硅矾寰?
+- `MEMORY_COLLECTION_NAME`锛氳蹇嗛泦鍚堝悕
+- `MEMORY_TOP_K`锛氭瘡娆℃绱㈢殑璁板繂鏉℃暟涓婇檺
 
 ---
 
-### 4.6 本地客户端同步配置
+### 4.6 鏈湴瀹㈡埛绔悓姝ラ厤缃?
 
 ```env
 CLIENT_SYNC_ENABLED=true
@@ -252,31 +252,31 @@ CODEX_LOCAL_BASE_URL=http://127.0.0.1:8000/v1
 CLAUDE_LOCAL_BASE_URL=http://127.0.0.1:8000
 ```
 
-用于把本地工具自动指向 NexusGate。
+鐢ㄤ簬鎶婃湰鍦板伐鍏疯嚜鍔ㄦ寚鍚?NexusGate銆?
 
 ---
 
-## 5. 启动
+## 5. 鍚姩
 
-### 5.1 使用应用工厂启动
-
-```bash
-python -m uvicorn nexusgate.app:create_app --factory --host 0.0.0.0 --port 8000
-```
-
-### 5.2 兼容旧启动方式
-
-仓库中也保留了旧示例：
+### 5.1 浣跨敤搴旂敤宸ュ巶鍚姩
 
 ```bash
-python -m uvicorn nexus_gate_core:app --host 0.0.0.0 --port 8000
+python -m uvicorn back.nexusgate.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
-如新版本以 `nexusgate.app:create_app` 为准，建议优先采用应用工厂方式启动。
+### 5.2 鍏煎鏃у惎鍔ㄦ柟寮?
+
+浠撳簱涓篃淇濈暀浜嗘棫绀轰緥锛?
+
+```bash
+python -m uvicorn back.nexus_gate_core:app --host 0.0.0.0 --port 8000
+```
+
+濡傛柊鐗堟湰浠?`nexusgate.app:create_app` 涓哄噯锛屽缓璁紭鍏堥噰鐢ㄥ簲鐢ㄥ伐鍘傛柟寮忓惎鍔ㄣ€?
 
 ---
 
-## 6. API 示例
+## 6. API 绀轰緥
 
 ### 6.1 Chat Completions
 
@@ -287,7 +287,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{
     "model": "claude-sonnet-4-5-20250929",
     "messages": [
-      {"role": "user", "content": "帮我总结当前项目的启动方式"}
+      {"role": "user", "content": "甯垜鎬荤粨褰撳墠椤圭洰鐨勫惎鍔ㄦ柟寮?}
     ]
   }'
 ```
@@ -300,7 +300,7 @@ curl http://127.0.0.1:8000/v1/responses \
   -H "Authorization: Bearer ng-abc123" \
   -d '{
     "model": "gpt-5.3-codex",
-    "input": "检查当前仓库的 README 是否与实现一致"
+    "input": "妫€鏌ュ綋鍓嶄粨搴撶殑 README 鏄惁涓庡疄鐜颁竴鑷?
   }'
 ```
 
@@ -314,20 +314,20 @@ curl http://127.0.0.1:8000/v1/messages \
     "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 512,
     "messages": [
-      {"role": "user", "content": "解释一下这个项目的记忆分层"}
+      {"role": "user", "content": "瑙ｉ噴涓€涓嬭繖涓」鐩殑璁板繂鍒嗗眰"}
     ]
   }'
 ```
 
 ---
 
-## 7. 客户端接入
+## 7. 瀹㈡埛绔帴鍏?
 
-### 7.1 OpenAI 兼容客户端
+### 7.1 OpenAI 鍏煎瀹㈡埛绔?
 
 - **Base URL**: `http://127.0.0.1:8000/v1`
-- **Model**: 你希望路由到的模型名
-- **API Key**: 如果启用了本地鉴权，则填写 `LOCAL_API_KEY`
+- **Model**: 浣犲笇鏈涜矾鐢卞埌鐨勬ā鍨嬪悕
+- **API Key**: 濡傛灉鍚敤浜嗘湰鍦伴壌鏉冿紝鍒欏～鍐?`LOCAL_API_KEY`
 
 ### 7.2 Aider
 
@@ -337,9 +337,9 @@ aider \
   --api-base http://127.0.0.1:8000/v1
 ```
 
-### 7.3 Codex / Claude 本地配置
+### 7.3 Codex / Claude 鏈湴閰嶇疆
 
-可结合以下配置项自动接入：
+鍙粨鍚堜互涓嬮厤缃」鑷姩鎺ュ叆锛?
 
 - `CODEX_CONFIG_PATH`
 - `CLAUDE_SETTINGS_PATH`
@@ -348,13 +348,13 @@ aider \
 
 ---
 
-## 8. 健康检查
+## 8. 鍋ュ悍妫€鏌?
 
 ```bash
 curl http://127.0.0.1:8000/health
 ```
 
-典型返回信息包含：
+鍏稿瀷杩斿洖淇℃伅鍖呭惈锛?
 
 - `status`
 - `upstream`
@@ -365,51 +365,51 @@ curl http://127.0.0.1:8000/health
 - `synced_clients`
 - `sync_errors`
 
-这对于前端管理台很有用，可以直接做“系统状态总览”。
+杩欏浜庡墠绔鐞嗗彴寰堟湁鐢紝鍙互鐩存帴鍋氣€滅郴缁熺姸鎬佹€昏鈥濄€?
 
 ---
 
-## 9. 当前实现重点
+## 9. 褰撳墠瀹炵幇閲嶇偣
 
-基于当前代码，README 需要明确：它已经不只是一个“记忆拼接器”，而是一个具备多层控制逻辑的本地网关：
+鍩轰簬褰撳墠浠ｇ爜锛孯EADME 闇€瑕佹槑纭細瀹冨凡缁忎笉鍙槸涓€涓€滆蹇嗘嫾鎺ュ櫒鈥濓紝鑰屾槸涓€涓叿澶囧灞傛帶鍒堕€昏緫鐨勬湰鍦扮綉鍏筹細
 
-- 有分层记忆与 provider-aware render
-- 有动态裁剪与 trim report
-- 有路由、回退、同 provider 重试
-- 有 grounding 与幻觉抑制
-- 有本地 key 与客户端同步能力
-- 有 OpenAI-compatible 与 provider-direct 双模式
+- 鏈夊垎灞傝蹇嗕笌 provider-aware render
+- 鏈夊姩鎬佽鍓笌 trim report
+- 鏈夎矾鐢便€佸洖閫€銆佸悓 provider 閲嶈瘯
+- 鏈?grounding 涓庡够瑙夋姂鍒?
+- 鏈夋湰鍦?key 涓庡鎴风鍚屾鑳藉姏
+- 鏈?OpenAI-compatible 涓?provider-direct 鍙屾ā寮?
 
 ---
 
-## 10. 测试
+## 10. 娴嬭瘯
 
-可按仓库内测试继续验证关键能力，例如：
+鍙寜浠撳簱鍐呮祴璇曠户缁獙璇佸叧閿兘鍔涳紝渚嬪锛?
 
 ```bash
 PYTHONPATH=. python -m unittest discover -s tests -p "test_memory_manager.py"
 ```
 
-建议后续补充的测试方向：
+寤鸿鍚庣画琛ュ厖鐨勬祴璇曟柟鍚戯細
 
-- 路由决策测试
-- fallback trace 测试
-- grounding rewrite 测试
-- OpenAI-compatible upstream 测试
-- 管理台 API 测试
+- 璺敱鍐崇瓥娴嬭瘯
+- fallback trace 娴嬭瘯
+- grounding rewrite 娴嬭瘯
+- OpenAI-compatible upstream 娴嬭瘯
+- 绠＄悊鍙?API 娴嬭瘯
 
 ---
 
-## 11. 适用场景
+## 11. 閫傜敤鍦烘櫙
 
-- 本地 coding agent 网关
-- 带记忆的 CLI / IDE 助手
-- 多模型统一接入层
-- 企业内部知识增强问答入口
-- 有审计与安全要求的代理执行环境
+- 鏈湴 coding agent 缃戝叧
+- 甯﹁蹇嗙殑 CLI / IDE 鍔╂墜
+- 澶氭ā鍨嬬粺涓€鎺ュ叆灞?
+- 浼佷笟鍐呴儴鐭ヨ瘑澧炲己闂瓟鍏ュ彛
+- 鏈夊璁′笌瀹夊叏瑕佹眰鐨勪唬鐞嗘墽琛岀幆澧?
 
 ---
 
 ## 12. License
 
-本项目包含 `LICENSE` 文件，请按仓库中的实际许可证使用。
+鏈」鐩寘鍚?`LICENSE` 鏂囦欢锛岃鎸変粨搴撲腑鐨勫疄闄呰鍙瘉浣跨敤銆
