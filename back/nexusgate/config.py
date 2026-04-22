@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     memory_collection_name: str = Field(default="nexusgate_memory")
     memory_top_k: int = 6
     memory_use_chroma: bool = False
+    enable_memory_management_sop: bool = True
+    enable_session_memory_recall_sop: bool = True
+    session_memory_recall_mode: str = "auto"
 
     model_config = SettingsConfigDict(
         env_file=".env",

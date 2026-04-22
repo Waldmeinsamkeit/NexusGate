@@ -19,6 +19,12 @@ from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.memory.schema import QueryFilters
+from nexusgate.prompt_policies import (
+    build_sop_system_blocks,
+    extract_metadata_from_responses_payload,
+    extract_user_text_from_responses_payload,
+    inject_sop_into_responses_payload,
+)
 from nexusgate.router import ProviderRouter
 from nexusgate.safety import apply_hallucination_guard, supported_claim_check
 from nexusgate.schemas import ChatCompletionRequest, NormalizedRequest
@@ -26,9 +32,9 @@ from nexusgate.schemas import ChatCompletionRequest, NormalizedRequest
 
 L0_META_RULES = (
     "你是由 NexusGate-Core 增强的智能助手。"
-    "始终基于 <nexus_context> 事实回答，若未提及则明确说“不知道”。"
+    "始终基于 <nexus_context> 中的事实回答；"
+    "如果证据不足或上下文未提及，请明确回答“不知道”。"
 )
-
 
 def create_app() -> FastAPI:
     if (
@@ -260,8 +266,14 @@ def create_app() -> FastAPI:
         grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode, grounding_policy=grounding_policy)
         evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
         citation_block = _build_citation_system_block(memory_pack.citations)
+        sop_blocks = build_sop_system_blocks(
+            user_text=user_query,
+            metadata=normalized_req.metadata or {},
+        )
+        sop_messages = [{"role": "system", "content": block} for block in sop_blocks]
         enhanced_messages = [
             {"role": "system", "content": L0_META_RULES},
+            *sop_messages,
             {"role": "system", "content": grounding_rules},
             {"role": "system", "content": evidence_blocks["facts"]},
             {"role": "system", "content": evidence_blocks["constraints"]},
@@ -552,6 +564,13 @@ def create_app() -> FastAPI:
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
         if settings.effective_target_base_url:
+            passthrough_metadata = extract_metadata_from_responses_payload(data)
+            passthrough_user_text = extract_user_text_from_responses_payload(data)
+            passthrough_payload = inject_sop_into_responses_payload(
+                data,
+                user_text=passthrough_user_text,
+                metadata=passthrough_metadata,
+            )
             recent_traces.appendleft(
                 {
                     "request_id": f"req_{uuid4().hex[:12]}",
@@ -569,7 +588,7 @@ def create_app() -> FastAPI:
             )
             passthrough = await _passthrough_responses_to_upstream(
                 request=request,
-                payload=data,
+                payload=passthrough_payload,
                 upstream_base_url=settings.effective_target_base_url,
                 upstream_api_key=settings.effective_target_api_key,
                 on_complete=lambda text: memory.start_memory_update(
