@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
@@ -74,6 +74,34 @@ class MemoryPack:
     l4: str
     citations: list[dict[str, str]]
     selected_ids: list[str]
+    facts: list[str] = field(default_factory=list)
+    procedures: list[str] = field(default_factory=list)
+    continuity: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    risk_profile: dict[str, str | bool | float] = field(default_factory=dict)
+    pack_features: dict[str, int | float | bool] = field(default_factory=dict)
+    estimated_tokens: int = 0
+    trim_report: dict[str, int | str] = field(default_factory=dict)
+    retrieval_trace: dict[str, object] = field(default_factory=dict)
+    assembly_trace: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class DroppedMemoryCandidate:
+    memory_id: str
+    layer: str
+    reason: str
+
+
+@dataclass(slots=True)
+class MemoryRetrievalResult:
+    session_id: str
+    project_id: str
+    query: str
+    task_type: str
+    candidates: list[ScoredMemory]
+    dropped_candidates: list[DroppedMemoryCandidate]
+    retrieval_stats: dict[str, int | float]
 
 
 # Backward compatibility alias for existing scoring/selector tests.

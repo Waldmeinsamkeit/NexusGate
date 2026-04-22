@@ -10,7 +10,7 @@ from typing import Any
 
 from nexusgate.memory.events import MemoryEvent, MemoryEventLogger
 from nexusgate.memory.index import ChromaIndex, MemoryBackendStatus, MemoryIndex, NullIndex
-from nexusgate.memory.models import MemoryCandidate, MemoryPack, ScoredMemory
+from nexusgate.memory.models import DroppedMemoryCandidate, MemoryCandidate, MemoryPack, MemoryRetrievalResult, ScoredMemory
 from nexusgate.memory.policies import SUCCESS_NEGATIVE_HINTS, SUCCESS_POSITIVE_HINTS
 from nexusgate.memory.query_service import MemoryQueryService
 from nexusgate.memory.repository import StructuredMemoryRepository
@@ -374,7 +374,15 @@ class MemoryManager:
     def query_memory_text(self, session_id: str, query: str, layers: list[str]) -> str:
         return self.query_memory(session_id=session_id, query=query, layers=layers)
 
-    def build_memory_pack(self, session_id: str, query: str, project_id: str = "") -> MemoryPack:
+    def _query_scored_layers(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        project_id: str,
+        task_type: str,
+        include_l4: bool,
+    ) -> tuple[dict[str, list[ScoredMemory]], list[DroppedMemoryCandidate], dict[str, int]]:
         filters = QueryFilters(layers=["L1", "L2", "L3", "L4"], session_id=session_id, project_id=project_id)
         records_by_layer = self.query_service.query_by_layers(query=query, filters=filters, limit_per_layer=self.top_k)
         records_by_layer["L3"] = [
@@ -387,23 +395,185 @@ class MemoryManager:
                 limit=self.top_k,
             ),
         ]
-        scored_by_layer: dict[str, list[ScoredMemory]] = {}
         scorer = MemoryScorer()
+        scored: dict[str, list[ScoredMemory]] = {}
+        dropped: list[DroppedMemoryCandidate] = []
+        stats = {"raw_candidates": 0, "kept_candidates": 0, "dropped_candidates": 0}
         for layer, rows in records_by_layer.items():
-            scored_by_layer[layer] = scorer.score(
+            ranked = scorer.score(
                 query=query,
                 candidates=rows,
-                task_type=self.selector.classify_task(query),
+                task_type=task_type,
                 current_session_id=session_id,
                 current_project_id=project_id,
             )
+            stats["raw_candidates"] += len(ranked)
+            kept, layer_dropped = self._apply_retrieval_filters(layer=layer, items=ranked, include_l4=include_l4)
+            stats["kept_candidates"] += len(kept)
+            stats["dropped_candidates"] += len(layer_dropped)
+            scored[layer] = kept
+            dropped.extend(layer_dropped)
+        return scored, dropped, stats
+
+    @staticmethod
+    def _apply_retrieval_filters(
+        *,
+        layer: str,
+        items: list[ScoredMemory],
+        include_l4: bool,
+    ) -> tuple[list[ScoredMemory], list[DroppedMemoryCandidate]]:
+        kept: list[ScoredMemory] = []
+        dropped: list[DroppedMemoryCandidate] = []
+        for item in items:
+            if layer == "L4" and not include_l4:
+                dropped.append(DroppedMemoryCandidate(memory_id=item.memory_id, layer=layer, reason="continuity_not_required"))
+                continue
+            if layer in {"L2", "L3"} and not item.verified:
+                dropped.append(DroppedMemoryCandidate(memory_id=item.memory_id, layer=layer, reason="unverified_filtered"))
+                continue
+            kept.append(item)
+        return kept, dropped
+
+    @staticmethod
+    def _semantic_compress_layer(items: list[ScoredMemory], max_items: int, max_chars: int) -> list[ScoredMemory]:
+        compressed: list[ScoredMemory] = []
+        seen: set[str] = set()
+        for row in items:
+            normalized = re.sub(r"\s+", " ", row.text.lower().strip())
+            key = normalized[:180]
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            clipped = row.text.strip()[:max_chars]
+            compressed.append(
+                ScoredMemory(
+                    layer=row.layer,
+                    text=clipped,
+                    memory_id=row.memory_id,
+                    evidence=row.evidence,
+                    source=row.source,
+                    verified=row.verified,
+                    score=row.score,
+                    recency=row.recency,
+                    scope=row.scope,
+                    session_id=row.session_id,
+                    project_id=row.project_id,
+                    updated_at=row.updated_at,
+                )
+            )
+            if len(compressed) >= max_items:
+                break
+        return compressed
+
+    def _semantic_compress(self, scored_by_layer: dict[str, list[ScoredMemory]]) -> dict[str, list[ScoredMemory]]:
+        return {
+            "L1": self._semantic_compress_layer(scored_by_layer.get("L1", []), max_items=self.top_k, max_chars=220),
+            "L2": self._semantic_compress_layer(scored_by_layer.get("L2", []), max_items=self.top_k, max_chars=260),
+            "L3": self._semantic_compress_layer(scored_by_layer.get("L3", []), max_items=self.top_k, max_chars=220),
+            "L4": self._semantic_compress_layer(scored_by_layer.get("L4", []), max_items=self.top_k, max_chars=160),
+        }
+
+    def _build_retrieval_result(
+        self,
+        *,
+        session_id: str,
+        project_id: str,
+        query: str,
+        task_type: str,
+        scored_by_layer: dict[str, list[ScoredMemory]],
+        dropped: list[DroppedMemoryCandidate],
+        stats: dict[str, int],
+    ) -> MemoryRetrievalResult:
+        candidates = [row for layer in ("L1", "L2", "L3", "L4") for row in scored_by_layer.get(layer, [])]
+        return MemoryRetrievalResult(
+            session_id=session_id,
+            project_id=project_id,
+            query=query,
+            task_type=task_type,
+            candidates=candidates,
+            dropped_candidates=dropped,
+            retrieval_stats=stats,
+        )
+
+    @staticmethod
+    def _contains_continuity_terms(query: str) -> bool:
+        lowered = (query or "").lower()
+        terms = ("continue", "continuity", "previous", "last session", "session", "history", "l4")
+        return any(term in lowered for term in terms)
+
+    def _build_pack_features(
+        self,
+        *,
+        facts: list[str],
+        procedures: list[str],
+        continuity: list[str],
+        citations: list[dict[str, str]],
+        retrieval: MemoryRetrievalResult,
+    ) -> tuple[dict[str, int | float | bool], dict[str, str | bool | float]]:
+        total_chars = sum(len(item) for item in [*facts, *procedures, *continuity])
+        total_items = len(facts) + len(procedures) + len(continuity)
+        estimated_tokens = max(total_chars // 4, 1) if total_chars else 0
+        verified = sum(1 for row in retrieval.candidates if row.verified)
+        verified_ratio = float(verified) / float(max(len(retrieval.candidates), 1))
+        continuity_chars = sum(len(item) for item in continuity)
+        factual_chars = sum(len(item) for item in facts)
+        citation_density = float(len(citations)) / float(max(total_items, 1))
+        features: dict[str, int | float | bool] = {
+            "estimated_tokens": estimated_tokens,
+            "verified_ratio": round(verified_ratio, 4),
+            "continuity_weight": round(float(continuity_chars) / float(max(total_chars, 1)), 4),
+            "factuality_weight": round(float(factual_chars) / float(max(total_chars, 1)), 4),
+            "tool_relevance": 1.0 if any("tool" in item.lower() for item in procedures) else 0.0,
+            "context_span": total_items,
+            "contains_l4": bool(continuity),
+            "citation_density": round(citation_density, 4),
+        }
+        strength = "high" if verified_ratio >= 0.75 else ("medium" if verified_ratio >= 0.4 else "low")
+        risk_level = "high" if (verified_ratio < 0.4 or citation_density < 0.2) else ("medium" if verified_ratio < 0.75 else "low")
+        risk: dict[str, str | bool | float] = {
+            "has_unverified": verified < len(retrieval.candidates),
+            "has_session_derived": bool(continuity),
+            "has_conflicts": False,
+            "staleness_level": "low",
+            "grounding_strength": strength,
+            "risk_level": risk_level,
+        }
+        return features, risk
+
+    def build_memory_pack(self, session_id: str, query: str, project_id: str = "") -> MemoryPack:
+        task_type = self.selector.classify_task(query)
+        include_l4 = task_type in {"debug", "planning"} or self._contains_continuity_terms(query)
+        scored_by_layer, dropped, stats = self._query_scored_layers(
+            session_id=session_id,
+            query=query,
+            project_id=project_id,
+            task_type=task_type,
+            include_l4=include_l4,
+        )
+        compressed = self._semantic_compress(scored_by_layer)
         selected = self.selector.select(
             user_text=query,
             l0="\n".join(self.l0_rules.splitlines()[:12]).strip(),
-            items_by_layer=scored_by_layer,
+            items_by_layer=compressed,
         )
-        selected_records = [row for layer in ("L1", "L2", "L3", "L4") for row in records_by_layer.get(layer, [])]
-        citations = self._build_pack_citations(records=selected_records)
+        selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in compressed.get(layer, [])]
+        citations = self._ensure_citations(self._build_pack_citations_from_scored(items=selected_items), query)
+        retrieval = self._build_retrieval_result(
+            session_id=session_id,
+            project_id=project_id,
+            query=query,
+            task_type=task_type,
+            scored_by_layer=compressed,
+            dropped=dropped,
+            stats=stats,
+        )
+        features, risk = self._build_pack_features(
+            facts=[row.text for row in compressed.get("L2", [])],
+            procedures=[row.text for row in compressed.get("L3", [])],
+            continuity=[row.text for row in compressed.get("L4", [])],
+            citations=citations,
+            retrieval=retrieval,
+        )
         return MemoryPack(
             task_type=selected.task_type,
             budget=self.selector.budget_for_task(selected.task_type),
@@ -413,7 +583,26 @@ class MemoryManager:
             l3=selected.l3,
             l4=selected.l4,
             citations=citations,
-            selected_ids=[row.memory_id for row in selected_records[: self.top_k * 4]],
+            selected_ids=[row.memory_id for row in selected_items if row.memory_id][: self.top_k * 4],
+            facts=[row.text for row in compressed.get("L2", [])],
+            procedures=[row.text for row in compressed.get("L3", [])],
+            continuity=[row.text for row in compressed.get("L4", [])],
+            constraints=[row.text for row in compressed.get("L1", [])],
+            risk_profile=risk,
+            pack_features=features,
+            estimated_tokens=int(features.get("estimated_tokens") or 0),
+            retrieval_trace={
+                "raw_candidates": stats["raw_candidates"],
+                "kept_candidates": stats["kept_candidates"],
+                "dropped_candidates": stats["dropped_candidates"],
+                "dropped_reasons": [row.reason for row in dropped[:12]],
+            },
+            assembly_trace={
+                "facts_count": len(compressed.get("L2", [])),
+                "procedures_count": len(compressed.get("L3", [])),
+                "continuity_count": len(compressed.get("L4", [])),
+                "constraints_count": len(compressed.get("L1", [])),
+            },
         )
 
     @staticmethod
@@ -443,21 +632,95 @@ class MemoryManager:
         return citations
 
     @staticmethod
+    def _build_pack_citations_from_scored(*, items: list[ScoredMemory], max_items: int = 6) -> list[dict[str, str]]:
+        citations: list[dict[str, str]] = []
+        for row in items:
+            text = (row.text or "").strip()
+            if not text:
+                continue
+            citations.append(
+                {
+                    "memory_ref": row.memory_id or f"{row.layer}:{hashlib.sha1(text.encode('utf-8')).hexdigest()[:10]}",
+                    "layer": row.layer,
+                    "snippet": text[:180],
+                    "source_type": "memory",
+                }
+            )
+            if len(citations) >= max_items:
+                break
+        return citations
+
+    @staticmethod
+    def _ensure_citations(citations: list[dict[str, str]], query: str) -> list[dict[str, str]]:
+        if citations:
+            return citations
+        text = (query or "").strip() or "user_query"
+        return [
+            {
+                "memory_ref": f"request:{hashlib.sha1(text.encode('utf-8')).hexdigest()[:10]}",
+                "layer": "REQ",
+                "snippet": text[:180],
+                "source_type": "request_query",
+            }
+        ]
+
+    @staticmethod
+    def _provider_char_budget(provider_style: str) -> int:
+        if provider_style == "anthropic_messages":
+            return 3000
+        return 2200
+
+    @staticmethod
+    def _apply_provider_trim(
+        *,
+        blocks: dict[str, str],
+        max_chars: int,
+    ) -> tuple[dict[str, str], dict[str, int | str]]:
+        total = sum(len(text) for text in blocks.values())
+        if total <= max_chars:
+            return blocks, {"trimmed_total_chars": 0, "final_total_chars": total, "mode": "no_trim"}
+        report: dict[str, int | str] = {"mode": "provider_aware_trim"}
+        min_keep = {"l1": 120, "l2": 220, "l3": 80, "l4": 0}
+        trim_order = ("l4", "l3", "l2", "l1")
+        remaining_excess = total - max_chars
+        trimmed = dict(blocks)
+        for key in trim_order:
+            if remaining_excess <= 0:
+                break
+            original = trimmed[key]
+            floor = min_keep[key]
+            removable = max(len(original) - floor, 0)
+            cut = min(removable, remaining_excess)
+            if cut <= 0:
+                continue
+            trimmed[key] = original[: len(original) - cut]
+            report[f"trimmed_{key}_chars"] = cut
+            remaining_excess -= cut
+        final_total = sum(len(text) for text in trimmed.values())
+        report["trimmed_total_chars"] = total - final_total
+        report["final_total_chars"] = final_total
+        return trimmed, report
+
+    @staticmethod
     def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
+        max_chars = MemoryManager._provider_char_budget(provider_style)
+        blocks = {"l1": pack.l1, "l2": pack.l2, "l3": pack.l3, "l4": pack.l4}
+        trimmed, report = MemoryManager._apply_provider_trim(blocks=blocks, max_chars=max_chars)
+        pack.trim_report = report
         if provider_style == "anthropic_messages":
             return (
                 f"{pack.l0}\n\n"
-                f"<anthropic_memory_index>\n{pack.l1}\n</anthropic_memory_index>\n\n"
-                f"<anthropic_relevant_skills>\n{pack.l3}\n</anthropic_relevant_skills>\n\n"
-                f"<anthropic_session_recall_hints>\n{pack.l4}\n</anthropic_session_recall_hints>\n\n"
-                f"<anthropic_relevant_memory>\n{pack.l2}\n</anthropic_relevant_memory>"
+                f"<anthropic_memory_index>\n{trimmed['l1']}\n</anthropic_memory_index>\n\n"
+                f"<anthropic_relevant_skills>\n{trimmed['l3']}\n</anthropic_relevant_skills>\n\n"
+                f"<anthropic_session_recall_hints>\n{trimmed['l4']}\n</anthropic_session_recall_hints>\n\n"
+                f"<anthropic_relevant_memory>\n{trimmed['l2']}\n</anthropic_relevant_memory>"
             )
         return (
             f"{pack.l0}\n\n"
-            f"<memory_index>\n{pack.l1}\n</memory_index>\n\n"
-            f"<relevant_skills>\n{pack.l3}\n</relevant_skills>\n\n"
-            f"<session_recall_hints>\n{pack.l4}\n</session_recall_hints>\n\n"
-            f"<relevant_memory>\n{pack.l2}\n</relevant_memory>"
+            f"<memory_index>\n{trimmed['l1']}\n</memory_index>\n\n"
+            f"<relevant_skills>\n{trimmed['l3']}\n</relevant_skills>\n\n"
+            f"<session_recall_hints>\n{trimmed['l4']}\n</session_recall_hints>\n\n"
+            f"<relevant_memory>\n{trimmed['l2']}\n</relevant_memory>"
         )
 
     def build_memory_header(self, session_id: str, query: str) -> str:
