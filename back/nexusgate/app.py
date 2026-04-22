@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import httpx
 import litellm
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from nexusgate.config import settings
 from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
+from nexusgate.memory.schema import QueryFilters
 from nexusgate.router import ProviderRouter
 from nexusgate.safety import apply_hallucination_guard, supported_claim_check
 from nexusgate.schemas import ChatCompletionRequest, NormalizedRequest
@@ -60,6 +64,44 @@ def create_app() -> FastAPI:
         use_chroma=settings.memory_use_chroma,
     )
     provider_router = ProviderRouter()
+    recent_traces: deque[dict[str, Any]] = deque(maxlen=200)
+
+    front_dir = Path(__file__).resolve().parents[2] / "front"
+    if front_dir.exists():
+        app.mount("/admin/ui", StaticFiles(directory=str(front_dir), html=True), name="admin_ui")
+
+    def _mask_secret(value: str | None) -> str:
+        if not value:
+            return ""
+        if len(value) <= 6:
+            return "***"
+        return f"{value[:3]}***{value[-2:]}"
+
+    def _record_admin_trace(
+        *,
+        request_id: str,
+        session_id: str,
+        api_style: str,
+        stream: bool,
+        trace: dict[str, Any],
+        grounding: dict[str, Any] | None = None,
+    ) -> None:
+        routing = trace.get("routing") or {}
+        fallback_events = trace.get("fallback") or []
+        row = {
+            "request_id": request_id,
+            "created_at": int(time.time()),
+            "session_id": session_id,
+            "api_style": api_style,
+            "provider": routing.get("provider"),
+            "model": routing.get("model"),
+            "status": "streaming" if stream else "completed",
+            "fallback_count": len(fallback_events),
+            "has_trim": bool(trace.get("render")),
+            "unsupported_ratio": float((grounding or {}).get("unsupported_ratio") or 0.0),
+            "trace": trace,
+        }
+        recent_traces.appendleft(row)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -79,12 +121,111 @@ def create_app() -> FastAPI:
             "sync_errors": sync_state.errors,
         }
 
+    @app.get("/admin/config")
+    async def admin_config(
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        return {
+            "app": {"name": settings.app_name, "env": settings.app_env},
+            "target": {
+                "provider": settings.target_provider,
+                "base_url": settings.target_base_url,
+                "api_key_masked": _mask_secret(settings.target_api_key),
+                "default_model": settings.default_model,
+            },
+            "legacy_llmapi": {
+                "base_url": settings.llmapi_base_url,
+                "api_key_masked": _mask_secret(settings.llmapi_api_key),
+                "model_prefix": settings.llmapi_model_prefix,
+                "provider_prefix": settings.llmapi_provider_prefix,
+            },
+            "effective": {
+                "base_url": settings.effective_target_base_url,
+                "api_key_masked": _mask_secret(settings.effective_target_api_key),
+                "upstream_mode": "openai_compatible" if settings.effective_target_base_url else "provider_direct",
+            },
+            "health": await health(),
+        }
+
+    @app.get("/admin/memories")
+    async def admin_memories(
+        limit: int = 50,
+        layers: str | None = None,
+        query: str | None = None,
+        session_id: str = "",
+        project_id: str = "",
+        include_archived: bool = False,
+        only_verified: bool = False,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+
+        parsed_limit = max(1, min(limit, 200))
+        parsed_layers = [token.strip().upper() for token in (layers or "L1,L2,L3,L4").split(",") if token.strip()]
+        filters = QueryFilters(
+            layers=parsed_layers or ["L1", "L2", "L3", "L4"],
+            session_id=session_id,
+            project_id=project_id,
+            include_scopes=["session", "project", "user", "global"],
+            only_verified=only_verified,
+            exclude_archived=(not include_archived),
+        )
+        if query and query.strip():
+            rows = memory.query_service.query(query=query.strip(), filters=filters, limit=parsed_limit)
+        else:
+            rows = memory.repository.filter_visible(filters)
+            rows.sort(key=lambda row: (row.updated_at or row.created_at), reverse=True)
+            rows = rows[:parsed_limit]
+        return {
+            "total": len(rows),
+            "items": [row.to_dict() for row in rows],
+        }
+
+    @app.get("/admin/traces")
+    async def admin_traces(
+        limit: int = 50,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        parsed_limit = max(1, min(limit, 200))
+        rows = list(recent_traces)[:parsed_limit]
+        return {"total": len(rows), "items": rows}
+
+    @app.get("/admin/ui")
+    async def admin_ui() -> Any:
+        if not front_dir.exists():
+            raise HTTPException(status_code=404, detail="front directory not found")
+        return RedirectResponse(url="/admin/ui/", status_code=307)
+
     def _run_completion(
         req: ChatCompletionRequest,
         data: dict[str, Any],
         normalized_req: NormalizedRequest,
         background_tasks: BackgroundTasks,
     ) -> Any:
+        request_id = f"req_{uuid4().hex[:12]}"
         session_id = normalized_req.session_id
         user_query = normalized_req.user_text
 
@@ -316,6 +457,7 @@ def create_app() -> FastAPI:
         raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
         background_tasks.add_task(memory.distill_to_l4, session_id, raw_messages)
         safety_ctx = {
+            "request_id": request_id,
             "session_id": session_id,
             "memory_context": memory_context,
             "user_text": user_query,
@@ -365,9 +507,26 @@ def create_app() -> FastAPI:
         )
 
         if req.stream:
+            _record_admin_trace(
+                request_id=str(safety_ctx.get("request_id") or f"req_{uuid4().hex[:12]}"),
+                session_id=normalized_req.session_id,
+                api_style=normalized_req.api_style,
+                stream=True,
+                trace=safety_ctx.get("trace") or {},
+                grounding=safety_ctx.get("grounding"),
+            )
             return StreamingResponse(response, media_type="text/event-stream")
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
-        return _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
+        patched = _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
+        _record_admin_trace(
+            request_id=str(safety_ctx.get("request_id") or f"req_{uuid4().hex[:12]}"),
+            session_id=normalized_req.session_id,
+            api_style=normalized_req.api_style,
+            stream=False,
+            trace=safety_ctx.get("trace") or {},
+            grounding=safety_ctx.get("grounding"),
+        )
+        return patched
 
     @app.post("/v1/responses")
     async def responses_api(
@@ -393,6 +552,21 @@ def create_app() -> FastAPI:
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
         if settings.effective_target_base_url:
+            recent_traces.appendleft(
+                {
+                    "request_id": f"req_{uuid4().hex[:12]}",
+                    "created_at": int(time.time()),
+                    "session_id": session_id,
+                    "api_style": normalized_req.api_style,
+                    "provider": "openai_compatible_passthrough",
+                    "model": req.model or settings.target_provider,
+                    "status": "passthrough",
+                    "fallback_count": 0,
+                    "has_trim": False,
+                    "unsupported_ratio": 0.0,
+                    "trace": {},
+                }
+            )
             passthrough = await _passthrough_responses_to_upstream(
                 request=request,
                 payload=data,
@@ -414,6 +588,14 @@ def create_app() -> FastAPI:
         )
 
         if req.stream:
+            _record_admin_trace(
+                request_id=str(safety_ctx.get("request_id") or f"req_{uuid4().hex[:12]}"),
+                session_id=normalized_req.session_id,
+                api_style=normalized_req.api_style,
+                stream=True,
+                trace=safety_ctx.get("trace") or {},
+                grounding=safety_ctx.get("grounding"),
+            )
             return StreamingResponse(
                 _responses_stream_from_openai(response, model=req.model or settings.target_provider),
                 media_type="text/event-stream",
@@ -421,6 +603,14 @@ def create_app() -> FastAPI:
 
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
         payload = _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
+        _record_admin_trace(
+            request_id=str(safety_ctx.get("request_id") or f"req_{uuid4().hex[:12]}"),
+            session_id=normalized_req.session_id,
+            api_style=normalized_req.api_style,
+            stream=False,
+            trace=safety_ctx.get("trace") or {},
+            grounding=safety_ctx.get("grounding"),
+        )
         background_tasks.add_task(
             memory.start_memory_update,
             session_id,
@@ -462,6 +652,14 @@ def create_app() -> FastAPI:
         )
 
         if req.stream:
+            _record_admin_trace(
+                request_id=str(safety_ctx.get("request_id") or f"req_{uuid4().hex[:12]}"),
+                session_id=normalized_req.session_id,
+                api_style=normalized_req.api_style,
+                stream=True,
+                trace=safety_ctx.get("trace") or {},
+                grounding=safety_ctx.get("grounding"),
+            )
             return StreamingResponse(
                 _anthropic_stream_from_openai(response, model=req.model or settings.target_provider),
                 media_type="text/event-stream",
@@ -469,6 +667,14 @@ def create_app() -> FastAPI:
 
         payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
         payload = _apply_grounding_to_openai_payload(payload=payload, safety_ctx=safety_ctx)
+        _record_admin_trace(
+            request_id=str(safety_ctx.get("request_id") or f"req_{uuid4().hex[:12]}"),
+            session_id=normalized_req.session_id,
+            api_style=normalized_req.api_style,
+            stream=False,
+            trace=safety_ctx.get("trace") or {},
+            grounding=safety_ctx.get("grounding"),
+        )
         return _anthropic_response_from_openai(
             payload=payload,
             model=req.model or settings.target_provider,
