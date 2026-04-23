@@ -1,0 +1,6 @@
+{
+  "name": "NexusGate Management Console",
+  "description": "An operational control panel for NexusGate AI Gateway, managing uptreams, memory systems, and request tracing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
