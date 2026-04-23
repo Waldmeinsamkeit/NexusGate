@@ -34,6 +34,27 @@ class Settings(BaseSettings):
     enable_memory_management_sop: bool = True
     enable_session_memory_recall_sop: bool = True
     session_memory_recall_mode: str = "auto"
+    history_rewrite_enabled: bool = True
+    history_rewrite_default_mode: str = "auto"
+    history_rewrite_global_light_query_threshold: int = 120
+    history_rewrite_light_keep_system: int = 0
+    history_rewrite_light_keep_user: int = 1
+    history_rewrite_light_keep_assistant: int = 0
+    history_rewrite_light_keep_tool: int = 0
+    history_rewrite_light_keep_other: int = 0
+    history_rewrite_light_max_chars_per_message: int = 700
+    history_rewrite_normal_keep_system: int = 1
+    history_rewrite_normal_keep_user: int = 1
+    history_rewrite_normal_keep_assistant: int = 1
+    history_rewrite_normal_keep_tool: int = 1
+    history_rewrite_normal_keep_other: int = 0
+    history_rewrite_normal_max_chars_per_message: int = 1200
+    history_rewrite_heavy_keep_system: int = 1
+    history_rewrite_heavy_keep_user: int = 2
+    history_rewrite_heavy_keep_assistant: int = 1
+    history_rewrite_heavy_keep_tool: int = 2
+    history_rewrite_heavy_keep_other: int = 1
+    history_rewrite_heavy_max_chars_per_message: int = 1800
 
     model_config = SettingsConfigDict(
         env_file=".env",

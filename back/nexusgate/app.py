@@ -29,7 +29,7 @@ from nexusgate.prompt_policies import (
 )
 from nexusgate.router import ProviderRouter
 from nexusgate.safety import apply_hallucination_guard, supported_claim_check
-from nexusgate.schemas import ChatCompletionRequest, NormalizedRequest
+from nexusgate.schemas import ChatCompletionRequest, ChatMessage, NormalizedRequest
 
 
 L0_META_RULES = (
@@ -255,6 +255,35 @@ def create_app() -> FastAPI:
                 "base_url": settings.effective_target_base_url,
                 "api_key_masked": _mask_secret(settings.effective_target_api_key),
                 "upstream_mode": "openai_compatible" if settings.effective_target_base_url else "provider_direct",
+            },
+            "history_rewrite": {
+                "enabled": settings.history_rewrite_enabled,
+                "default_mode": settings.history_rewrite_default_mode,
+                "global_light_query_threshold": settings.history_rewrite_global_light_query_threshold,
+                "light": {
+                    "keep_system": settings.history_rewrite_light_keep_system,
+                    "keep_user": settings.history_rewrite_light_keep_user,
+                    "keep_assistant": settings.history_rewrite_light_keep_assistant,
+                    "keep_tool": settings.history_rewrite_light_keep_tool,
+                    "keep_other": settings.history_rewrite_light_keep_other,
+                    "max_chars_per_message": settings.history_rewrite_light_max_chars_per_message,
+                },
+                "normal": {
+                    "keep_system": settings.history_rewrite_normal_keep_system,
+                    "keep_user": settings.history_rewrite_normal_keep_user,
+                    "keep_assistant": settings.history_rewrite_normal_keep_assistant,
+                    "keep_tool": settings.history_rewrite_normal_keep_tool,
+                    "keep_other": settings.history_rewrite_normal_keep_other,
+                    "max_chars_per_message": settings.history_rewrite_normal_max_chars_per_message,
+                },
+                "heavy": {
+                    "keep_system": settings.history_rewrite_heavy_keep_system,
+                    "keep_user": settings.history_rewrite_heavy_keep_user,
+                    "keep_assistant": settings.history_rewrite_heavy_keep_assistant,
+                    "keep_tool": settings.history_rewrite_heavy_keep_tool,
+                    "keep_other": settings.history_rewrite_heavy_keep_other,
+                    "max_chars_per_message": settings.history_rewrite_heavy_max_chars_per_message,
+                },
             },
             "health": await health(),
         }
@@ -708,10 +737,22 @@ def create_app() -> FastAPI:
         request_id = f"req_{uuid4().hex[:12]}"
         session_id = normalized_req.session_id
         user_query = normalized_req.user_text
+        task_mode = _resolve_task_mode(metadata=normalized_req.metadata or {}, session_id=session_id, user_text=user_query)
+        prepared_rows, history_stats = _prepare_messages_for_inference(normalized_req.messages, mode=task_mode)
+        prepared_user_query = _extract_latest_user_query_from_rows(prepared_rows) or user_query
+        prepared_metadata = dict(normalized_req.metadata or {})
+        prepared_metadata.setdefault("task_mode", task_mode)
+        prepared_req = normalized_req.model_copy(
+            update={
+                "messages": _to_chat_messages(prepared_rows),
+                "user_text": prepared_user_query,
+                "metadata": prepared_metadata,
+            }
+        )
 
-        memory_pack = memory.build_memory_pack(session_id, user_query)
+        memory_pack = memory.build_memory_pack(session_id, prepared_user_query)
         decision = route(
-            normalized_req=normalized_req,
+            normalized_req=prepared_req,
             defaults={
                 "model": req.model or settings.target_provider,
                 "api_base": settings.effective_target_base_url,
@@ -723,7 +764,7 @@ def create_app() -> FastAPI:
             router=provider_router,
         )
         enriched_messages, memory_pack = memory.enrich_from_normalized_request(
-            normalized_req=normalized_req,
+            normalized_req=prepared_req,
             provider_style=str(decision.get("render_mode") or "openai"),
             memory_pack=memory_pack,
         )
@@ -735,14 +776,14 @@ def create_app() -> FastAPI:
         grounding_policy = _derive_grounding_policy(
             risk_profile=memory_pack.risk_profile,
             pack_features=memory_pack.pack_features,
-            metadata=normalized_req.metadata or {},
+            metadata=prepared_req.metadata or {},
         )
         grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode, grounding_policy=grounding_policy)
         evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
         citation_block = _build_citation_system_block(memory_pack.citations)
         sop_blocks = build_sop_system_blocks(
-            user_text=user_query,
-            metadata=normalized_req.metadata or {},
+            user_text=prepared_user_query,
+            metadata=prepared_req.metadata or {},
         )
         sop_messages = [{"role": "system", "content": block} for block in sop_blocks]
         enhanced_messages = [
@@ -940,16 +981,17 @@ def create_app() -> FastAPI:
                 detail=f"Upstream completion failed after fallbacks: {last_error}",
             ) from last_error
 
-        raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
+        raw_messages = [message.model_dump(exclude_none=True) for message in prepared_req.messages]
         background_tasks.add_task(memory.distill_to_l4, session_id, raw_messages)
         safety_ctx = {
             "request_id": request_id,
             "session_id": session_id,
             "memory_context": memory_context,
-            "user_text": user_query,
-            "metadata": normalized_req.metadata or {},
+            "user_text": prepared_user_query,
+            "metadata": prepared_req.metadata or {},
             "citations": memory_pack.citations,
             "trace": {
+                "history": history_stats,
                 "retrieval": memory_pack.retrieval_trace,
                 "assembly": memory_pack.assembly_trace,
                 "routing": {
@@ -1038,16 +1080,34 @@ def create_app() -> FastAPI:
         req = ChatCompletionRequest(**openai_data)
         normalized_req = _normalize_responses_request(data=data, req=req)
         session_id = normalized_req.session_id
-        raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
+        task_mode = _resolve_task_mode(
+            metadata=normalized_req.metadata or {},
+            session_id=session_id,
+            user_text=normalized_req.user_text,
+        )
+        prepared_rows, history_stats = _prepare_messages_for_inference(normalized_req.messages, mode=task_mode)
+        prepared_user_text = _extract_latest_user_query_from_rows(prepared_rows) or normalized_req.user_text
+        prepared_metadata = dict(normalized_req.metadata or {})
+        prepared_metadata.setdefault("task_mode", task_mode)
+        prepared_req = normalized_req.model_copy(
+            update={
+                "messages": _to_chat_messages(prepared_rows),
+                "user_text": prepared_user_text,
+                "metadata": prepared_metadata,
+            }
+        )
+        raw_messages = [message.model_dump(exclude_none=True) for message in prepared_req.messages]
 
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
         if settings.effective_target_base_url:
-            passthrough_metadata = extract_metadata_from_responses_payload(data)
-            passthrough_user_text = extract_user_text_from_responses_payload(data)
+            prepared_payload = _replace_responses_input_with_prepared_window(data, prepared_rows)
+            passthrough_metadata = extract_metadata_from_responses_payload(prepared_payload)
+            passthrough_metadata = {**passthrough_metadata, **prepared_metadata}
+            passthrough_user_text = prepared_user_text or extract_user_text_from_responses_payload(prepared_payload)
             memory_pack = memory.build_memory_pack(session_id, passthrough_user_text)
             decision = route(
-                normalized_req=normalized_req,
+                normalized_req=prepared_req,
                 defaults={
                     "model": req.model or settings.target_provider,
                     "api_base": settings.effective_target_base_url,
@@ -1065,10 +1125,10 @@ def create_app() -> FastAPI:
             grounding_policy = _derive_grounding_policy(
                 risk_profile=memory_pack.risk_profile,
                 pack_features=memory_pack.pack_features,
-                metadata=normalized_req.metadata or {},
+                metadata=prepared_req.metadata or {},
             )
             passthrough_payload = inject_system_blocks_into_responses_payload(
-                data,
+                prepared_payload,
                 user_text=passthrough_user_text,
                 metadata=passthrough_metadata,
                 memory_context=memory_context,
@@ -1101,6 +1161,7 @@ def create_app() -> FastAPI:
                         "usage_source": "passthrough_unknown",
                     },
                     "trace": {
+                        "history": history_stats,
                         "retrieval": memory_pack.retrieval_trace,
                         "assembly": memory_pack.assembly_trace,
                         "routing": {
@@ -1364,6 +1425,193 @@ def _extract_latest_user_query(messages: list[Any]) -> str:
             return message.content
         return json.dumps(message.content, ensure_ascii=False)
     return ""
+
+
+def _normalize_message_rows(messages: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for message in messages:
+        if hasattr(message, "model_dump"):
+            rows.append(message.model_dump(exclude_none=True))
+        elif isinstance(message, dict):
+            rows.append(dict(message))
+        else:
+            rows.append({"role": "user", "content": str(message)})
+    return rows
+
+
+def _extract_latest_user_query_from_rows(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role") or "") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False)
+    return ""
+
+
+def _resolve_task_mode(*, metadata: dict[str, Any], session_id: str, user_text: str) -> str:
+    if not settings.history_rewrite_enabled:
+        return "disabled"
+    explicit = str((metadata or {}).get("task_mode") or "").strip().lower()
+    if explicit in {"light", "normal", "heavy"}:
+        return explicit
+    configured_default = str(settings.history_rewrite_default_mode or "auto").strip().lower()
+    if configured_default in {"light", "normal", "heavy"}:
+        return configured_default
+    if not session_id or session_id == "global":
+        threshold = max(int(settings.history_rewrite_global_light_query_threshold or 120), 1)
+        return "light" if len((user_text or "").strip()) < threshold else "normal"
+    return "normal"
+
+
+def _window_limits_for_mode(mode: str) -> dict[str, int]:
+    if mode == "disabled":
+        return {
+            "system": 10_000,
+            "user": 10_000,
+            "assistant": 10_000,
+            "tool": 10_000,
+            "other": 10_000,
+            "max_chars_per_message": 1_000_000,
+        }
+    if mode == "light":
+        return {
+            "system": max(int(settings.history_rewrite_light_keep_system or 0), 0),
+            "user": max(int(settings.history_rewrite_light_keep_user or 1), 0),
+            "assistant": max(int(settings.history_rewrite_light_keep_assistant or 0), 0),
+            "tool": max(int(settings.history_rewrite_light_keep_tool or 0), 0),
+            "other": max(int(settings.history_rewrite_light_keep_other or 0), 0),
+            "max_chars_per_message": max(int(settings.history_rewrite_light_max_chars_per_message or 700), 100),
+        }
+    if mode == "heavy":
+        return {
+            "system": max(int(settings.history_rewrite_heavy_keep_system or 1), 0),
+            "user": max(int(settings.history_rewrite_heavy_keep_user or 2), 0),
+            "assistant": max(int(settings.history_rewrite_heavy_keep_assistant or 1), 0),
+            "tool": max(int(settings.history_rewrite_heavy_keep_tool or 2), 0),
+            "other": max(int(settings.history_rewrite_heavy_keep_other or 1), 0),
+            "max_chars_per_message": max(int(settings.history_rewrite_heavy_max_chars_per_message or 1800), 100),
+        }
+    return {
+        "system": max(int(settings.history_rewrite_normal_keep_system or 1), 0),
+        "user": max(int(settings.history_rewrite_normal_keep_user or 1), 0),
+        "assistant": max(int(settings.history_rewrite_normal_keep_assistant or 1), 0),
+        "tool": max(int(settings.history_rewrite_normal_keep_tool or 1), 0),
+        "other": max(int(settings.history_rewrite_normal_keep_other or 0), 0),
+        "max_chars_per_message": max(int(settings.history_rewrite_normal_max_chars_per_message or 1200), 100),
+    }
+
+
+def _truncate_message_content(content: Any, max_chars: int) -> Any:
+    if max_chars <= 0:
+        return content
+    if isinstance(content, str):
+        if len(content) <= max_chars:
+            return content
+        return f"{content[:max_chars]}…[truncated]"
+    if isinstance(content, list):
+        clipped: list[Any] = []
+        used = 0
+        for item in content:
+            text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+            if used >= max_chars:
+                break
+            remaining = max_chars - used
+            if len(text) <= remaining:
+                clipped.append(item)
+                used += len(text)
+                continue
+            if isinstance(item, str):
+                clipped.append(f"{item[:remaining]}…[truncated]")
+            else:
+                clipped.append({"type": "input_text", "text": f"{text[:remaining]}…[truncated]"})
+            used = max_chars
+        return clipped
+    return content
+
+
+def _prepare_messages_for_inference(messages: list[Any], *, mode: str) -> tuple[list[dict[str, Any]], dict[str, int | str]]:
+    rows = _normalize_message_rows(messages)
+    raw_tokens = _estimate_token_count_from_messages(rows)
+    limits = _window_limits_for_mode(mode)
+    remaining = {
+        "system": int(limits["system"]),
+        "user": int(limits["user"]),
+        "assistant": int(limits["assistant"]),
+        "tool": int(limits["tool"]),
+        "other": int(limits["other"]),
+    }
+
+    picked: list[tuple[int, dict[str, Any]]] = []
+    latest_user_idx = -1
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        role = str(row.get("role") or "user").lower()
+        if role == "user" and latest_user_idx < 0:
+            latest_user_idx = idx
+        bucket = role if role in remaining else "other"
+        if remaining.get(bucket, 0) <= 0:
+            continue
+        remaining[bucket] = int(remaining[bucket]) - 1
+        patched = dict(row)
+        patched["content"] = _truncate_message_content(patched.get("content"), int(limits["max_chars_per_message"]))
+        picked.append((idx, patched))
+
+    if latest_user_idx >= 0 and all(idx != latest_user_idx for idx, _ in picked):
+        forced = dict(rows[latest_user_idx])
+        forced["content"] = _truncate_message_content(forced.get("content"), int(limits["max_chars_per_message"]))
+        picked.append((latest_user_idx, forced))
+    if not picked and rows:
+        fallback = dict(rows[-1])
+        fallback["content"] = _truncate_message_content(fallback.get("content"), int(limits["max_chars_per_message"]))
+        picked.append((len(rows) - 1, fallback))
+
+    picked.sort(key=lambda item: item[0])
+    prepared = [row for _, row in picked]
+    prepared_tokens = _estimate_token_count_from_messages(prepared)
+    replaced_tokens = max(raw_tokens - prepared_tokens, 0)
+    return prepared, {
+        "mode": mode,
+        "raw_input_tokens": raw_tokens,
+        "prepared_messages_tokens": prepared_tokens,
+        "history_replaced_tokens": replaced_tokens,
+    }
+
+
+def _to_chat_messages(rows: list[dict[str, Any]]) -> list[ChatMessage]:
+    out: list[ChatMessage] = []
+    for row in rows:
+        out.append(
+            ChatMessage(
+                role=str(row.get("role") or "user"),
+                content=row.get("content"),
+                name=str(row.get("name")) if row.get("name") is not None else None,
+            )
+        )
+    return out
+
+
+def _replace_responses_input_with_prepared_window(payload: dict[str, Any], prepared_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    patched = dict(payload)
+    input_value = patched.get("input")
+    if not isinstance(input_value, list):
+        return patched
+    if not all(isinstance(item, dict) and "role" in item for item in input_value):
+        return patched
+
+    rebuilt: list[dict[str, Any]] = []
+    for row in prepared_rows:
+        role = str(row.get("role") or "user")
+        content = row.get("content")
+        if isinstance(content, str):
+            rebuilt.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+        elif isinstance(content, list):
+            rebuilt.append({"role": role, "content": content})
+        else:
+            rebuilt.append({"role": role, "content": [{"type": "input_text", "text": json.dumps(content, ensure_ascii=False)}]})
+    patched["input"] = rebuilt
+    return patched
 
 
 def _estimate_pack_size(pack: Any) -> int:
