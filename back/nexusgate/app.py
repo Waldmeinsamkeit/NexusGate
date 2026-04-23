@@ -285,6 +285,11 @@ def create_app() -> FastAPI:
                     "max_chars_per_message": settings.history_rewrite_heavy_max_chars_per_message,
                 },
             },
+            "context_budget": {
+                "enabled": settings.context_budget_enabled,
+                "response_reserve_ratio": settings.context_budget_response_reserve_ratio,
+                "min_prompt_tokens": settings.context_budget_min_prompt_tokens,
+            },
             "health": await health(),
         }
 
@@ -797,6 +802,10 @@ def create_app() -> FastAPI:
             {"role": "system", "content": citation_block},
             *enriched_messages,
         ]
+        enhanced_messages, budget_report = _apply_total_context_budget(
+            enhanced_messages,
+            context_budget_tokens=decision.get("context_budget"),
+        )
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
         if decision.get("api_base"):
@@ -992,6 +1001,7 @@ def create_app() -> FastAPI:
             "citations": memory_pack.citations,
             "trace": {
                 "history": history_stats,
+                "budget": budget_report,
                 "retrieval": memory_pack.retrieval_trace,
                 "assembly": memory_pack.assembly_trace,
                 "routing": {
@@ -1133,6 +1143,12 @@ def create_app() -> FastAPI:
                 metadata=passthrough_metadata,
                 memory_context=memory_context,
             )
+            passthrough_budget_messages = _responses_payload_to_messages(passthrough_payload)
+            passthrough_budget_messages, budget_report = _apply_total_context_budget(
+                passthrough_budget_messages,
+                context_budget_tokens=decision.get("context_budget"),
+            )
+            passthrough_payload = _messages_to_responses_payload(passthrough_payload, passthrough_budget_messages)
             estimated_prompt_tokens = _estimate_token_count_from_messages(raw_messages)
             estimated_sent_tokens = estimated_prompt_tokens + _estimate_pack_size(memory_pack)
             recent_traces.appendleft(
@@ -1162,6 +1178,7 @@ def create_app() -> FastAPI:
                     },
                     "trace": {
                         "history": history_stats,
+                        "budget": budget_report,
                         "retrieval": memory_pack.retrieval_trace,
                         "assembly": memory_pack.assembly_trace,
                         "routing": {
@@ -1656,6 +1673,198 @@ def _estimate_token_count_from_messages(messages: list[dict[str, Any]]) -> int:
                 total_chars += len(_collect_text(message.get(extra_key)))
 
     return max(1, total_chars // 4)
+
+
+def _system_drop_rank(content: str) -> int:
+    lowered = (content or "").lower()
+    if "session continuity context" in lowered:
+        return 90
+    if "non-cited procedures" in lowered:
+        return 80
+    if "citation-backed facts" in lowered:
+        return 70
+    if "citation refs" in lowered:
+        return 65
+    if "<memory_usage_skill>" in lowered or "<session_memory_recall>" in lowered:
+        return 60
+    if "grounding policy:" in lowered:
+        return 50
+    if "<nexus_context>" in lowered:
+        return 20
+    if "hard constraints" in lowered:
+        return 10
+    return 55
+
+
+def _apply_total_context_budget(
+    messages: list[dict[str, Any]],
+    *,
+    context_budget_tokens: int | None,
+) -> tuple[list[dict[str, Any]], dict[str, int | float | bool]]:
+    before_tokens = _estimate_token_count_from_messages(messages)
+    if not settings.context_budget_enabled:
+        return list(messages), {
+            "enabled": False,
+            "before_tokens": before_tokens,
+            "after_tokens": before_tokens,
+            "context_budget_tokens": int(context_budget_tokens or 0),
+            "prompt_budget_tokens": 0,
+            "truncated_messages": 0,
+            "dropped_messages": 0,
+            "over_budget_before": False,
+            "over_budget_after": False,
+        }
+
+    budget_total = max(int(context_budget_tokens or 0), int(settings.context_budget_min_prompt_tokens or 512))
+    reserve_ratio = float(settings.context_budget_response_reserve_ratio or 0.3)
+    reserve_ratio = min(max(reserve_ratio, 0.05), 0.9)
+    prompt_budget = max(int(budget_total * (1.0 - reserve_ratio)), int(settings.context_budget_min_prompt_tokens or 512))
+    if before_tokens <= prompt_budget:
+        return list(messages), {
+            "enabled": True,
+            "before_tokens": before_tokens,
+            "after_tokens": before_tokens,
+            "context_budget_tokens": budget_total,
+            "prompt_budget_tokens": prompt_budget,
+            "truncated_messages": 0,
+            "dropped_messages": 0,
+            "over_budget_before": False,
+            "over_budget_after": False,
+        }
+
+    patched = [dict(row) for row in messages]
+    truncated = 0
+    dropped = 0
+
+    # Pass 1: truncate system blocks by role-aware caps.
+    for row in patched:
+        if str(row.get("role") or "") != "system":
+            continue
+        content = str(row.get("content") or "")
+        cap = 500
+        if "<nexus_context>" in content:
+            cap = 1600
+        elif "Hard constraints" in content:
+            cap = 800
+        if len(content) > cap:
+            row["content"] = f"{content[:cap]}…[budget-trimmed]"
+            truncated += 1
+
+    # Pass 2: drop low-priority system blocks if still over budget.
+    while _estimate_token_count_from_messages(patched) > prompt_budget:
+        system_candidates: list[tuple[int, int]] = []
+        for idx, row in enumerate(patched):
+            if str(row.get("role") or "") != "system":
+                continue
+            content = str(row.get("content") or "")
+            rank = _system_drop_rank(content)
+            # keep core meta and memory context as much as possible
+            if rank <= 25:
+                continue
+            system_candidates.append((rank, idx))
+        if not system_candidates:
+            break
+        system_candidates.sort(reverse=True)
+        _, drop_idx = system_candidates[0]
+        patched.pop(drop_idx)
+        dropped += 1
+
+    # Pass 3: truncate older assistant/tool messages, but keep the latest user.
+    if _estimate_token_count_from_messages(patched) > prompt_budget:
+        latest_user_idx = -1
+        for idx in range(len(patched) - 1, -1, -1):
+            if str(patched[idx].get("role") or "") == "user":
+                latest_user_idx = idx
+                break
+        for idx, row in enumerate(patched):
+            role = str(row.get("role") or "")
+            if role not in {"assistant", "tool", "user"}:
+                continue
+            if role == "user" and idx == latest_user_idx:
+                continue
+            content = row.get("content")
+            clipped = _truncate_message_content(content, 400)
+            if clipped != content:
+                row["content"] = clipped
+                truncated += 1
+            if _estimate_token_count_from_messages(patched) <= prompt_budget:
+                break
+
+    after_tokens = _estimate_token_count_from_messages(patched)
+    return patched, {
+        "enabled": True,
+        "before_tokens": before_tokens,
+        "after_tokens": after_tokens,
+        "context_budget_tokens": budget_total,
+        "prompt_budget_tokens": prompt_budget,
+        "truncated_messages": truncated,
+        "dropped_messages": dropped,
+        "over_budget_before": before_tokens > prompt_budget,
+        "over_budget_after": after_tokens > prompt_budget,
+    }
+
+
+def _content_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        rows: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                rows.append(item)
+                continue
+            if isinstance(item, dict):
+                text = str(item.get("text") or "")
+                if text:
+                    rows.append(text)
+                    continue
+                rows.append(json.dumps(item, ensure_ascii=False))
+                continue
+            rows.append(str(item))
+        return "\n".join(row for row in rows if row).strip()
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _responses_payload_to_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        rows.append({"role": "system", "content": instructions})
+    input_value = payload.get("input")
+    if isinstance(input_value, str):
+        rows.append({"role": "user", "content": input_value})
+        return rows
+    if isinstance(input_value, dict):
+        role = str(input_value.get("role") or "user")
+        rows.append({"role": role, "content": _content_to_text(input_value.get("content"))})
+        return rows
+    if isinstance(input_value, list):
+        for item in input_value:
+            if isinstance(item, dict) and "role" in item:
+                role = str(item.get("role") or "user")
+                rows.append({"role": role, "content": _content_to_text(item.get("content"))})
+            elif isinstance(item, str):
+                rows.append({"role": "user", "content": item})
+    return rows
+
+
+def _messages_to_responses_payload(payload: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    patched = dict(payload)
+    patched.pop("instructions", None)
+    rendered: list[dict[str, Any]] = []
+    for row in rows:
+        role = str(row.get("role") or "user")
+        text = _content_to_text(row.get("content"))
+        rendered.append({"role": role, "content": [{"type": "input_text", "text": text}]})
+    patched["input"] = rendered
+    return patched
 
 
 def _provider_from_model(model: str, fallback: str = "openai") -> str:

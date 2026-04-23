@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     history_rewrite_heavy_keep_tool: int = 2
     history_rewrite_heavy_keep_other: int = 1
     history_rewrite_heavy_max_chars_per_message: int = 1800
+    context_budget_enabled: bool = True
+    context_budget_response_reserve_ratio: float = 0.3
+    context_budget_min_prompt_tokens: int = 512
 
     model_config = SettingsConfigDict(
         env_file=".env",
