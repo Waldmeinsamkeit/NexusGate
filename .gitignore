@@ -31,13 +31,5 @@ memory/l4/archive.jsonl
 
 #docs
 exploration_findings.md
-front_design.md
-<<<<<<< HEAD
-memory/l4/archive.jsonl
-memory/candidates/candidate_events.jsonl
-memory/candidates/candidate_events.jsonl
-memory/l4/archive.jsonl
-memory/candidates/candidate_events.jsonl
-=======
+frontdesign.md
 memory/l3/layer_routing_min_decision_sop.md
->>>>>>> 42e2223315dae7d2e97bca64ab990bf52a3b4eb0
