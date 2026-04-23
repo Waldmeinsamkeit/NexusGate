@@ -64,10 +64,24 @@ def should_enable_session_memory_recall(user_text: str, metadata: dict[str, Any]
     return False
 
 
+def build_memory_usage_skill_block() -> str:
+    return (
+        "<memory_usage_skill>\n"
+        "When operating through NexusGate with long-running coding or agent workflows:\n"
+        "- Check <nexus_context> first for recalled session state, constraints, decisions, and prior work.\n"
+        "- If the user asks to continue, resume, recall, or pick up previous work, summarize the recovered state briefly before acting.\n"
+        "- Distinguish confirmed memory from inference; do not present guessed details as facts.\n"
+        "- If the recovered context is insufficient to act safely, ask a targeted clarification question before making irreversible changes.\n"
+        "- Preserve stable constraints and prior decisions unless newer evidence in <nexus_context> contradicts them.\n"
+        "</memory_usage_skill>"
+    )
+
+
 def build_sop_system_blocks(user_text: str, metadata: dict[str, Any] | None) -> list[str]:
     blocks: list[str] = []
     if settings.enable_memory_management_sop:
         blocks.append(build_memory_management_sop_block())
+        blocks.append(build_memory_usage_skill_block())
 
     if not settings.enable_session_memory_recall_sop:
         return blocks
@@ -100,39 +114,73 @@ def extract_user_text_from_responses_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
+def build_responses_system_blocks(
+    *,
+    user_text: str,
+    metadata: dict[str, Any] | None,
+    memory_context: str | None = None,
+) -> list[str]:
+    blocks = build_sop_system_blocks(user_text=user_text, metadata=metadata)
+    memory_text = str(memory_context or "").strip()
+    if memory_text:
+        blocks.append(memory_text)
+    return [block for block in blocks if str(block or "").strip()]
+
+
+
+def inject_system_blocks_into_responses_payload(
+    payload: dict[str, Any],
+    *,
+    user_text: str,
+    metadata: dict[str, Any] | None,
+    memory_context: str | None = None,
+) -> dict[str, Any]:
+    system_blocks = build_responses_system_blocks(
+        user_text=user_text,
+        metadata=metadata,
+        memory_context=memory_context,
+    )
+    if not system_blocks:
+        return dict(payload)
+
+    patched = copy.deepcopy(payload)
+    system_text = "\n\n".join(system_blocks).strip()
+    if not system_text:
+        return patched
+
+    instructions = patched.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        patched["instructions"] = f"{system_text}\n\n{instructions}"
+        return patched
+
+    input_value = patched.get("input")
+    system_item = {"role": "system", "content": [{"type": "input_text", "text": system_text}]}
+    if isinstance(input_value, str):
+        patched["input"] = [system_item, {"role": "user", "content": [{"type": "input_text", "text": input_value}]}]
+        return patched
+    if isinstance(input_value, list):
+        patched["input"] = [system_item, *input_value]
+        return patched
+    if isinstance(input_value, dict):
+        if _dict_input_is_textual(input_value):
+            patched["input"] = [system_item, input_value]
+        return patched
+    return patched
+
+
+
 def inject_sop_into_responses_payload(
     payload: dict[str, Any],
     *,
     user_text: str,
     metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    sop_blocks = build_sop_system_blocks(user_text=user_text, metadata=metadata)
-    if not sop_blocks:
-        return dict(payload)
-
-    patched = copy.deepcopy(payload)
-    sop_text = "\n\n".join(sop_blocks).strip()
-    if not sop_text:
-        return patched
-
-    instructions = patched.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        patched["instructions"] = f"{sop_text}\n\n{instructions}"
-        return patched
-
-    input_value = patched.get("input")
-    sop_item = {"role": "system", "content": [{"type": "input_text", "text": sop_text}]}
-    if isinstance(input_value, str):
-        patched["input"] = [sop_item, {"role": "user", "content": [{"type": "input_text", "text": input_value}]}]
-        return patched
-    if isinstance(input_value, list):
-        patched["input"] = [sop_item, *input_value]
-        return patched
-    if isinstance(input_value, dict):
-        if _dict_input_is_textual(input_value):
-            patched["input"] = [sop_item, input_value]
-        return patched
-    return patched
+    return inject_system_blocks_into_responses_payload(
+        payload,
+        user_text=user_text,
+        metadata=metadata,
+        memory_context=None,
+    )
 
 
 def _extract_text_from_input(input_value: Any) -> str:

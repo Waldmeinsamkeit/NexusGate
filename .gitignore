@@ -25,9 +25,14 @@ __pycache__/
 memory/structured_memory.jsonl
 memory/candidates/candidate_states.json
 memory/candidates/candidates.jsonl
+memory/candidates/candidate_events.jsonl
 memory/l4/archive.jsonl
 
 #docs
 exploration_findings.md
 frontdesign.md
 memory/l3/layer_routing_min_decision_sop.md
+memory/solo_token.txt
+memory/sum_token.txt
+solo_token.txt
+plan.md

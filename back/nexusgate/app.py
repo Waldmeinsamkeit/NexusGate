@@ -25,7 +25,7 @@ from nexusgate.prompt_policies import (
     build_sop_system_blocks,
     extract_metadata_from_responses_payload,
     extract_user_text_from_responses_payload,
-    inject_sop_into_responses_payload,
+    inject_system_blocks_into_responses_payload,
 )
 from nexusgate.router import ProviderRouter
 from nexusgate.safety import apply_hallucination_guard, supported_claim_check
@@ -73,6 +73,8 @@ def create_app() -> FastAPI:
     )
     provider_router = ProviderRouter()
     recent_traces: deque[dict[str, Any]] = deque(maxlen=200)
+    solo_token_path = Path(__file__).resolve().parents[2] / "solo_token.txt"
+    sum_memory_path = Path(__file__).resolve().parents[2] / "memory" / "sum_memory.txt"
 
     front_dir = Path(__file__).resolve().parents[2] / "front"
     if front_dir.exists():
@@ -84,6 +86,48 @@ def create_app() -> FastAPI:
         if len(value) <= 6:
             return "***"
         return f"{value[:3]}***{value[-2:]}"
+
+    def _refresh_solo_token_summary() -> None:
+        total_with_arch = 0
+        total_no_arch = 0
+        rows = 0
+        if solo_token_path.exists():
+            try:
+                with solo_token_path.open("r", encoding="utf-8") as handle:
+                    for raw in handle:
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                        total_with_arch += int(payload.get("with_arch_total_tokens") or 0)
+                        total_no_arch += int(payload.get("no_arch_est_total_tokens") or 0)
+                        rows += 1
+            except Exception:
+                return
+        total_saved = total_no_arch - total_with_arch
+        summary = (
+            f"rows={rows}\n"
+            f"with_arch_total_tokens={total_with_arch}\n"
+            f"no_arch_est_total_tokens={total_no_arch}\n"
+            f"saved_total_tokens={total_saved}\n"
+        )
+        try:
+            sum_memory_path.parent.mkdir(parents=True, exist_ok=True)
+            sum_memory_path.write_text(summary, encoding="utf-8")
+        except Exception:
+            return
+
+    def _append_solo_token_line(line: dict[str, Any]) -> None:
+        try:
+            with solo_token_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{json.dumps(line, ensure_ascii=False)}\n")
+            _refresh_solo_token_summary()
+        except Exception:
+            # Token logging must never break request flow.
+            pass
 
     def _record_admin_trace(
         *,
@@ -133,6 +177,32 @@ def create_app() -> FastAPI:
             "trace": trace,
         }
         recent_traces.appendleft(row)
+        token_stats = row.get("token_stats") or {}
+        with_prompt = int(token_stats.get("prompt_tokens") or 0)
+        with_completion = int(token_stats.get("completion_tokens") or 0)
+        with_total = int(token_stats.get("total_tokens") or (with_prompt + with_completion))
+        if with_prompt <= 0:
+            with_prompt = int(token_stats.get("estimated_sent_tokens") or 0)
+            with_total = with_prompt + with_completion
+        memory_after = int((render or {}).get("estimated_tokens_after") or 0)
+        no_arch_prompt_est = max(with_prompt - memory_after, 0)
+        no_arch_total_est = no_arch_prompt_est + with_completion
+        _append_solo_token_line(
+            {
+                "created_at": row.get("created_at"),
+                "request_id": row.get("request_id"),
+                "session_id": row.get("session_id"),
+                "api_style": row.get("api_style"),
+                "provider": row.get("provider"),
+                "model": row.get("model"),
+                "with_arch_total_tokens": with_total,
+                "no_arch_est_total_tokens": no_arch_total_est,
+                "delta_total_tokens": with_total - no_arch_total_est,
+                "with_arch_prompt_tokens": with_prompt,
+                "no_arch_est_prompt_tokens": no_arch_prompt_est,
+                "memory_render_tokens_est": memory_after,
+            }
+        )
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -975,39 +1045,104 @@ def create_app() -> FastAPI:
         if settings.effective_target_base_url:
             passthrough_metadata = extract_metadata_from_responses_payload(data)
             passthrough_user_text = extract_user_text_from_responses_payload(data)
-            passthrough_payload = inject_sop_into_responses_payload(
+            memory_pack = memory.build_memory_pack(session_id, passthrough_user_text)
+            decision = route(
+                normalized_req=normalized_req,
+                defaults={
+                    "model": req.model or settings.target_provider,
+                    "api_base": settings.effective_target_base_url,
+                    "api_key": settings.effective_target_api_key,
+                },
+                memory_pack_size=_estimate_pack_size(memory_pack),
+                pack_features=memory_pack.pack_features,
+                risk_profile=memory_pack.risk_profile,
+                router=provider_router,
+            )
+            memory_context = memory.render_memory_for_provider(
+                pack=memory_pack,
+                provider_style=str(decision.get("render_mode") or "openai"),
+            )
+            grounding_policy = _derive_grounding_policy(
+                risk_profile=memory_pack.risk_profile,
+                pack_features=memory_pack.pack_features,
+                metadata=normalized_req.metadata or {},
+            )
+            passthrough_payload = inject_system_blocks_into_responses_payload(
                 data,
                 user_text=passthrough_user_text,
                 metadata=passthrough_metadata,
+                memory_context=memory_context,
             )
+            estimated_prompt_tokens = _estimate_token_count_from_messages(raw_messages)
+            estimated_sent_tokens = estimated_prompt_tokens + _estimate_pack_size(memory_pack)
             recent_traces.appendleft(
                 {
                     "request_id": f"req_{uuid4().hex[:12]}",
                     "created_at": int(time.time()),
                     "session_id": session_id,
                     "api_style": normalized_req.api_style,
-                    "provider": "openai_compatible_passthrough",
-                    "model": req.model or settings.target_provider,
+                    "provider": decision.get("provider") or "openai_compatible_passthrough",
+                    "model": decision.get("model") or req.model or settings.target_provider,
                     "status": "passthrough",
                     "fallback_count": 0,
-                    "has_trim": False,
+                    "has_trim": bool(memory_pack.trim_report),
                     "latency_ms": int((time.perf_counter() - started) * 1000.0),
                     "unsupported_ratio": 0.0,
                     "token_stats": {
-                        "estimated_prompt_tokens": 0,
-                        "estimated_sent_tokens": 0,
+                        "estimated_prompt_tokens": estimated_prompt_tokens,
+                        "estimated_sent_tokens": estimated_sent_tokens,
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "total_tokens": 0,
-                        "saved_tokens_estimated": 0,
+                        "saved_tokens_estimated": max(estimated_sent_tokens - (int(memory_pack.trim_report.get("estimated_tokens_after") or 0) if memory_pack.trim_report else estimated_sent_tokens), 0),
                         "saved_tokens_actual": 0,
                         "saved_rate_estimated": 0.0,
                         "saved_rate_actual": 0.0,
                         "usage_source": "passthrough_unknown",
                     },
-                    "trace": {},
+                    "trace": {
+                        "retrieval": memory_pack.retrieval_trace,
+                        "assembly": memory_pack.assembly_trace,
+                        "routing": {
+                            "provider": decision.get("provider"),
+                            "model": decision.get("model"),
+                            "reason_codes": decision.get("reason_codes") or [],
+                            "fallback_chain": decision.get("fallback_chain") or decision.get("fallbacks") or [],
+                            "context_budget": decision.get("context_budget"),
+                            "grounding_mode": decision.get("grounding_mode"),
+                            "grounding_policy": grounding_policy,
+                        },
+                        "render": memory_pack.trim_report,
+                        "fallback": [],
+                    },
                 }
             )
+            try:
+                passthrough_row = recent_traces[0]
+                token_stats = passthrough_row.get("token_stats") or {}
+                with_prompt = int(token_stats.get("estimated_sent_tokens") or token_stats.get("prompt_tokens") or 0)
+                with_completion = int(token_stats.get("completion_tokens") or 0)
+                with_total = with_prompt + with_completion
+                memory_after = int((memory_pack.trim_report or {}).get("estimated_tokens_after") or 0)
+                no_arch_prompt_est = max(with_prompt - memory_after, 0)
+                no_arch_total_est = no_arch_prompt_est + with_completion
+                line = {
+                    "created_at": passthrough_row.get("created_at"),
+                    "request_id": passthrough_row.get("request_id"),
+                    "session_id": passthrough_row.get("session_id"),
+                    "api_style": passthrough_row.get("api_style"),
+                    "provider": passthrough_row.get("provider"),
+                    "model": passthrough_row.get("model"),
+                    "with_arch_total_tokens": with_total,
+                    "no_arch_est_total_tokens": no_arch_total_est,
+                    "delta_total_tokens": with_total - no_arch_total_est,
+                    "with_arch_prompt_tokens": with_prompt,
+                    "no_arch_est_prompt_tokens": no_arch_prompt_est,
+                    "memory_render_tokens_est": memory_after,
+                }
+                _append_solo_token_line(line)
+            except Exception:
+                pass
             passthrough = await _passthrough_responses_to_upstream(
                 request=request,
                 payload=passthrough_payload,
@@ -1240,6 +1375,39 @@ def _estimate_pack_size(pack: Any) -> int:
         "\n".join(getattr(pack, "constraints", []) or []),
     ]
     return sum(len(part) for part in canonical_parts if part)
+
+
+def _estimate_token_count_from_messages(messages: list[dict[str, Any]]) -> int:
+    def _collect_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return " ".join(part for item in value if (part := _collect_text(item)))
+        if isinstance(value, dict):
+            parts: list[str] = []
+            for key in ("content", "text", "input_text", "output_text", "arguments", "name"):
+                part = _collect_text(value.get(key))
+                if part:
+                    parts.append(part)
+            if not parts:
+                parts.append(json.dumps(value, ensure_ascii=False))
+            return " ".join(parts)
+        return str(value)
+
+    total_chars = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            total_chars += len(_collect_text(message))
+            continue
+        total_chars += len(str(message.get("role", ""))) + 8
+        total_chars += len(_collect_text(message.get("content")))
+        for extra_key in ("tool_calls", "function_call", "name"):
+            if extra_key in message:
+                total_chars += len(_collect_text(message.get(extra_key)))
+
+    return max(1, total_chars // 4)
 
 
 def _provider_from_model(model: str, fallback: str = "openai") -> str:
