@@ -37,3 +37,6 @@ memory/sum_token.txt
 solo_token.txt
 plan.md
 memory/sum_memory.txt
+memory/token_mode_benchmark.json
+memory/token_mode_benchmark.md
+scripts/token_mode_benchmark.py

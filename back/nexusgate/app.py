@@ -90,6 +90,12 @@ def create_app() -> FastAPI:
     def _refresh_solo_token_summary() -> None:
         total_with_arch = 0
         total_no_arch = 0
+        total_raw_input = 0
+        total_prepared_input = 0
+        total_history_replaced = 0
+        total_memory_before_trim = 0
+        total_memory_after_trim = 0
+        total_final_input = 0
         rows = 0
         if solo_token_path.exists():
             try:
@@ -104,6 +110,12 @@ def create_app() -> FastAPI:
                             continue
                         total_with_arch += int(payload.get("with_arch_total_tokens") or 0)
                         total_no_arch += int(payload.get("no_arch_est_total_tokens") or 0)
+                        total_raw_input += int(payload.get("raw_input_tokens") or 0)
+                        total_prepared_input += int(payload.get("prepared_messages_tokens") or 0)
+                        total_history_replaced += int(payload.get("history_replaced_tokens") or 0)
+                        total_memory_before_trim += int(payload.get("memory_tokens_before_trim") or 0)
+                        total_memory_after_trim += int(payload.get("memory_tokens_after_trim") or 0)
+                        total_final_input += int(payload.get("final_input_tokens") or 0)
                         rows += 1
             except Exception:
                 return
@@ -113,12 +125,73 @@ def create_app() -> FastAPI:
             f"with_arch_total_tokens={total_with_arch}\n"
             f"no_arch_est_total_tokens={total_no_arch}\n"
             f"saved_total_tokens={total_saved}\n"
+            f"raw_input_tokens_total={total_raw_input}\n"
+            f"prepared_messages_tokens_total={total_prepared_input}\n"
+            f"history_replaced_tokens_total={total_history_replaced}\n"
+            f"memory_tokens_before_trim_total={total_memory_before_trim}\n"
+            f"memory_tokens_after_trim_total={total_memory_after_trim}\n"
+            f"final_input_tokens_total={total_final_input}\n"
         )
         try:
             sum_memory_path.parent.mkdir(parents=True, exist_ok=True)
             sum_memory_path.write_text(summary, encoding="utf-8")
         except Exception:
             return
+
+    def _build_solo_token_line(*, row: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
+        token_stats = row.get("token_stats") or {}
+        render = trace.get("render") or {}
+        history = trace.get("history") or {}
+        budget = trace.get("budget") or {}
+
+        with_prompt = int(token_stats.get("prompt_tokens") or 0)
+        with_completion = int(token_stats.get("completion_tokens") or 0)
+        with_total = int(token_stats.get("total_tokens") or (with_prompt + with_completion))
+        if with_prompt <= 0:
+            with_prompt = int(token_stats.get("estimated_sent_tokens") or 0)
+            with_total = with_prompt + with_completion
+
+        memory_before = int(render.get("estimated_tokens_before") or 0)
+        memory_after = int(render.get("estimated_tokens_after") or 0)
+        no_arch_prompt_est = max(with_prompt - memory_after, 0)
+        no_arch_total_est = no_arch_prompt_est + with_completion
+
+        raw_input_tokens = int(history.get("raw_input_tokens") or 0)
+        prepared_messages_tokens = int(history.get("prepared_messages_tokens") or 0)
+        history_replaced_tokens = int(history.get("history_replaced_tokens") or 0)
+        mode = str(history.get("mode") or "unknown")
+
+        # Approximate baseline if full history were sent with current non-history overhead preserved.
+        non_history_overhead = max(with_prompt - prepared_messages_tokens, 0)
+        estimated_full_history_without_replacement = raw_input_tokens + non_history_overhead
+
+        return {
+            "created_at": row.get("created_at"),
+            "request_id": row.get("request_id"),
+            "session_id": row.get("session_id"),
+            "api_style": row.get("api_style"),
+            "provider": row.get("provider"),
+            "model": row.get("model"),
+            "mode": mode,
+            "with_arch_total_tokens": with_total,
+            "no_arch_est_total_tokens": no_arch_total_est,
+            "delta_total_tokens": with_total - no_arch_total_est,
+            "with_arch_prompt_tokens": with_prompt,
+            "no_arch_est_prompt_tokens": no_arch_prompt_est,
+            "memory_render_tokens_est": memory_after,
+            "raw_input_tokens": raw_input_tokens,
+            "prepared_messages_tokens": prepared_messages_tokens,
+            "history_replaced_tokens": history_replaced_tokens,
+            "memory_tokens_before_trim": memory_before,
+            "memory_tokens_after_trim": memory_after,
+            "final_input_tokens": with_prompt,
+            "estimated_full_history_without_replacement": estimated_full_history_without_replacement,
+            "budget_prompt_tokens": int(budget.get("prompt_budget_tokens") or 0),
+            "budget_before_tokens": int(budget.get("before_tokens") or 0),
+            "budget_after_tokens": int(budget.get("after_tokens") or 0),
+            "budget_dropped_messages": int(budget.get("dropped_messages") or 0),
+            "budget_truncated_messages": int(budget.get("truncated_messages") or 0),
+        }
 
     def _append_solo_token_line(line: dict[str, Any]) -> None:
         try:
@@ -177,32 +250,7 @@ def create_app() -> FastAPI:
             "trace": trace,
         }
         recent_traces.appendleft(row)
-        token_stats = row.get("token_stats") or {}
-        with_prompt = int(token_stats.get("prompt_tokens") or 0)
-        with_completion = int(token_stats.get("completion_tokens") or 0)
-        with_total = int(token_stats.get("total_tokens") or (with_prompt + with_completion))
-        if with_prompt <= 0:
-            with_prompt = int(token_stats.get("estimated_sent_tokens") or 0)
-            with_total = with_prompt + with_completion
-        memory_after = int((render or {}).get("estimated_tokens_after") or 0)
-        no_arch_prompt_est = max(with_prompt - memory_after, 0)
-        no_arch_total_est = no_arch_prompt_est + with_completion
-        _append_solo_token_line(
-            {
-                "created_at": row.get("created_at"),
-                "request_id": row.get("request_id"),
-                "session_id": row.get("session_id"),
-                "api_style": row.get("api_style"),
-                "provider": row.get("provider"),
-                "model": row.get("model"),
-                "with_arch_total_tokens": with_total,
-                "no_arch_est_total_tokens": no_arch_total_est,
-                "delta_total_tokens": with_total - no_arch_total_est,
-                "with_arch_prompt_tokens": with_prompt,
-                "no_arch_est_prompt_tokens": no_arch_prompt_est,
-                "memory_render_tokens_est": memory_after,
-            }
-        )
+        _append_solo_token_line(_build_solo_token_line(row=row, trace=trace))
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -1197,28 +1245,7 @@ def create_app() -> FastAPI:
             )
             try:
                 passthrough_row = recent_traces[0]
-                token_stats = passthrough_row.get("token_stats") or {}
-                with_prompt = int(token_stats.get("estimated_sent_tokens") or token_stats.get("prompt_tokens") or 0)
-                with_completion = int(token_stats.get("completion_tokens") or 0)
-                with_total = with_prompt + with_completion
-                memory_after = int((memory_pack.trim_report or {}).get("estimated_tokens_after") or 0)
-                no_arch_prompt_est = max(with_prompt - memory_after, 0)
-                no_arch_total_est = no_arch_prompt_est + with_completion
-                line = {
-                    "created_at": passthrough_row.get("created_at"),
-                    "request_id": passthrough_row.get("request_id"),
-                    "session_id": passthrough_row.get("session_id"),
-                    "api_style": passthrough_row.get("api_style"),
-                    "provider": passthrough_row.get("provider"),
-                    "model": passthrough_row.get("model"),
-                    "with_arch_total_tokens": with_total,
-                    "no_arch_est_total_tokens": no_arch_total_est,
-                    "delta_total_tokens": with_total - no_arch_total_est,
-                    "with_arch_prompt_tokens": with_prompt,
-                    "no_arch_est_prompt_tokens": no_arch_prompt_est,
-                    "memory_render_tokens_est": memory_after,
-                }
-                _append_solo_token_line(line)
+                _append_solo_token_line(_build_solo_token_line(row=passthrough_row, trace=passthrough_row.get("trace") or {}))
             except Exception:
                 pass
             passthrough = await _passthrough_responses_to_upstream(
