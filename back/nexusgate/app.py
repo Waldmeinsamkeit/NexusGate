@@ -21,17 +21,12 @@ from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.memory.schema import QueryFilters
-from nexusgate.prompting.responses_budget import budget_native_responses_payload
-from nexusgate.prompting.system_blocks import (
-    build_system_blocks,
-    dedupe_and_merge_system_blocks,
-    render_system_blocks_for_provider,
-)
+from nexusgate.prompting.plan import build_standard_prompt_plan
+from nexusgate.prompting.preparer import prepare_prompt_for_provider
 from nexusgate.prompt_policies import (
     build_sop_system_blocks,
     extract_metadata_from_responses_payload,
     extract_user_text_from_responses_payload,
-    inject_system_blocks_into_responses_payload,
 )
 from nexusgate.router import ProviderRouter
 from nexusgate.safety import apply_hallucination_guard, supported_claim_check
@@ -863,29 +858,24 @@ def create_app() -> FastAPI:
             user_text=prepared_user_query,
             metadata=prepared_req.metadata or {},
         )
-        raw_system_blocks: list[dict[str, Any]] = [
-            {"category": "meta_rules", "content": L0_META_RULES, "source": "l0", "priority": 5, "singleton": True},
-            *[
-                {"category": "sop", "content": block, "source": "sop", "priority": 10}
-                for block in sop_blocks
-            ],
-            {"category": "grounding_policy", "content": grounding_rules, "source": "grounding", "priority": 20, "singleton": True},
-            {"category": "memory_constraints", "content": evidence_blocks["constraints"], "source": "memory_evidence", "priority": 30},
-            {"category": "memory_facts", "content": evidence_blocks["facts"], "source": "memory_evidence", "priority": 31},
-            {"category": "memory_procedures", "content": evidence_blocks["procedures"], "source": "memory_evidence", "priority": 32},
-            {"category": "memory_continuity", "content": evidence_blocks["continuity"], "source": "memory_evidence", "priority": 33},
-            {"category": "citation_refs", "content": citation_block, "source": "citations", "priority": 40},
-        ]
-        merged_system_blocks = dedupe_and_merge_system_blocks(build_system_blocks(raw_system_blocks))
-        rendered_system_blocks = render_system_blocks_for_provider(
-            merged_system_blocks,
+        prompt_plan = build_standard_prompt_plan(
             provider_style=str(decision.get("render_mode") or "openai"),
+            conversation_rows=enriched_messages,
+            l0_meta_rules=L0_META_RULES,
+            sop_blocks=sop_blocks,
+            grounding_rules=grounding_rules,
+            evidence_blocks=evidence_blocks,
+            citation_block=citation_block,
+            citations=memory_pack.citations,
+            metadata=prepared_req.metadata or {},
         )
-        system_messages = [{"role": "system", "content": block} for block in rendered_system_blocks]
-        enhanced_messages = [*system_messages, *enriched_messages]
-        enhanced_messages, budget_report = _apply_total_context_budget(
-            enhanced_messages,
+        enhanced_messages, budget_report = prepare_prompt_for_provider(
+            prompt_plan=prompt_plan,
             context_budget_tokens=decision.get("context_budget"),
+            mode="messages",
+            apply_total_context_budget=lambda rows, budget: _apply_total_context_budget(rows, context_budget_tokens=budget),
+            responses_payload_to_messages=_responses_payload_to_messages,
+            messages_to_responses_payload=_messages_to_responses_payload,
         )
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
@@ -1218,25 +1208,38 @@ def create_app() -> FastAPI:
                 pack_features=memory_pack.pack_features,
                 metadata=prepared_req.metadata or {},
             )
-            passthrough_payload = inject_system_blocks_into_responses_payload(
-                prepared_payload,
+            grounding_mode = str(decision.get("grounding_mode") or "balanced")
+            grounding_rules = _build_grounding_system_rules(
+                grounding_mode=grounding_mode,
+                grounding_policy=grounding_policy,
+            )
+            evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
+            citation_block = _build_citation_system_block(memory_pack.citations)
+            sop_blocks = build_sop_system_blocks(
                 user_text=passthrough_user_text,
+                metadata=passthrough_metadata,
+            )
+            prompt_plan = build_standard_prompt_plan(
+                provider_style=str(decision.get("render_mode") or "openai"),
+                conversation_rows=prepared_rows,
+                l0_meta_rules=L0_META_RULES,
+                sop_blocks=sop_blocks,
+                grounding_rules=grounding_rules,
+                evidence_blocks=evidence_blocks,
+                citation_block=citation_block,
+                citations=memory_pack.citations,
                 metadata=passthrough_metadata,
                 memory_context=memory_context,
             )
-            if passthrough_payload.get("tools"):
-                passthrough_payload, budget_report = budget_native_responses_payload(
-                    passthrough_payload,
-                    context_budget_tokens=int(decision.get("context_budget") or 0),
-                    reserve_ratio=float(settings.context_budget_response_reserve_ratio or 0.3),
-                )
-            else:
-                passthrough_budget_messages = _responses_payload_to_messages(passthrough_payload)
-                passthrough_budget_messages, budget_report = _apply_total_context_budget(
-                    passthrough_budget_messages,
-                    context_budget_tokens=decision.get("context_budget"),
-                )
-                passthrough_payload = _messages_to_responses_payload(passthrough_payload, passthrough_budget_messages)
+            passthrough_payload, budget_report = prepare_prompt_for_provider(
+                prompt_plan=prompt_plan,
+                context_budget_tokens=decision.get("context_budget"),
+                mode="responses",
+                responses_payload=prepared_payload,
+                apply_total_context_budget=lambda rows, budget: _apply_total_context_budget(rows, context_budget_tokens=budget),
+                responses_payload_to_messages=_responses_payload_to_messages,
+                messages_to_responses_payload=_messages_to_responses_payload,
+            )
             estimated_prompt_tokens = _estimate_token_count_from_messages(raw_messages)
             estimated_sent_tokens = estimated_prompt_tokens + _estimate_pack_size(memory_pack)
             recent_traces.appendleft(
