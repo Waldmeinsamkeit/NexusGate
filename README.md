@@ -111,7 +111,19 @@ With architecture          = compressed history + memory injection + system bloc
 Savings                    = baseline - actual sent
 ```
 
-Token logs are written to `solo_token.txt` per request, with an aggregate summary in `memory/sum_memory.txt` including overall `saved_rate`. In typical multi-turn coding sessions with history rewrite enabled, **savings of 70–85% are common** because NexusGate aggressively compresses long conversation history while injecting only the relevant memory slices.
+Token logs are written to `solo_token.txt` per request, with an aggregate summary in `memory/sum_memory.txt` including overall `saved_rate`.
+
+Offline benchmark results (`scripts/arch_token_benchmark.py`):
+
+| Scenario | Messages | No-Arch | With-Arch | Net Saved | Rate |
+|----------|----------|---------|-----------|-----------|------|
+| Short (1-turn) | 1 | 20 | 542 | -522 | N/A |
+| Medium (10-turn) | 10 | 1,356 | 579 | +777 | **57%** |
+| Long (30-turn) | 23 | 5,494 | 565 | +4,929 | **90%** |
+
+- **Short conversations**: Architecture adds overhead (memory + system blocks ~524 tokens) with nothing to compress — this is expected and honest.
+- **Medium conversations**: History compression outweighs overhead, net positive savings.
+- **Long conversations**: Savings of **90%** as history rewrite aggressively compresses accumulated context while injecting only relevant memory slices.
 
 ### Grounding & Hallucination Guard
 

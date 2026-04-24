@@ -40,3 +40,5 @@ memory/sum_memory.txt
 memory/token_mode_benchmark.json
 memory/token_mode_benchmark.md
 scripts/token_mode_benchmark.py
+scripts/bench_results.json
+scripts/bench_report.txt
