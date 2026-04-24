@@ -57,28 +57,7 @@ It sits between your AI clients (Cursor, Codex CLI, Aider, custom agents…) and
 - Long document / log summarization
 - Tasks requiring persistent user preferences, project constraints, or incremental conclusions
 
-<<<<<<< HEAD
----
-## NexusGate 最适合的使用场景
-
-它最有价值的场景是：
-
-- 长对话、多轮推进的任务
-- 复杂代码排错
-- 跨多个文件的调用链分析
-- 分阶段重构
-- 长文档/长日志总结
-- 需要持续保留“用户偏好、项目约束、阶段结论”的任务
-
-不太需要它深度介入的场景：
-
-- 一次性很短的小问题
-- 完全不依赖上下文的单轮问答
-- 与之前任务无关的临时问题
----
-=======
 ### Not necessary for
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 
 - One-off short questions
 - Context-free single-turn Q&A
@@ -217,63 +196,6 @@ pip install -r requirements.txt
 
 ### 2. Configure
 
-<<<<<<< HEAD
-```env
-# 核心网关配置
-APP_ENV=dev
-HOST=0.0.0.0
-PORT=8000
-
-# 记忆向量库配置 (本地存储)
-MEMORY_ENABLED=true
-MEMORY_STORE_PATH=memory
-MEMORY_COLLECTION_NAME=nexusgate_memory
-MEMORY_TOP_K=6
-
-# 提供商 API Keys
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-...
-
-# 历史替代模式开关（light / normal / heavy / auto）
-HISTORY_REWRITE_ENABLED=true
-HISTORY_REWRITE_DEFAULT_MODE=auto
-HISTORY_REWRITE_GLOBAL_LIGHT_QUERY_THRESHOLD=120
-
-# light 模式
-HISTORY_REWRITE_LIGHT_KEEP_SYSTEM=0
-HISTORY_REWRITE_LIGHT_KEEP_USER=1
-HISTORY_REWRITE_LIGHT_KEEP_ASSISTANT=0
-HISTORY_REWRITE_LIGHT_KEEP_TOOL=0
-HISTORY_REWRITE_LIGHT_KEEP_OTHER=0
-HISTORY_REWRITE_LIGHT_MAX_CHARS_PER_MESSAGE=700
-
-# normal 模式
-HISTORY_REWRITE_NORMAL_KEEP_SYSTEM=1
-HISTORY_REWRITE_NORMAL_KEEP_USER=1
-HISTORY_REWRITE_NORMAL_KEEP_ASSISTANT=1
-HISTORY_REWRITE_NORMAL_KEEP_TOOL=1
-HISTORY_REWRITE_NORMAL_KEEP_OTHER=0
-HISTORY_REWRITE_NORMAL_MAX_CHARS_PER_MESSAGE=1200
-
-# heavy 模式
-HISTORY_REWRITE_HEAVY_KEEP_SYSTEM=1
-HISTORY_REWRITE_HEAVY_KEEP_USER=2
-HISTORY_REWRITE_HEAVY_KEEP_ASSISTANT=1
-HISTORY_REWRITE_HEAVY_KEEP_TOOL=2
-HISTORY_REWRITE_HEAVY_KEEP_OTHER=1
-HISTORY_REWRITE_HEAVY_MAX_CHARS_PER_MESSAGE=1800
-
-# 全局上下文预算器（Phase D）
-CONTEXT_BUDGET_ENABLED=true
-CONTEXT_BUDGET_RESPONSE_RESERVE_RATIO=0.3
-CONTEXT_BUDGET_MIN_PROMPT_TOKENS=512
-```
-
-> 建议：先复制 `.env.example` 为 `.env` 再按需调整。默认推荐 `HISTORY_REWRITE_DEFAULT_MODE=auto`。
-
-### 3. 启动服务
-您可以使用内置脚本一键启动，网关将默认在 `http://localhost:8000` 运行：
-=======
 ```bash
 cp .env.example .env
 ```
@@ -303,7 +225,6 @@ CLIENT_SYNC_ENABLED=true
 
 ### 3. Start
 
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 ```bash
 # Linux / macOS
 ./run.sh
@@ -371,39 +292,6 @@ Remember my preferences:
 - Include file paths and line numbers
 - Prefer no-code-change solutions first
 ```
-<<<<<<< HEAD
----
-### NexusGate 的作用
-
-它在两者之间负责：
-
-- 记住前几轮的关键结论
-- 压缩长任务里的上下文
-- 把用户偏好、项目约束、阶段成果重新注入后续轮次
-- 降低模型在长任务中的遗忘和漂移
----
-## 想让 NexusGate 更好提取记忆，应该主动告诉它什么
-
-### 1. 用户偏好
-例如：
-`记住我的偏好： - 先证据后结论 - 修改前先读源码 - 尽量中文回答 - 回答带文件路径和行号 - 能不改代码就先不改`
-
-### 2. 项目级约束
-
-例如：
-`这个项目的固定约束： - 默认不联网 - 优先读日志再看源码 - 所有改动都要可回滚 - 不要碰生产配置`
-
-### 3. 已确认的稳定事实
-例如：
-`当前已确认事实： - 后端入口在 back/nexusgate/app.py - 配置在 back/nexusgate/config.py - 内存索引在 back/nexusgate/memory/index.py`
-
-模板：
-```
-将项目结构分类导入L2，索引到L1中
-```
----
-## 🤝 参与贡献 (Contributing)
-=======
 
 #### 2. Define project constraints (stored as L1)
 
@@ -414,7 +302,6 @@ Project constraints:
 - All changes must be reversible
 - Never touch production config
 ```
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 
 #### 3. Import project facts (stored as L2)
 
@@ -425,9 +312,6 @@ Confirmed facts:
 - Memory index: back/nexusgate/memory/index.py
 - Frontend: React + Vite in front/
 
-<<<<<<< HEAD
-本项目采用 [MIT License](LICENSE) 许可协议开源。您可以自由地使用、修改和分发代码。禁止用于商业用途。
-=======
 Import the above as L2 facts and index them in L1.
 ```
 
@@ -568,4 +452,3 @@ Contributions are welcome! Please follow this flow:
 ## 📄 License
 
 [MIT License](LICENSE) — Copyright (c) 2026 Waldmeinsamkeit
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce

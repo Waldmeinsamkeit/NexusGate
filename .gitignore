@@ -40,8 +40,5 @@ memory/sum_memory.txt
 memory/token_mode_benchmark.json
 memory/token_mode_benchmark.md
 scripts/token_mode_benchmark.py
-<<<<<<< HEAD
-=======
 scripts/bench_results.json
 scripts/bench_report.txt
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce

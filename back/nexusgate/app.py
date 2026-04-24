@@ -101,10 +101,7 @@ def create_app() -> FastAPI:
         total_memory_before_trim = 0
         total_memory_after_trim = 0
         total_final_input = 0
-<<<<<<< HEAD
-=======
         total_saved_prompt = 0
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
         rows = 0
         if solo_token_path.exists():
             try:
@@ -125,10 +122,7 @@ def create_app() -> FastAPI:
                         total_memory_before_trim += int(payload.get("memory_tokens_before_trim") or 0)
                         total_memory_after_trim += int(payload.get("memory_tokens_after_trim") or 0)
                         total_final_input += int(payload.get("final_input_tokens") or 0)
-<<<<<<< HEAD
-=======
                         total_saved_prompt += int(payload.get("saved_prompt_tokens") or 0)
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
                         rows += 1
             except Exception:
                 return
@@ -139,20 +133,14 @@ def create_app() -> FastAPI:
             f"with_arch_total_tokens={total_with_arch}\n"
             f"no_arch_est_total_tokens={total_no_arch}\n"
             f"saved_total_tokens={total_saved}\n"
-<<<<<<< HEAD
-=======
             f"saved_rate={overall_saved_rate}%\n"
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
             f"raw_input_tokens_total={total_raw_input}\n"
             f"prepared_messages_tokens_total={total_prepared_input}\n"
             f"history_replaced_tokens_total={total_history_replaced}\n"
             f"memory_tokens_before_trim_total={total_memory_before_trim}\n"
             f"memory_tokens_after_trim_total={total_memory_after_trim}\n"
             f"final_input_tokens_total={total_final_input}\n"
-<<<<<<< HEAD
-=======
             f"saved_prompt_tokens_total={total_saved_prompt}\n"
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
         )
         try:
             sum_memory_path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,10 +153,7 @@ def create_app() -> FastAPI:
         render = trace.get("render") or {}
         history = trace.get("history") or {}
         budget = trace.get("budget") or {}
-<<<<<<< HEAD
-=======
         budget_diag = _budget_diagnostics_from_report(budget)
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 
         with_prompt = int(token_stats.get("prompt_tokens") or 0)
         with_completion = int(token_stats.get("completion_tokens") or 0)
@@ -179,22 +164,12 @@ def create_app() -> FastAPI:
 
         memory_before = int(render.get("estimated_tokens_before") or 0)
         memory_after = int(render.get("estimated_tokens_after") or 0)
-<<<<<<< HEAD
-        no_arch_prompt_est = max(with_prompt - memory_after, 0)
-        no_arch_total_est = no_arch_prompt_est + with_completion
-=======
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 
         raw_input_tokens = int(history.get("raw_input_tokens") or 0)
         prepared_messages_tokens = int(history.get("prepared_messages_tokens") or 0)
         history_replaced_tokens = int(history.get("history_replaced_tokens") or 0)
         mode = str(history.get("mode") or "unknown")
 
-<<<<<<< HEAD
-        # Approximate baseline if full history were sent with current non-history overhead preserved.
-        non_history_overhead = max(with_prompt - prepared_messages_tokens, 0)
-        estimated_full_history_without_replacement = raw_input_tokens + non_history_overhead
-=======
         # Correct baseline: without NexusGate, the client sends the raw
         # uncompressed messages directly to the provider — no history
         # rewrite, no memory injection, no system blocks.
@@ -203,7 +178,6 @@ def create_app() -> FastAPI:
         saved_prompt = max(no_arch_prompt_est - with_prompt, 0)
         saved_total = max(no_arch_total_est - with_total, 0)
         saved_rate = round(min(float(saved_prompt) / float(max(no_arch_prompt_est, 1)), 1.0), 4)
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 
         return {
             "created_at": row.get("created_at"),
@@ -215,13 +189,9 @@ def create_app() -> FastAPI:
             "mode": mode,
             "with_arch_total_tokens": with_total,
             "no_arch_est_total_tokens": no_arch_total_est,
-<<<<<<< HEAD
-            "delta_total_tokens": with_total - no_arch_total_est,
-=======
             "delta_total_tokens": saved_total,
             "saved_prompt_tokens": saved_prompt,
             "saved_rate": saved_rate,
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
             "with_arch_prompt_tokens": with_prompt,
             "no_arch_est_prompt_tokens": no_arch_prompt_est,
             "memory_render_tokens_est": memory_after,
@@ -231,17 +201,11 @@ def create_app() -> FastAPI:
             "memory_tokens_before_trim": memory_before,
             "memory_tokens_after_trim": memory_after,
             "final_input_tokens": with_prompt,
-<<<<<<< HEAD
-            "estimated_full_history_without_replacement": estimated_full_history_without_replacement,
-=======
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
             "budget_prompt_tokens": int(budget.get("prompt_budget_tokens") or 0),
             "budget_before_tokens": int(budget.get("before_tokens") or 0),
             "budget_after_tokens": int(budget.get("after_tokens") or 0),
             "budget_dropped_messages": int(budget.get("dropped_messages") or 0),
             "budget_truncated_messages": int(budget.get("truncated_messages") or 0),
-<<<<<<< HEAD
-=======
             "budget_native_tools": bool(budget_diag.get("native_tools_budget")),
             "budget_episode_count": int(budget_diag.get("episode_count") or 0),
             "budget_episodes_trimmed": int(budget_diag.get("episodes_trimmed") or 0),
@@ -258,7 +222,6 @@ def create_app() -> FastAPI:
             "episodes_summarized": int(budget.get("episodes_summarized") or 0),
             "tool_result_pruned_chars": int(budget.get("tool_result_pruned_chars") or 0),
             "skip_reason": str(budget.get("skip_reason") or ""),
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
         }
 
     def _append_solo_token_line(line: dict[str, Any]) -> None:
@@ -1000,10 +963,6 @@ def create_app() -> FastAPI:
                 "metadata": prepared_metadata,
             }
         )
-<<<<<<< HEAD
-
-        memory_pack = memory.build_memory_pack(session_id, prepared_user_query)
-=======
         needs_memory = _query_needs_memory(
             user_text=prepared_user_query,
             messages=prepared_rows,
@@ -1021,7 +980,6 @@ def create_app() -> FastAPI:
             )
         else:
             memory_pack = _empty_memory_pack(task_type=str((prepared_req.metadata or {}).get("task_type") or "chat"))
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
         decision = route(
             normalized_req=prepared_req,
             defaults={
@@ -1034,17 +992,6 @@ def create_app() -> FastAPI:
             risk_profile=memory_pack.risk_profile,
             router=provider_router,
         )
-<<<<<<< HEAD
-        enriched_messages, memory_pack = memory.enrich_from_normalized_request(
-            normalized_req=prepared_req,
-            provider_style=str(decision.get("render_mode") or "openai"),
-            memory_pack=memory_pack,
-        )
-        memory_context = memory.render_memory_for_provider(
-            pack=memory_pack,
-            provider_style=str(decision.get("render_mode") or "openai"),
-        )
-=======
         if needs_memory and memory.enabled:
             enriched_messages, memory_pack = memory.enrich_from_normalized_request(
                 normalized_req=prepared_req,
@@ -1058,45 +1005,22 @@ def create_app() -> FastAPI:
         else:
             enriched_messages = _normalize_message_rows(prepared_req.messages)
             memory_context = ""
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
         grounding_mode = str(decision.get("grounding_mode") or "balanced")
         grounding_policy = _derive_grounding_policy(
             risk_profile=memory_pack.risk_profile,
             pack_features=memory_pack.pack_features,
             metadata=prepared_req.metadata or {},
-<<<<<<< HEAD
-=======
         )
         grounding_rules = _build_grounding_system_rules(
             grounding_mode=grounding_mode,
             grounding_policy=grounding_policy,
             verified_ratio=float((memory_pack.pack_features or {}).get("verified_ratio") or 0.0),
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
         )
         evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
         citation_block = _build_citation_system_block(memory_pack.citations)
         sop_blocks = build_sop_system_blocks(
             user_text=prepared_user_query,
             metadata=prepared_req.metadata or {},
-<<<<<<< HEAD
-        )
-        sop_messages = [{"role": "system", "content": block} for block in sop_blocks]
-        enhanced_messages = [
-            {"role": "system", "content": L0_META_RULES},
-            *sop_messages,
-            {"role": "system", "content": grounding_rules},
-            {"role": "system", "content": evidence_blocks["facts"]},
-            {"role": "system", "content": evidence_blocks["constraints"]},
-            {"role": "system", "content": evidence_blocks["procedures"]},
-            {"role": "system", "content": evidence_blocks["continuity"]},
-            {"role": "system", "content": citation_block},
-            *enriched_messages,
-        ]
-        enhanced_messages, budget_report = _apply_total_context_budget(
-            enhanced_messages,
-            context_budget_tokens=decision.get("context_budget"),
-        )
-=======
             has_memory_content=bool(
                 (memory_pack.facts or memory_pack.procedures or memory_pack.continuity or memory_pack.constraints)
             ),
@@ -1120,7 +1044,6 @@ def create_app() -> FastAPI:
             responses_payload_to_messages=_responses_payload_to_messages,
             messages_to_responses_payload=_messages_to_responses_payload,
         )
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
         if decision.get("api_base"):
@@ -1470,9 +1393,6 @@ def create_app() -> FastAPI:
             passthrough_metadata = extract_metadata_from_responses_payload(prepared_payload)
             passthrough_metadata = {**passthrough_metadata, **prepared_metadata}
             passthrough_user_text = prepared_user_text or extract_user_text_from_responses_payload(prepared_payload)
-<<<<<<< HEAD
-            memory_pack = memory.build_memory_pack(session_id, passthrough_user_text)
-=======
             needs_memory = _query_needs_memory(
                 user_text=passthrough_user_text,
                 messages=prepared_rows,
@@ -1490,7 +1410,6 @@ def create_app() -> FastAPI:
                 )
             else:
                 memory_pack = _empty_memory_pack(task_type=str((prepared_req.metadata or {}).get("task_type") or "chat"))
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
             decision = route(
                 normalized_req=prepared_req,
                 defaults={
@@ -1515,10 +1434,6 @@ def create_app() -> FastAPI:
                 pack_features=memory_pack.pack_features,
                 metadata=prepared_req.metadata or {},
             )
-<<<<<<< HEAD
-            passthrough_payload = inject_system_blocks_into_responses_payload(
-                prepared_payload,
-=======
             grounding_mode = str(decision.get("grounding_mode") or "balanced")
             grounding_rules = _build_grounding_system_rules(
                 grounding_mode=grounding_mode,
@@ -1527,7 +1442,6 @@ def create_app() -> FastAPI:
             evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
             citation_block = _build_citation_system_block(memory_pack.citations)
             sop_blocks = build_sop_system_blocks(
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
                 user_text=passthrough_user_text,
                 metadata=passthrough_metadata,
                 has_memory_content=bool(
@@ -1546,14 +1460,6 @@ def create_app() -> FastAPI:
                 metadata=passthrough_metadata,
                 memory_context=memory_context,
             )
-<<<<<<< HEAD
-            passthrough_budget_messages = _responses_payload_to_messages(passthrough_payload)
-            passthrough_budget_messages, budget_report = _apply_total_context_budget(
-                passthrough_budget_messages,
-                context_budget_tokens=decision.get("context_budget"),
-            )
-            passthrough_payload = _messages_to_responses_payload(passthrough_payload, passthrough_budget_messages)
-=======
             passthrough_payload, budget_report = prepare_prompt_for_provider(
                 prompt_plan=prompt_plan,
                 context_budget_tokens=decision.get("context_budget"),
@@ -1563,7 +1469,6 @@ def create_app() -> FastAPI:
                 responses_payload_to_messages=_responses_payload_to_messages,
                 messages_to_responses_payload=_messages_to_responses_payload,
             )
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
             estimated_prompt_tokens = _estimate_token_count_from_messages(raw_messages)
             estimated_sent_tokens = estimated_prompt_tokens + _estimate_pack_size(memory_pack)
             recent_traces.appendleft(
@@ -1944,11 +1849,7 @@ def _truncate_message_content(content: Any, max_chars: int) -> Any:
 
 
 def _prepare_messages_for_inference(messages: list[Any], *, mode: str) -> tuple[list[dict[str, Any]], dict[str, int | str]]:
-<<<<<<< HEAD
-    rows = _normalize_message_rows(messages)
-=======
     rows = _compress_tool_results(_normalize_message_rows(messages))
->>>>>>> 3b3d94a1e9c993e93662fb9b1e813518645c37ce
     raw_tokens = _estimate_token_count_from_messages(rows)
     limits = _window_limits_for_mode(mode)
     remaining = {
