@@ -173,11 +173,21 @@ def create_app() -> FastAPI:
         # Correct baseline: without NexusGate, the client sends the raw
         # uncompressed messages directly to the provider — no history
         # rewrite, no memory injection, no system blocks.
+        # When raw_input_tokens is unavailable (0), we cannot reliably
+        # estimate the baseline — fall back to with_prompt so no phantom
+        # savings are claimed (consistent with _record_admin_trace).
         no_arch_prompt_est = raw_input_tokens if raw_input_tokens > 0 else with_prompt
         no_arch_total_est = no_arch_prompt_est + with_completion
-        saved_prompt = max(no_arch_prompt_est - with_prompt, 0)
-        saved_total = max(no_arch_total_est - with_total, 0)
-        saved_rate = round(min(float(saved_prompt) / float(max(no_arch_prompt_est, 1)), 1.0), 4)
+        # When with_prompt is 0 (no upstream usage AND no estimated_sent_tokens),
+        # we have no reliable cost metric — claim zero savings.
+        if with_prompt <= 0 and no_arch_prompt_est > 0:
+            saved_prompt = 0
+            saved_total = 0
+            saved_rate = 0.0
+        else:
+            saved_prompt = max(no_arch_prompt_est - with_prompt, 0)
+            saved_total = max(no_arch_total_est - with_total, 0)
+            saved_rate = round(min(float(saved_prompt) / float(max(no_arch_prompt_est, 1)), 1.0), 4)
 
         return {
             "created_at": row.get("created_at"),
@@ -257,10 +267,26 @@ def create_app() -> FastAPI:
         total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens))
         # Correct baseline: raw_input_tokens is what the client would send
         # directly without NexusGate (no compression, no memory, no system blocks).
-        no_arch_baseline = raw_input_tokens if raw_input_tokens > 0 else estimated_before
+        # When raw_input_tokens is unavailable (0), we cannot reliably estimate
+        # savings — fall back to actual_sent so no phantom savings are claimed.
+        no_arch_baseline = raw_input_tokens if raw_input_tokens > 0 else (prompt_tokens if prompt_tokens > 0 else estimated_after)
         actual_sent = prompt_tokens if prompt_tokens > 0 else estimated_after
-        saved_estimated = max(no_arch_baseline - actual_sent, 0)
-        saved_actual = max(raw_input_tokens - prompt_tokens, 0) if prompt_tokens > 0 and raw_input_tokens > 0 else 0
+        # When actual_sent is 0 (upstream didn't report usage AND no memory
+        # render data), we have no reliable cost metric — claim zero savings
+        # to avoid phantom rates like 99.9% on short inputs.
+        if actual_sent <= 0:
+            saved_estimated = 0
+            saved_actual = 0
+        else:
+            saved_estimated = max(no_arch_baseline - actual_sent, 0)
+            saved_actual = max(raw_input_tokens - prompt_tokens, 0) if prompt_tokens > 0 and raw_input_tokens > 0 else 0
+        # DEBUG: token savings diagnostics
+        print(
+            f"[TOKEN-DEBUG-TRACE] raw_input={raw_input_tokens} prompt={prompt_tokens} "
+            f"est_before={estimated_before} est_after={estimated_after} "
+            f"no_arch_baseline={no_arch_baseline} actual_sent={actual_sent} "
+            f"saved_est={saved_estimated} saved_act={saved_actual}"
+        )
         row = {
             "request_id": request_id,
             "created_at": int(time.time()),
@@ -1470,7 +1496,29 @@ def create_app() -> FastAPI:
                 messages_to_responses_payload=_messages_to_responses_payload,
             )
             estimated_prompt_tokens = _estimate_token_count_from_messages(raw_messages)
-            estimated_sent_tokens = estimated_prompt_tokens + _estimate_pack_size(memory_pack)
+            # budget_after_tokens only counts the "input" array tokens from the
+            # responses payload — it does NOT include the "instructions" field
+            # where system blocks (L0, SOP, grounding, etc.) are injected.
+            # We must add instructions separately.
+            # NOTE: tool definitions ("tools" field) are passthrough — they appear
+            # identically in both the baseline (no NexusGate) and actual request,
+            # so they cancel out and should NOT be added to estimated_sent_tokens.
+            budget_after_tokens = int((budget_report or {}).get("after_tokens") or 0)
+            instructions_text = str(passthrough_payload.get("instructions") or "").strip()
+            instructions_tokens = _estimate_token_count_from_messages(
+                [{"role": "system", "content": instructions_text}] if instructions_text else []
+            )
+            if budget_after_tokens > 0:
+                estimated_sent_tokens = budget_after_tokens + instructions_tokens
+            else:
+                estimated_sent_tokens = estimated_prompt_tokens + max(_estimate_pack_size(memory_pack) // 4, 0) + instructions_tokens
+            # DEBUG: token savings diagnostics
+            _raw_tok = int(history_stats.get("raw_input_tokens") or 0)
+            print(
+                f"[TOKEN-DEBUG] raw_input={_raw_tok} est_prompt={estimated_prompt_tokens} "
+                f"budget_after={budget_after_tokens} est_sent={estimated_sent_tokens} "
+                f"saved={max(_raw_tok - estimated_sent_tokens, 0) if _raw_tok > 0 else 0}"
+            )
             recent_traces.appendleft(
                 {
                     "request_id": f"req_{uuid4().hex[:12]}",
@@ -1487,12 +1535,13 @@ def create_app() -> FastAPI:
                     "token_stats": {
                         "estimated_prompt_tokens": estimated_prompt_tokens,
                         "estimated_sent_tokens": estimated_sent_tokens,
+                        "raw_input_tokens": int(history_stats.get("raw_input_tokens") or 0),
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "total_tokens": 0,
-                        "saved_tokens_estimated": max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0),
+                        "saved_tokens_estimated": max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0) if int(history_stats.get("raw_input_tokens") or 0) > 0 else 0,
                         "saved_tokens_actual": 0,
-                        "saved_rate_estimated": round(min(float(max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0)) / float(max(int(history_stats.get("raw_input_tokens") or 0), 1)), 1.0), 4),
+                        "saved_rate_estimated": round(min(float(max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0)) / float(max(int(history_stats.get("raw_input_tokens") or 0), 1)), 1.0), 4) if int(history_stats.get("raw_input_tokens") or 0) > 0 else 0.0,
                         "saved_rate_actual": 0.0,
                         "usage_source": "passthrough_unknown",
                     },

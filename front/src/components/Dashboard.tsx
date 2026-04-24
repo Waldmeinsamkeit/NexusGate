@@ -27,12 +27,13 @@ function aggregateTraces(traces: TraceRecord[]): AggregatedStats {
     totalSaved += Math.max(ts.saved_tokens_actual || ts.saved_tokens_estimated || 0, 0);
   }
   const clampedSaved = Math.max(totalSaved, 0);
+  const effectiveRaw = Math.max(totalRaw, clampedSaved);
   return {
     totalRequests: traces.length,
     totalRawTokens: totalRaw,
     totalSentTokens: totalSent,
     totalSaved: clampedSaved,
-    savedRate: totalRaw > 0 ? Math.min(clampedSaved / totalRaw, 1.0) : 0,
+    savedRate: effectiveRaw > 0 ? Math.min(clampedSaved / effectiveRaw, 1.0) : 0,
   };
 }
 
@@ -112,7 +113,7 @@ const TraceDetail = ({ trace, onClose }: { trace: TraceRecord; onClose: () => vo
           <div className="bg-slate-50 rounded-lg p-3 border border-slate-100 space-y-2">
             <h4 className="text-[10px] font-bold text-slate-500 uppercase">Token 明细</h4>
             <div className="grid grid-cols-2 gap-2 text-[11px]">
-              <div className="flex justify-between"><span className="text-slate-500">原始输入</span><span className="font-mono font-bold">{formatNumber(ts?.raw_input_tokens || 0)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">原始输入</span><span className="font-mono font-bold">{formatNumber(ts?.raw_input_tokens || ts?.estimated_prompt_tokens || 0)}</span></div>
               <div className="flex justify-between"><span className="text-slate-500">实际发送</span><span className="font-mono font-bold text-blue-600">{formatNumber(ts?.prompt_tokens || ts?.estimated_sent_tokens || 0)}</span></div>
               <div className="flex justify-between"><span className="text-slate-500">完成 tokens</span><span className="font-mono font-bold">{formatNumber(ts?.completion_tokens || 0)}</span></div>
               <div className="flex justify-between"><span className="text-slate-500">节省</span><span className="font-mono font-bold text-emerald-600">{formatNumber(ts?.saved_tokens_actual || ts?.saved_tokens_estimated || 0)}</span></div>
@@ -264,7 +265,7 @@ export const Dashboard = () => {
         const weekRaw = chartData.reduce((s, d) => s + d.raw, 0);
         const weekSent = chartData.reduce((s, d) => s + d.sent, 0);
         const weekSaved = chartData.reduce((s, d) => s + d.saved, 0);
-        const weekRate = weekRaw > 0 ? weekSaved / weekRaw : 0;
+        const weekRate = weekRaw > 0 ? Math.min(weekSaved / weekRaw, 1.0) : (weekSaved > 0 ? 1.0 : 0);
         const hasData = chartData.length > 0;
         return (
           <div className="card-panel p-5">
@@ -314,7 +315,7 @@ export const Dashboard = () => {
                 </div>
                 <div className="mt-4 grid grid-cols-7 gap-2">
                   {chartData.map((d) => {
-                    const pct = d.raw > 0 ? ((d.saved / d.raw) * 100) : 0;
+                    const pct = d.raw > 0 ? Math.min((d.saved / d.raw) * 100, 100) : 0;
                     return (
                       <div key={d.date} className="text-center">
                         <div className="text-[9px] text-slate-400 font-mono">{d.date.slice(5)}</div>
