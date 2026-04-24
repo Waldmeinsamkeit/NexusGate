@@ -1,4 +1,4 @@
-﻿
+﻿﻿
 # 🌌 NexusGate
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
@@ -47,6 +47,23 @@ NexusGate 支持完全兼容 OpenAI 规范的 API 接口 (`/v1/chat/completions`
 - **模式 B (本地/聚合嵌套)**：`Client -> NexusGate (审查与调度) -> Ollama / vLLM / 第三方聚合 API`
 
 ---
+## NexusGate 最适合的使用场景
+
+它最有价值的场景是：
+
+- 长对话、多轮推进的任务
+- 复杂代码排错
+- 跨多个文件的调用链分析
+- 分阶段重构
+- 长文档/长日志总结
+- 需要持续保留“用户偏好、项目约束、阶段结论”的任务
+
+不太需要它深度介入的场景：
+
+- 一次性很短的小问题
+- 完全不依赖上下文的单轮问答
+- 与之前任务无关的临时问题
+---
 
 ## 🚀 快速开始 (Getting Started)
 
@@ -69,18 +86,24 @@ pip install -r requirements.txt
 
 ```env
 # 核心网关配置
-GATEWAY_PORT=8000
-GATEWAY_HOST=0.0.0.0
+APP_ENV=dev
+HOST=0.0.0.0
+PORT=8000
 
 # 记忆向量库配置 (本地存储)
-MEMORY_STORE_PATH=./memory
+MEMORY_ENABLED=true
+MEMORY_STORE_PATH=memory
 MEMORY_COLLECTION_NAME=nexusgate_memory
 MEMORY_TOP_K=6
 
 # 提供商 API Keys
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-...
+
+
 ```
+
+> 建议：先复制 `.env.example` 为 `.env` 再按需调整。默认推荐 `HISTORY_REWRITE_DEFAULT_MODE=auto`。
 
 ### 3. 启动服务
 您可以使用内置脚本一键启动，网关将默认在 `http://localhost:8000` 运行：
@@ -128,9 +151,9 @@ print(response.choices[0].message.content)
 在每次任务结束时追加：
 
 请把本轮已验证且未来同类任务仍可复用的信息，分类为:
-    L2 环境事实
-    L3 任务经验 / SOP
-    仅应留在 L4 的会话信息
+    L2 环境事实;
+    L3 任务经验 / SOP;
+    仅应留在 L4 的会话信息;
     若存在 L2/L3 候选，请先执行长期记忆更新，再给我总结。
 
 ## 📂 项目结构 (Project Structure)
@@ -147,9 +170,36 @@ NexusGate/
 ├── run.sh              # 启动脚本
 └── requirements.txt    # 依赖清单
 ```
-
 ---
+### NexusGate 的作用
 
+它在两者之间负责：
+
+- 记住前几轮的关键结论
+- 压缩长任务里的上下文
+- 把用户偏好、项目约束、阶段成果重新注入后续轮次
+- 降低模型在长任务中的遗忘和漂移
+---
+## 想让 NexusGate 更好提取记忆，应该主动告诉它什么
+
+### 1. 用户偏好
+例如：
+`记住我的偏好： - 先证据后结论 - 修改前先读源码 - 尽量中文回答 - 回答带文件路径和行号 - 能不改代码就先不改`
+
+### 2. 项目级约束
+
+例如：
+`这个项目的固定约束： - 默认不联网 - 优先读日志再看源码 - 所有改动都要可回滚 - 不要碰生产配置`
+
+### 3. 已确认的稳定事实
+例如：
+`当前已确认事实： - 后端入口在 back/nexusgate/app.py - 配置在 back/nexusgate/config.py - 内存索引在 back/nexusgate/memory/index.py`
+
+模板：
+```
+将项目结构分类导入L2，索引到L1中
+```
+---
 ## 🤝 参与贡献 (Contributing)
 
 我们欢迎任何形式的贡献！如果您有新的想法、发现了 Bug 或希望增加对新 Provider 的支持，请遵循以下流程：

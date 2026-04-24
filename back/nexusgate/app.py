@@ -29,7 +29,7 @@ from nexusgate.prompt_policies import (
 )
 from nexusgate.router import ProviderRouter
 from nexusgate.safety import apply_hallucination_guard, supported_claim_check
-from nexusgate.schemas import ChatCompletionRequest, NormalizedRequest
+from nexusgate.schemas import ChatCompletionRequest, ChatMessage, NormalizedRequest
 
 
 L0_META_RULES = (
@@ -90,6 +90,12 @@ def create_app() -> FastAPI:
     def _refresh_solo_token_summary() -> None:
         total_with_arch = 0
         total_no_arch = 0
+        total_raw_input = 0
+        total_prepared_input = 0
+        total_history_replaced = 0
+        total_memory_before_trim = 0
+        total_memory_after_trim = 0
+        total_final_input = 0
         rows = 0
         if solo_token_path.exists():
             try:
@@ -104,6 +110,12 @@ def create_app() -> FastAPI:
                             continue
                         total_with_arch += int(payload.get("with_arch_total_tokens") or 0)
                         total_no_arch += int(payload.get("no_arch_est_total_tokens") or 0)
+                        total_raw_input += int(payload.get("raw_input_tokens") or 0)
+                        total_prepared_input += int(payload.get("prepared_messages_tokens") or 0)
+                        total_history_replaced += int(payload.get("history_replaced_tokens") or 0)
+                        total_memory_before_trim += int(payload.get("memory_tokens_before_trim") or 0)
+                        total_memory_after_trim += int(payload.get("memory_tokens_after_trim") or 0)
+                        total_final_input += int(payload.get("final_input_tokens") or 0)
                         rows += 1
             except Exception:
                 return
@@ -113,12 +125,73 @@ def create_app() -> FastAPI:
             f"with_arch_total_tokens={total_with_arch}\n"
             f"no_arch_est_total_tokens={total_no_arch}\n"
             f"saved_total_tokens={total_saved}\n"
+            f"raw_input_tokens_total={total_raw_input}\n"
+            f"prepared_messages_tokens_total={total_prepared_input}\n"
+            f"history_replaced_tokens_total={total_history_replaced}\n"
+            f"memory_tokens_before_trim_total={total_memory_before_trim}\n"
+            f"memory_tokens_after_trim_total={total_memory_after_trim}\n"
+            f"final_input_tokens_total={total_final_input}\n"
         )
         try:
             sum_memory_path.parent.mkdir(parents=True, exist_ok=True)
             sum_memory_path.write_text(summary, encoding="utf-8")
         except Exception:
             return
+
+    def _build_solo_token_line(*, row: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
+        token_stats = row.get("token_stats") or {}
+        render = trace.get("render") or {}
+        history = trace.get("history") or {}
+        budget = trace.get("budget") or {}
+
+        with_prompt = int(token_stats.get("prompt_tokens") or 0)
+        with_completion = int(token_stats.get("completion_tokens") or 0)
+        with_total = int(token_stats.get("total_tokens") or (with_prompt + with_completion))
+        if with_prompt <= 0:
+            with_prompt = int(token_stats.get("estimated_sent_tokens") or 0)
+            with_total = with_prompt + with_completion
+
+        memory_before = int(render.get("estimated_tokens_before") or 0)
+        memory_after = int(render.get("estimated_tokens_after") or 0)
+        no_arch_prompt_est = max(with_prompt - memory_after, 0)
+        no_arch_total_est = no_arch_prompt_est + with_completion
+
+        raw_input_tokens = int(history.get("raw_input_tokens") or 0)
+        prepared_messages_tokens = int(history.get("prepared_messages_tokens") or 0)
+        history_replaced_tokens = int(history.get("history_replaced_tokens") or 0)
+        mode = str(history.get("mode") or "unknown")
+
+        # Approximate baseline if full history were sent with current non-history overhead preserved.
+        non_history_overhead = max(with_prompt - prepared_messages_tokens, 0)
+        estimated_full_history_without_replacement = raw_input_tokens + non_history_overhead
+
+        return {
+            "created_at": row.get("created_at"),
+            "request_id": row.get("request_id"),
+            "session_id": row.get("session_id"),
+            "api_style": row.get("api_style"),
+            "provider": row.get("provider"),
+            "model": row.get("model"),
+            "mode": mode,
+            "with_arch_total_tokens": with_total,
+            "no_arch_est_total_tokens": no_arch_total_est,
+            "delta_total_tokens": with_total - no_arch_total_est,
+            "with_arch_prompt_tokens": with_prompt,
+            "no_arch_est_prompt_tokens": no_arch_prompt_est,
+            "memory_render_tokens_est": memory_after,
+            "raw_input_tokens": raw_input_tokens,
+            "prepared_messages_tokens": prepared_messages_tokens,
+            "history_replaced_tokens": history_replaced_tokens,
+            "memory_tokens_before_trim": memory_before,
+            "memory_tokens_after_trim": memory_after,
+            "final_input_tokens": with_prompt,
+            "estimated_full_history_without_replacement": estimated_full_history_without_replacement,
+            "budget_prompt_tokens": int(budget.get("prompt_budget_tokens") or 0),
+            "budget_before_tokens": int(budget.get("before_tokens") or 0),
+            "budget_after_tokens": int(budget.get("after_tokens") or 0),
+            "budget_dropped_messages": int(budget.get("dropped_messages") or 0),
+            "budget_truncated_messages": int(budget.get("truncated_messages") or 0),
+        }
 
     def _append_solo_token_line(line: dict[str, Any]) -> None:
         try:
@@ -177,32 +250,7 @@ def create_app() -> FastAPI:
             "trace": trace,
         }
         recent_traces.appendleft(row)
-        token_stats = row.get("token_stats") or {}
-        with_prompt = int(token_stats.get("prompt_tokens") or 0)
-        with_completion = int(token_stats.get("completion_tokens") or 0)
-        with_total = int(token_stats.get("total_tokens") or (with_prompt + with_completion))
-        if with_prompt <= 0:
-            with_prompt = int(token_stats.get("estimated_sent_tokens") or 0)
-            with_total = with_prompt + with_completion
-        memory_after = int((render or {}).get("estimated_tokens_after") or 0)
-        no_arch_prompt_est = max(with_prompt - memory_after, 0)
-        no_arch_total_est = no_arch_prompt_est + with_completion
-        _append_solo_token_line(
-            {
-                "created_at": row.get("created_at"),
-                "request_id": row.get("request_id"),
-                "session_id": row.get("session_id"),
-                "api_style": row.get("api_style"),
-                "provider": row.get("provider"),
-                "model": row.get("model"),
-                "with_arch_total_tokens": with_total,
-                "no_arch_est_total_tokens": no_arch_total_est,
-                "delta_total_tokens": with_total - no_arch_total_est,
-                "with_arch_prompt_tokens": with_prompt,
-                "no_arch_est_prompt_tokens": no_arch_prompt_est,
-                "memory_render_tokens_est": memory_after,
-            }
-        )
+        _append_solo_token_line(_build_solo_token_line(row=row, trace=trace))
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -255,6 +303,40 @@ def create_app() -> FastAPI:
                 "base_url": settings.effective_target_base_url,
                 "api_key_masked": _mask_secret(settings.effective_target_api_key),
                 "upstream_mode": "openai_compatible" if settings.effective_target_base_url else "provider_direct",
+            },
+            "history_rewrite": {
+                "enabled": settings.history_rewrite_enabled,
+                "default_mode": settings.history_rewrite_default_mode,
+                "global_light_query_threshold": settings.history_rewrite_global_light_query_threshold,
+                "light": {
+                    "keep_system": settings.history_rewrite_light_keep_system,
+                    "keep_user": settings.history_rewrite_light_keep_user,
+                    "keep_assistant": settings.history_rewrite_light_keep_assistant,
+                    "keep_tool": settings.history_rewrite_light_keep_tool,
+                    "keep_other": settings.history_rewrite_light_keep_other,
+                    "max_chars_per_message": settings.history_rewrite_light_max_chars_per_message,
+                },
+                "normal": {
+                    "keep_system": settings.history_rewrite_normal_keep_system,
+                    "keep_user": settings.history_rewrite_normal_keep_user,
+                    "keep_assistant": settings.history_rewrite_normal_keep_assistant,
+                    "keep_tool": settings.history_rewrite_normal_keep_tool,
+                    "keep_other": settings.history_rewrite_normal_keep_other,
+                    "max_chars_per_message": settings.history_rewrite_normal_max_chars_per_message,
+                },
+                "heavy": {
+                    "keep_system": settings.history_rewrite_heavy_keep_system,
+                    "keep_user": settings.history_rewrite_heavy_keep_user,
+                    "keep_assistant": settings.history_rewrite_heavy_keep_assistant,
+                    "keep_tool": settings.history_rewrite_heavy_keep_tool,
+                    "keep_other": settings.history_rewrite_heavy_keep_other,
+                    "max_chars_per_message": settings.history_rewrite_heavy_max_chars_per_message,
+                },
+            },
+            "context_budget": {
+                "enabled": settings.context_budget_enabled,
+                "response_reserve_ratio": settings.context_budget_response_reserve_ratio,
+                "min_prompt_tokens": settings.context_budget_min_prompt_tokens,
             },
             "health": await health(),
         }
@@ -708,10 +790,22 @@ def create_app() -> FastAPI:
         request_id = f"req_{uuid4().hex[:12]}"
         session_id = normalized_req.session_id
         user_query = normalized_req.user_text
+        task_mode = _resolve_task_mode(metadata=normalized_req.metadata or {}, session_id=session_id, user_text=user_query)
+        prepared_rows, history_stats = _prepare_messages_for_inference(normalized_req.messages, mode=task_mode)
+        prepared_user_query = _extract_latest_user_query_from_rows(prepared_rows) or user_query
+        prepared_metadata = dict(normalized_req.metadata or {})
+        prepared_metadata.setdefault("task_mode", task_mode)
+        prepared_req = normalized_req.model_copy(
+            update={
+                "messages": _to_chat_messages(prepared_rows),
+                "user_text": prepared_user_query,
+                "metadata": prepared_metadata,
+            }
+        )
 
-        memory_pack = memory.build_memory_pack(session_id, user_query)
+        memory_pack = memory.build_memory_pack(session_id, prepared_user_query)
         decision = route(
-            normalized_req=normalized_req,
+            normalized_req=prepared_req,
             defaults={
                 "model": req.model or settings.target_provider,
                 "api_base": settings.effective_target_base_url,
@@ -723,7 +817,7 @@ def create_app() -> FastAPI:
             router=provider_router,
         )
         enriched_messages, memory_pack = memory.enrich_from_normalized_request(
-            normalized_req=normalized_req,
+            normalized_req=prepared_req,
             provider_style=str(decision.get("render_mode") or "openai"),
             memory_pack=memory_pack,
         )
@@ -735,14 +829,14 @@ def create_app() -> FastAPI:
         grounding_policy = _derive_grounding_policy(
             risk_profile=memory_pack.risk_profile,
             pack_features=memory_pack.pack_features,
-            metadata=normalized_req.metadata or {},
+            metadata=prepared_req.metadata or {},
         )
         grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode, grounding_policy=grounding_policy)
         evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
         citation_block = _build_citation_system_block(memory_pack.citations)
         sop_blocks = build_sop_system_blocks(
-            user_text=user_query,
-            metadata=normalized_req.metadata or {},
+            user_text=prepared_user_query,
+            metadata=prepared_req.metadata or {},
         )
         sop_messages = [{"role": "system", "content": block} for block in sop_blocks]
         enhanced_messages = [
@@ -756,6 +850,10 @@ def create_app() -> FastAPI:
             {"role": "system", "content": citation_block},
             *enriched_messages,
         ]
+        enhanced_messages, budget_report = _apply_total_context_budget(
+            enhanced_messages,
+            context_budget_tokens=decision.get("context_budget"),
+        )
 
         kwargs = _build_upstream_kwargs(req=req, data=data, enhanced_messages=enhanced_messages)
         if decision.get("api_base"):
@@ -940,16 +1038,18 @@ def create_app() -> FastAPI:
                 detail=f"Upstream completion failed after fallbacks: {last_error}",
             ) from last_error
 
-        raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
+        raw_messages = [message.model_dump(exclude_none=True) for message in prepared_req.messages]
         background_tasks.add_task(memory.distill_to_l4, session_id, raw_messages)
         safety_ctx = {
             "request_id": request_id,
             "session_id": session_id,
             "memory_context": memory_context,
-            "user_text": user_query,
-            "metadata": normalized_req.metadata or {},
+            "user_text": prepared_user_query,
+            "metadata": prepared_req.metadata or {},
             "citations": memory_pack.citations,
             "trace": {
+                "history": history_stats,
+                "budget": budget_report,
                 "retrieval": memory_pack.retrieval_trace,
                 "assembly": memory_pack.assembly_trace,
                 "routing": {
@@ -1038,16 +1138,34 @@ def create_app() -> FastAPI:
         req = ChatCompletionRequest(**openai_data)
         normalized_req = _normalize_responses_request(data=data, req=req)
         session_id = normalized_req.session_id
-        raw_messages = [message.model_dump(exclude_none=True) for message in normalized_req.messages]
+        task_mode = _resolve_task_mode(
+            metadata=normalized_req.metadata or {},
+            session_id=session_id,
+            user_text=normalized_req.user_text,
+        )
+        prepared_rows, history_stats = _prepare_messages_for_inference(normalized_req.messages, mode=task_mode)
+        prepared_user_text = _extract_latest_user_query_from_rows(prepared_rows) or normalized_req.user_text
+        prepared_metadata = dict(normalized_req.metadata or {})
+        prepared_metadata.setdefault("task_mode", task_mode)
+        prepared_req = normalized_req.model_copy(
+            update={
+                "messages": _to_chat_messages(prepared_rows),
+                "user_text": prepared_user_text,
+                "metadata": prepared_metadata,
+            }
+        )
+        raw_messages = [message.model_dump(exclude_none=True) for message in prepared_req.messages]
 
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
         if settings.effective_target_base_url:
-            passthrough_metadata = extract_metadata_from_responses_payload(data)
-            passthrough_user_text = extract_user_text_from_responses_payload(data)
+            prepared_payload = _replace_responses_input_with_prepared_window(data, prepared_rows)
+            passthrough_metadata = extract_metadata_from_responses_payload(prepared_payload)
+            passthrough_metadata = {**passthrough_metadata, **prepared_metadata}
+            passthrough_user_text = prepared_user_text or extract_user_text_from_responses_payload(prepared_payload)
             memory_pack = memory.build_memory_pack(session_id, passthrough_user_text)
             decision = route(
-                normalized_req=normalized_req,
+                normalized_req=prepared_req,
                 defaults={
                     "model": req.model or settings.target_provider,
                     "api_base": settings.effective_target_base_url,
@@ -1065,14 +1183,35 @@ def create_app() -> FastAPI:
             grounding_policy = _derive_grounding_policy(
                 risk_profile=memory_pack.risk_profile,
                 pack_features=memory_pack.pack_features,
-                metadata=normalized_req.metadata or {},
+                metadata=prepared_req.metadata or {},
             )
             passthrough_payload = inject_system_blocks_into_responses_payload(
-                data,
+                prepared_payload,
                 user_text=passthrough_user_text,
                 metadata=passthrough_metadata,
                 memory_context=memory_context,
             )
+            if passthrough_payload.get("tools"):
+                budget_report = {
+                    "enabled": False,
+                    "before_tokens": 0,
+                    "after_tokens": 0,
+                    "context_budget_tokens": int(decision.get("context_budget") or 0),
+                    "prompt_budget_tokens": 0,
+                    "truncated_messages": 0,
+                    "dropped_messages": 0,
+                    "over_budget_before": False,
+                    "over_budget_after": False,
+                    "skipped": True,
+                    "skip_reason": "responses_tools_passthrough",
+                }
+            else:
+                passthrough_budget_messages = _responses_payload_to_messages(passthrough_payload)
+                passthrough_budget_messages, budget_report = _apply_total_context_budget(
+                    passthrough_budget_messages,
+                    context_budget_tokens=decision.get("context_budget"),
+                )
+                passthrough_payload = _messages_to_responses_payload(passthrough_payload, passthrough_budget_messages)
             estimated_prompt_tokens = _estimate_token_count_from_messages(raw_messages)
             estimated_sent_tokens = estimated_prompt_tokens + _estimate_pack_size(memory_pack)
             recent_traces.appendleft(
@@ -1101,6 +1240,8 @@ def create_app() -> FastAPI:
                         "usage_source": "passthrough_unknown",
                     },
                     "trace": {
+                        "history": history_stats,
+                        "budget": budget_report,
                         "retrieval": memory_pack.retrieval_trace,
                         "assembly": memory_pack.assembly_trace,
                         "routing": {
@@ -1119,28 +1260,7 @@ def create_app() -> FastAPI:
             )
             try:
                 passthrough_row = recent_traces[0]
-                token_stats = passthrough_row.get("token_stats") or {}
-                with_prompt = int(token_stats.get("estimated_sent_tokens") or token_stats.get("prompt_tokens") or 0)
-                with_completion = int(token_stats.get("completion_tokens") or 0)
-                with_total = with_prompt + with_completion
-                memory_after = int((memory_pack.trim_report or {}).get("estimated_tokens_after") or 0)
-                no_arch_prompt_est = max(with_prompt - memory_after, 0)
-                no_arch_total_est = no_arch_prompt_est + with_completion
-                line = {
-                    "created_at": passthrough_row.get("created_at"),
-                    "request_id": passthrough_row.get("request_id"),
-                    "session_id": passthrough_row.get("session_id"),
-                    "api_style": passthrough_row.get("api_style"),
-                    "provider": passthrough_row.get("provider"),
-                    "model": passthrough_row.get("model"),
-                    "with_arch_total_tokens": with_total,
-                    "no_arch_est_total_tokens": no_arch_total_est,
-                    "delta_total_tokens": with_total - no_arch_total_est,
-                    "with_arch_prompt_tokens": with_prompt,
-                    "no_arch_est_prompt_tokens": no_arch_prompt_est,
-                    "memory_render_tokens_est": memory_after,
-                }
-                _append_solo_token_line(line)
+                _append_solo_token_line(_build_solo_token_line(row=passthrough_row, trace=passthrough_row.get("trace") or {}))
             except Exception:
                 pass
             passthrough = await _passthrough_responses_to_upstream(
@@ -1366,6 +1486,193 @@ def _extract_latest_user_query(messages: list[Any]) -> str:
     return ""
 
 
+def _normalize_message_rows(messages: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for message in messages:
+        if hasattr(message, "model_dump"):
+            rows.append(message.model_dump(exclude_none=True))
+        elif isinstance(message, dict):
+            rows.append(dict(message))
+        else:
+            rows.append({"role": "user", "content": str(message)})
+    return rows
+
+
+def _extract_latest_user_query_from_rows(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role") or "") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False)
+    return ""
+
+
+def _resolve_task_mode(*, metadata: dict[str, Any], session_id: str, user_text: str) -> str:
+    if not settings.history_rewrite_enabled:
+        return "disabled"
+    explicit = str((metadata or {}).get("task_mode") or "").strip().lower()
+    if explicit in {"light", "normal", "heavy"}:
+        return explicit
+    configured_default = str(settings.history_rewrite_default_mode or "auto").strip().lower()
+    if configured_default in {"light", "normal", "heavy"}:
+        return configured_default
+    if not session_id or session_id == "global":
+        threshold = max(int(settings.history_rewrite_global_light_query_threshold or 120), 1)
+        return "light" if len((user_text or "").strip()) < threshold else "normal"
+    return "normal"
+
+
+def _window_limits_for_mode(mode: str) -> dict[str, int]:
+    if mode == "disabled":
+        return {
+            "system": 10_000,
+            "user": 10_000,
+            "assistant": 10_000,
+            "tool": 10_000,
+            "other": 10_000,
+            "max_chars_per_message": 1_000_000,
+        }
+    if mode == "light":
+        return {
+            "system": max(int(settings.history_rewrite_light_keep_system or 0), 0),
+            "user": max(int(settings.history_rewrite_light_keep_user or 1), 0),
+            "assistant": max(int(settings.history_rewrite_light_keep_assistant or 0), 0),
+            "tool": max(int(settings.history_rewrite_light_keep_tool or 0), 0),
+            "other": max(int(settings.history_rewrite_light_keep_other or 0), 0),
+            "max_chars_per_message": max(int(settings.history_rewrite_light_max_chars_per_message or 700), 100),
+        }
+    if mode == "heavy":
+        return {
+            "system": max(int(settings.history_rewrite_heavy_keep_system or 1), 0),
+            "user": max(int(settings.history_rewrite_heavy_keep_user or 2), 0),
+            "assistant": max(int(settings.history_rewrite_heavy_keep_assistant or 1), 0),
+            "tool": max(int(settings.history_rewrite_heavy_keep_tool or 2), 0),
+            "other": max(int(settings.history_rewrite_heavy_keep_other or 1), 0),
+            "max_chars_per_message": max(int(settings.history_rewrite_heavy_max_chars_per_message or 1800), 100),
+        }
+    return {
+        "system": max(int(settings.history_rewrite_normal_keep_system or 1), 0),
+        "user": max(int(settings.history_rewrite_normal_keep_user or 1), 0),
+        "assistant": max(int(settings.history_rewrite_normal_keep_assistant or 1), 0),
+        "tool": max(int(settings.history_rewrite_normal_keep_tool or 1), 0),
+        "other": max(int(settings.history_rewrite_normal_keep_other or 0), 0),
+        "max_chars_per_message": max(int(settings.history_rewrite_normal_max_chars_per_message or 1200), 100),
+    }
+
+
+def _truncate_message_content(content: Any, max_chars: int) -> Any:
+    if max_chars <= 0:
+        return content
+    if isinstance(content, str):
+        if len(content) <= max_chars:
+            return content
+        return f"{content[:max_chars]}…[truncated]"
+    if isinstance(content, list):
+        clipped: list[Any] = []
+        used = 0
+        for item in content:
+            text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+            if used >= max_chars:
+                break
+            remaining = max_chars - used
+            if len(text) <= remaining:
+                clipped.append(item)
+                used += len(text)
+                continue
+            if isinstance(item, str):
+                clipped.append(f"{item[:remaining]}…[truncated]")
+            else:
+                clipped.append({"type": "input_text", "text": f"{text[:remaining]}…[truncated]"})
+            used = max_chars
+        return clipped
+    return content
+
+
+def _prepare_messages_for_inference(messages: list[Any], *, mode: str) -> tuple[list[dict[str, Any]], dict[str, int | str]]:
+    rows = _normalize_message_rows(messages)
+    raw_tokens = _estimate_token_count_from_messages(rows)
+    limits = _window_limits_for_mode(mode)
+    remaining = {
+        "system": int(limits["system"]),
+        "user": int(limits["user"]),
+        "assistant": int(limits["assistant"]),
+        "tool": int(limits["tool"]),
+        "other": int(limits["other"]),
+    }
+
+    picked: list[tuple[int, dict[str, Any]]] = []
+    latest_user_idx = -1
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        role = str(row.get("role") or "user").lower()
+        if role == "user" and latest_user_idx < 0:
+            latest_user_idx = idx
+        bucket = role if role in remaining else "other"
+        if remaining.get(bucket, 0) <= 0:
+            continue
+        remaining[bucket] = int(remaining[bucket]) - 1
+        patched = dict(row)
+        patched["content"] = _truncate_message_content(patched.get("content"), int(limits["max_chars_per_message"]))
+        picked.append((idx, patched))
+
+    if latest_user_idx >= 0 and all(idx != latest_user_idx for idx, _ in picked):
+        forced = dict(rows[latest_user_idx])
+        forced["content"] = _truncate_message_content(forced.get("content"), int(limits["max_chars_per_message"]))
+        picked.append((latest_user_idx, forced))
+    if not picked and rows:
+        fallback = dict(rows[-1])
+        fallback["content"] = _truncate_message_content(fallback.get("content"), int(limits["max_chars_per_message"]))
+        picked.append((len(rows) - 1, fallback))
+
+    picked.sort(key=lambda item: item[0])
+    prepared = [row for _, row in picked]
+    prepared_tokens = _estimate_token_count_from_messages(prepared)
+    replaced_tokens = max(raw_tokens - prepared_tokens, 0)
+    return prepared, {
+        "mode": mode,
+        "raw_input_tokens": raw_tokens,
+        "prepared_messages_tokens": prepared_tokens,
+        "history_replaced_tokens": replaced_tokens,
+    }
+
+
+def _to_chat_messages(rows: list[dict[str, Any]]) -> list[ChatMessage]:
+    out: list[ChatMessage] = []
+    for row in rows:
+        out.append(
+            ChatMessage(
+                role=str(row.get("role") or "user"),
+                content=row.get("content"),
+                name=str(row.get("name")) if row.get("name") is not None else None,
+            )
+        )
+    return out
+
+
+def _replace_responses_input_with_prepared_window(payload: dict[str, Any], prepared_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    patched = dict(payload)
+    input_value = patched.get("input")
+    if not isinstance(input_value, list):
+        return patched
+    if not all(isinstance(item, dict) and "role" in item for item in input_value):
+        return patched
+
+    rebuilt: list[dict[str, Any]] = []
+    for row in prepared_rows:
+        role = str(row.get("role") or "user")
+        content = row.get("content")
+        if isinstance(content, str):
+            rebuilt.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+        elif isinstance(content, list):
+            rebuilt.append({"role": role, "content": content})
+        else:
+            rebuilt.append({"role": role, "content": [{"type": "input_text", "text": json.dumps(content, ensure_ascii=False)}]})
+    patched["input"] = rebuilt
+    return patched
+
+
 def _estimate_pack_size(pack: Any) -> int:
     canonical_parts = [
         str(getattr(pack, "l0", "")),
@@ -1408,6 +1715,198 @@ def _estimate_token_count_from_messages(messages: list[dict[str, Any]]) -> int:
                 total_chars += len(_collect_text(message.get(extra_key)))
 
     return max(1, total_chars // 4)
+
+
+def _system_drop_rank(content: str) -> int:
+    lowered = (content or "").lower()
+    if "session continuity context" in lowered:
+        return 90
+    if "non-cited procedures" in lowered:
+        return 80
+    if "citation-backed facts" in lowered:
+        return 70
+    if "citation refs" in lowered:
+        return 65
+    if "<memory_usage_skill>" in lowered or "<session_memory_recall>" in lowered:
+        return 60
+    if "grounding policy:" in lowered:
+        return 50
+    if "<nexus_context>" in lowered:
+        return 20
+    if "hard constraints" in lowered:
+        return 10
+    return 55
+
+
+def _apply_total_context_budget(
+    messages: list[dict[str, Any]],
+    *,
+    context_budget_tokens: int | None,
+) -> tuple[list[dict[str, Any]], dict[str, int | float | bool]]:
+    before_tokens = _estimate_token_count_from_messages(messages)
+    if not settings.context_budget_enabled:
+        return list(messages), {
+            "enabled": False,
+            "before_tokens": before_tokens,
+            "after_tokens": before_tokens,
+            "context_budget_tokens": int(context_budget_tokens or 0),
+            "prompt_budget_tokens": 0,
+            "truncated_messages": 0,
+            "dropped_messages": 0,
+            "over_budget_before": False,
+            "over_budget_after": False,
+        }
+
+    budget_total = max(int(context_budget_tokens or 0), int(settings.context_budget_min_prompt_tokens or 512))
+    reserve_ratio = float(settings.context_budget_response_reserve_ratio or 0.3)
+    reserve_ratio = min(max(reserve_ratio, 0.05), 0.9)
+    prompt_budget = max(int(budget_total * (1.0 - reserve_ratio)), int(settings.context_budget_min_prompt_tokens or 512))
+    if before_tokens <= prompt_budget:
+        return list(messages), {
+            "enabled": True,
+            "before_tokens": before_tokens,
+            "after_tokens": before_tokens,
+            "context_budget_tokens": budget_total,
+            "prompt_budget_tokens": prompt_budget,
+            "truncated_messages": 0,
+            "dropped_messages": 0,
+            "over_budget_before": False,
+            "over_budget_after": False,
+        }
+
+    patched = [dict(row) for row in messages]
+    truncated = 0
+    dropped = 0
+
+    # Pass 1: truncate system blocks by role-aware caps.
+    for row in patched:
+        if str(row.get("role") or "") != "system":
+            continue
+        content = str(row.get("content") or "")
+        cap = 500
+        if "<nexus_context>" in content:
+            cap = 1600
+        elif "Hard constraints" in content:
+            cap = 800
+        if len(content) > cap:
+            row["content"] = f"{content[:cap]}…[budget-trimmed]"
+            truncated += 1
+
+    # Pass 2: drop low-priority system blocks if still over budget.
+    while _estimate_token_count_from_messages(patched) > prompt_budget:
+        system_candidates: list[tuple[int, int]] = []
+        for idx, row in enumerate(patched):
+            if str(row.get("role") or "") != "system":
+                continue
+            content = str(row.get("content") or "")
+            rank = _system_drop_rank(content)
+            # keep core meta and memory context as much as possible
+            if rank <= 25:
+                continue
+            system_candidates.append((rank, idx))
+        if not system_candidates:
+            break
+        system_candidates.sort(reverse=True)
+        _, drop_idx = system_candidates[0]
+        patched.pop(drop_idx)
+        dropped += 1
+
+    # Pass 3: truncate older assistant/tool messages, but keep the latest user.
+    if _estimate_token_count_from_messages(patched) > prompt_budget:
+        latest_user_idx = -1
+        for idx in range(len(patched) - 1, -1, -1):
+            if str(patched[idx].get("role") or "") == "user":
+                latest_user_idx = idx
+                break
+        for idx, row in enumerate(patched):
+            role = str(row.get("role") or "")
+            if role not in {"assistant", "tool", "user"}:
+                continue
+            if role == "user" and idx == latest_user_idx:
+                continue
+            content = row.get("content")
+            clipped = _truncate_message_content(content, 400)
+            if clipped != content:
+                row["content"] = clipped
+                truncated += 1
+            if _estimate_token_count_from_messages(patched) <= prompt_budget:
+                break
+
+    after_tokens = _estimate_token_count_from_messages(patched)
+    return patched, {
+        "enabled": True,
+        "before_tokens": before_tokens,
+        "after_tokens": after_tokens,
+        "context_budget_tokens": budget_total,
+        "prompt_budget_tokens": prompt_budget,
+        "truncated_messages": truncated,
+        "dropped_messages": dropped,
+        "over_budget_before": before_tokens > prompt_budget,
+        "over_budget_after": after_tokens > prompt_budget,
+    }
+
+
+def _content_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        rows: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                rows.append(item)
+                continue
+            if isinstance(item, dict):
+                text = str(item.get("text") or "")
+                if text:
+                    rows.append(text)
+                    continue
+                rows.append(json.dumps(item, ensure_ascii=False))
+                continue
+            rows.append(str(item))
+        return "\n".join(row for row in rows if row).strip()
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _responses_payload_to_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        rows.append({"role": "system", "content": instructions})
+    input_value = payload.get("input")
+    if isinstance(input_value, str):
+        rows.append({"role": "user", "content": input_value})
+        return rows
+    if isinstance(input_value, dict):
+        role = str(input_value.get("role") or "user")
+        rows.append({"role": role, "content": _content_to_text(input_value.get("content"))})
+        return rows
+    if isinstance(input_value, list):
+        for item in input_value:
+            if isinstance(item, dict) and "role" in item:
+                role = str(item.get("role") or "user")
+                rows.append({"role": role, "content": _content_to_text(item.get("content"))})
+            elif isinstance(item, str):
+                rows.append({"role": "user", "content": item})
+    return rows
+
+
+def _messages_to_responses_payload(payload: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    patched = dict(payload)
+    patched.pop("instructions", None)
+    rendered: list[dict[str, Any]] = []
+    for row in rows:
+        role = str(row.get("role") or "user")
+        text = _content_to_text(row.get("content"))
+        rendered.append({"role": role, "content": [{"type": "input_text", "text": text}]})
+    patched["input"] = rendered
+    return patched
 
 
 def _provider_from_model(model: str, fallback: str = "openai") -> str:
@@ -2045,6 +2544,45 @@ def _sse_event(event: str, payload: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {text}\n\n".encode("utf-8")
 
 
+def _sse_error_event(message: str, *, code: str = "upstream_error") -> bytes:
+    return _sse_event("error", {"type": "error", "error": {"message": message, "code": code}})
+
+
+def _responses_incomplete_terminal_events(message: str, *, code: str = "stream_incomplete") -> Iterator[bytes]:
+    response_id = f"resp_{uuid4().hex}"
+    yield _sse_error_event(message, code=code)
+    yield _sse_event(
+        "response.failed",
+        {
+            "type": "response.failed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "failed",
+                "error": {"message": message, "code": code},
+            },
+        },
+    )
+    yield _sse_event(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "failed",
+                "error": {"message": message, "code": code},
+                "output": [],
+                "parallel_tool_calls": True,
+                "tools": [],
+            },
+        },
+    )
+    yield b"data: [DONE]\n\n"
+
+
 async def _passthrough_responses_to_upstream(
     request: Request,
     payload: dict[str, Any],
@@ -2061,15 +2599,17 @@ async def _passthrough_responses_to_upstream(
         async def event_stream() -> Iterator[bytes]:
             buffer = ""
             parts: list[str] = []
+            saw_completed = False
+            started = False
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
                     if resp.status_code >= 400:
                         body = await resp.aread()
                         detail = body.decode("utf-8", errors="replace")
-                        raise HTTPException(
-                            status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail=f"Upstream responses stream failed ({resp.status_code}): {detail}",
-                        )
+                        message = f"Upstream responses stream failed ({resp.status_code}): {detail}"
+                        for terminal_chunk in _responses_incomplete_terminal_events(message, code="upstream_http_error"):
+                            yield terminal_chunk
+                        return
                     async for chunk in resp.aiter_bytes():
                         if chunk:
                             text = chunk.decode("utf-8", errors="ignore")
@@ -2094,7 +2634,15 @@ async def _passthrough_responses_to_upstream(
                                     done_text = obj.get("text")
                                     if isinstance(done_text, str):
                                         parts = [done_text]
+                                elif event_type == "response.completed":
+                                    saw_completed = True
+                            started = True
                             yield chunk
+            if not saw_completed:
+                message = "Upstream responses stream ended before response.completed"
+                for terminal_chunk in _responses_incomplete_terminal_events(message, code="stream_incomplete"):
+                    yield terminal_chunk
+                return
             if on_complete is not None:
                 final_text = "".join(parts).strip()
                 on_complete(final_text)
@@ -2119,12 +2667,27 @@ async def _passthrough_responses_to_upstream(
 
 def _build_upstream_headers(request: Request, upstream_api_key: str | None) -> dict[str, str]:
     passthrough_headers = {}
+    blocked_headers = {
+        "host",
+        "content-length",
+        "authorization",
+        "accept-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "trailers",
+        "upgrade",
+    }
     for key, value in request.headers.items():
         lowered = key.lower()
-        if lowered in {"host", "content-length", "authorization"}:
+        if lowered in blocked_headers:
             continue
         passthrough_headers[key] = value
 
+    passthrough_headers["Accept-Encoding"] = "identity"
     if upstream_api_key:
         passthrough_headers["Authorization"] = f"Bearer {upstream_api_key}"
     elif "Authorization" not in passthrough_headers:
