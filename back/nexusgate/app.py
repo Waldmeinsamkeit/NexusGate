@@ -1310,9 +1310,9 @@ def create_app() -> FastAPI:
             "citations": memory_pack.citations,
             "trace": {
                 "history": history_stats,
-                "budget": budget_report,
-                "retrieval": memory_pack.retrieval_trace,
-                "assembly": memory_pack.assembly_trace,
+                "budget": budget_report or None,
+                "retrieval": memory_pack.retrieval_trace or None,
+                "assembly": memory_pack.assembly_trace or None,
                 "routing": {
                     "provider": decision.get("provider"),
                     "model": decision.get("model"),
@@ -1322,7 +1322,7 @@ def create_app() -> FastAPI:
                     "grounding_mode": decision.get("grounding_mode"),
                     "grounding_policy": grounding_policy,
                 },
-                "render": memory_pack.trim_report,
+                "render": memory_pack.trim_report or None,
                 "fallback": fallback_events,
             },
             "grounding_policy": grounding_policy,
@@ -1553,9 +1553,9 @@ def create_app() -> FastAPI:
                     "budget_diagnostics": _budget_diagnostics_from_report(budget_report),
                     "trace": {
                         "history": history_stats,
-                        "budget": budget_report,
-                        "retrieval": memory_pack.retrieval_trace,
-                        "assembly": memory_pack.assembly_trace,
+                        "budget": budget_report or None,
+                        "retrieval": memory_pack.retrieval_trace or None,
+                        "assembly": memory_pack.assembly_trace or None,
                         "routing": {
                             "provider": decision.get("provider"),
                             "model": decision.get("model"),
@@ -1565,7 +1565,7 @@ def create_app() -> FastAPI:
                             "grounding_mode": decision.get("grounding_mode"),
                             "grounding_policy": grounding_policy,
                         },
-                        "render": memory_pack.trim_report,
+                        "render": memory_pack.trim_report or None,
                         "fallback": [],
                     },
                 }

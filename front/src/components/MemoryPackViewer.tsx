@@ -92,13 +92,91 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
   const assembly = t.assembly;
   const render = t.render;
   const routing = t.routing;
+  const budget = t.budget;
+  const ts = trace.token_stats;
 
   const totalAssembly = (assembly?.facts_count || 0) + (assembly?.procedures_count || 0) + (assembly?.continuity_count || 0) + (assembly?.constraints_count || 0);
   const droppedCount = render?.dropped_blocks?.length || 0;
   const keptCount = render?.rendered_block_order?.length || 0;
+  const hasRenderData = render && (render.estimated_tokens_before || render.trim_passes || render.trimmed_total_chars);
+  const hasBudgetData = budget && (budget.before_tokens || budget.after_tokens || budget.enabled);
+
+  const rawInput = ts.raw_input_tokens || 0;
+  const sentTokens = ts.estimated_sent_tokens || ts.prompt_tokens || 0;
+  const savedEst = ts.saved_tokens_estimated || 0;
+  const savedRate = ts.saved_rate_estimated || 0;
 
   return (
     <div className="space-y-3">
+      {/* 0. Token Stats Overview */}
+      <Panel title="Token 统计" icon={BarChart3} defaultOpen badge={
+        rawInput > 0 ? <span className="text-[9px] font-mono text-slate-400">节省 {Math.round(savedRate * 100)}%</span> : null
+      }>
+        <div className="space-y-4">
+          <div className="grid grid-cols-4 gap-3">
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+              <span className="text-[9px] text-slate-400 font-bold uppercase">原始输入</span>
+              <p className="mt-1"><Num v={rawInput} unit="tok" /></p>
+            </div>
+            <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
+              <span className="text-[9px] text-blue-600 font-bold uppercase">实际发送</span>
+              <p className="mt-1"><Num v={sentTokens} unit="tok" /></p>
+            </div>
+            <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-100">
+              <span className="text-[9px] text-emerald-600 font-bold uppercase">节省</span>
+              <p className="mt-1"><Num v={savedEst} unit="tok" /></p>
+            </div>
+            <div className="p-3 bg-amber-50 rounded-lg border border-amber-100">
+              <span className="text-[9px] text-amber-600 font-bold uppercase">节省率</span>
+              <p className="mt-1 text-xs font-mono font-bold text-amber-700">{rawInput > 0 ? `${Math.round(savedRate * 100)}%` : '-'}</p>
+            </div>
+          </div>
+          {rawInput > 0 && (
+            <div className="space-y-2">
+              <p className="text-[10px] font-bold text-slate-500">发送量对比</p>
+              <div className="flex items-center gap-3">
+                <div className="flex-1">
+                  <div className="flex justify-between text-[9px] text-slate-400 mb-1">
+                    <span>原始输入</span>
+                    <span className="font-mono">{rawInput} tok</span>
+                  </div>
+                  <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div className="h-full bg-blue-500 rounded-full" style={{ width: '100%' }} />
+                  </div>
+                </div>
+                <ArrowDown size={14} className="text-slate-300 shrink-0" />
+                <div className="flex-1">
+                  <div className="flex justify-between text-[9px] text-slate-400 mb-1">
+                    <span>实际发送</span>
+                    <span className="font-mono">{sentTokens} tok</span>
+                  </div>
+                  <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-500 rounded-full"
+                      style={{ width: `${Math.max(5, (sentTokens / Math.max(rawInput, 1)) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="grid grid-cols-3 gap-3">
+            <div className="p-2 bg-slate-50 rounded-lg border border-slate-100">
+              <span className="text-[9px] text-slate-400 font-bold uppercase">完成 tokens</span>
+              <p className="mt-1"><Num v={ts.completion_tokens} unit="tok" /></p>
+            </div>
+            <div className="p-2 bg-slate-50 rounded-lg border border-slate-100">
+              <span className="text-[9px] text-slate-400 font-bold uppercase">数据来源</span>
+              <p className="mt-1 text-[10px] font-mono text-slate-600">{ts.usage_source || '-'}</p>
+            </div>
+            <div className="p-2 bg-slate-50 rounded-lg border border-slate-100">
+              <span className="text-[9px] text-slate-400 font-bold uppercase">API</span>
+              <p className="mt-1 text-[10px] font-mono text-slate-600">{trace.api_style}</p>
+            </div>
+          </div>
+        </div>
+      </Panel>
+
       {/* 1. Retrieval */}
       <Panel title="检索阶段 — 命中的记忆候选" icon={Search} defaultOpen badge={
         retrieval ? <span className="text-[9px] font-mono text-slate-400">{retrieval.kept_candidates || 0}/{retrieval.raw_candidates || 0} 命中</span> : null
@@ -162,15 +240,15 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
         ) : <p className="text-xs text-slate-400">无组装数据</p>}
       </Panel>
 
-      {/* 3. Provider Render + Trim */}
-      <Panel title="渲染 & 裁剪 — Provider 适配" icon={Scissors} badge={
-        render ? (
+      {/* 3. Memory Render + Trim */}
+      <Panel title="记忆渲染 & 裁剪" icon={Scissors} badge={
+        hasRenderData ? (
           <span className="text-[9px] font-mono text-slate-400">
-            {render.estimated_tokens_before || 0} → {render.estimated_tokens_after || 0} tok
+            {render!.estimated_tokens_before || 0} → {render!.estimated_tokens_after || 0} tok
           </span>
         ) : null
       }>
-        {render ? (
+        {hasRenderData ? (
           <div className="space-y-4">
             {/* Token diff bar */}
             <div className="space-y-2">
@@ -179,7 +257,7 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
                 <div className="flex-1">
                   <div className="flex justify-between text-[9px] text-slate-400 mb-1">
                     <span>裁剪前</span>
-                    <span className="font-mono">{render.estimated_tokens_before || 0} tok</span>
+                    <span className="font-mono">{render!.estimated_tokens_before || 0} tok</span>
                   </div>
                   <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
                     <div className="h-full bg-blue-500 rounded-full" style={{ width: '100%' }} />
@@ -189,12 +267,12 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
                 <div className="flex-1">
                   <div className="flex justify-between text-[9px] text-slate-400 mb-1">
                     <span>裁剪后</span>
-                    <span className="font-mono">{render.estimated_tokens_after || 0} tok</span>
+                    <span className="font-mono">{render!.estimated_tokens_after || 0} tok</span>
                   </div>
                   <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
                     <div
                       className="h-full bg-emerald-500 rounded-full"
-                      style={{ width: `${Math.max(5, ((render.estimated_tokens_after || 0) / Math.max(render.estimated_tokens_before || 1, 1)) * 100)}%` }}
+                      style={{ width: `${Math.max(5, ((render!.estimated_tokens_after || 0) / Math.max(render!.estimated_tokens_before || 1, 1)) * 100)}%` }}
                     />
                   </div>
                 </div>
@@ -205,15 +283,15 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
             <div className="grid grid-cols-3 gap-3">
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[9px] text-slate-400 font-bold uppercase">裁剪次数</span>
-                <p className="mt-1"><Num v={render.trim_passes} /></p>
+                <p className="mt-1"><Num v={render!.trim_passes} /></p>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[9px] text-slate-400 font-bold uppercase">裁剪字符</span>
-                <p className="mt-1"><Num v={render.trimmed_total_chars} unit="ch" /></p>
+                <p className="mt-1"><Num v={render!.trimmed_total_chars} unit="ch" /></p>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="text-[9px] text-slate-400 font-bold uppercase">最终字符</span>
-                <p className="mt-1"><Num v={render.final_total_chars} unit="ch" /></p>
+                <p className="mt-1"><Num v={render!.final_total_chars} unit="ch" /></p>
               </div>
             </div>
 
@@ -222,10 +300,10 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
               <p className="text-[10px] font-bold text-slate-500 mb-2">各层裁剪量</p>
               <div className="grid grid-cols-4 gap-2">
                 {[
-                  { label: 'L1 约束', val: render.trimmed_l1_chars, color: 'amber' },
-                  { label: 'L2 事实', val: render.trimmed_l2_chars, color: 'emerald' },
-                  { label: 'L3 技能', val: render.trimmed_l3_chars, color: 'blue' },
-                  { label: 'L4 连续性', val: render.trimmed_l4_chars, color: 'purple' },
+                  { label: 'L1 约束', val: render!.trimmed_l1_chars, color: 'amber' },
+                  { label: 'L2 事实', val: render!.trimmed_l2_chars, color: 'emerald' },
+                  { label: 'L3 技能', val: render!.trimmed_l3_chars, color: 'blue' },
+                  { label: 'L4 连续性', val: render!.trimmed_l4_chars, color: 'purple' },
                 ].map(({ label, val, color }) => (
                   <div key={label} className={cn('p-2 rounded-lg border text-center', val ? `bg-${color}-50 border-${color}-100` : 'bg-slate-50 border-slate-100')}>
                     <p className="text-[9px] font-bold text-slate-500">{label}</p>
@@ -238,11 +316,11 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
             </div>
 
             {/* Retained counts by section */}
-            {render.retained_counts_by_section && (
+            {render!.retained_counts_by_section && (
               <div>
                 <p className="text-[10px] font-bold text-slate-500 mb-2">保留条目数</p>
                 <div className="grid grid-cols-4 gap-2">
-                  {Object.entries(render.retained_counts_by_section).map(([section, count]) => (
+                  {Object.entries(render!.retained_counts_by_section).map(([section, count]) => (
                     <div key={section} className="p-2 rounded-lg border border-slate-100 bg-emerald-50 text-center">
                       <p className="text-[9px] font-bold text-slate-500">{SECTION_LABELS[section] || section}</p>
                       <p className="text-xs font-mono font-bold text-emerald-700 mt-0.5">{count}</p>
@@ -253,13 +331,13 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
             )}
 
             {/* Kept block IDs */}
-            {render.rendered_block_order && render.rendered_block_order.length > 0 && (
+            {render!.rendered_block_order && render!.rendered_block_order.length > 0 && (
               <div>
                 <p className="text-[10px] font-bold text-emerald-600 mb-1.5 flex items-center gap-1">
                   <CheckCircle size={10} /> 保留的 blocks ({keptCount})
                 </p>
                 <div className="flex flex-wrap gap-1">
-                  {render.rendered_block_order.map((id, i) => {
+                  {render!.rendered_block_order.map((id, i) => {
                     const section = id.split(':')[0];
                     return (
                       <span key={i} className={cn('text-[8px] px-1.5 py-0.5 rounded border font-mono', SECTION_COLORS[section] || 'bg-slate-50 text-slate-600 border-slate-100')}>
@@ -272,19 +350,19 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
             )}
 
             {/* Dropped block IDs */}
-            {render.dropped_block_ids && render.dropped_block_ids.length > 0 && (
+            {render!.dropped_block_ids && render!.dropped_block_ids.length > 0 && (
               <div>
                 <p className="text-[10px] font-bold text-red-600 mb-1.5 flex items-center gap-1">
                   <XCircle size={10} /> 被裁剪的 blocks ({droppedCount})
                 </p>
                 <div className="flex flex-wrap gap-1">
-                  {render.dropped_block_ids.map((id, i) => (
+                  {render!.dropped_block_ids.map((id, i) => (
                     <span key={i} className="text-[8px] px-1.5 py-0.5 rounded border border-red-100 bg-red-50 text-red-600 font-mono line-through">{id}</span>
                   ))}
                 </div>
-                {render.drop_reason_by_block && (
+                {render!.drop_reason_by_block && (
                   <div className="mt-2 space-y-1">
-                    {Object.entries(render.drop_reason_by_block).map(([blockId, reason]) => (
+                    {Object.entries(render!.drop_reason_by_block).map(([blockId, reason]) => (
                       <div key={blockId} className="text-[9px] flex gap-2">
                         <span className="font-mono text-red-500 truncate max-w-[200px]">{blockId}</span>
                         <span className="text-slate-400">→</span>
@@ -297,11 +375,11 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
             )}
 
             {/* Sections after trim */}
-            {render.sections_after && (
+            {render!.sections_after && (
               <div>
                 <p className="text-[10px] font-bold text-slate-500 mb-2">裁剪后各 section 内容</p>
                 <div className="space-y-2">
-                  {Object.entries(render.sections_after).map(([section, content]) => (
+                  {Object.entries(render!.sections_after).map(([section, content]) => (
                     <div key={section} className="rounded-lg border border-slate-100 overflow-hidden">
                       <div className={cn('px-3 py-1.5 border-b', SECTION_COLORS[section]?.replace('text-', 'bg-').split(' ')[0] || 'bg-slate-50')}>
                         <SectionTag name={SECTION_LABELS[section] || section} cls={SECTION_COLORS[section]} />
@@ -315,7 +393,112 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
               </div>
             )}
           </div>
-        ) : <p className="text-xs text-slate-400">无渲染数据（可能是 passthrough 请求）</p>}
+        ) : <p className="text-xs text-slate-400">无记忆裁剪数据</p>}
+      </Panel>
+
+      {/* 3b. Context Budget */}
+      <Panel title="上下文预算 & 裁剪" icon={BarChart3} badge={
+        hasBudgetData ? (
+          <span className="text-[9px] font-mono text-slate-400">
+            {budget!.before_tokens || 0} → {budget!.after_tokens || 0} tok
+            {budget!.native_tools_budget ? ' · tools' : ''}
+          </span>
+        ) : null
+      }>
+        {hasBudgetData ? (
+          <div className="space-y-4">
+            {/* Budget status */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                <span className="text-[9px] text-slate-400 font-bold uppercase">状态</span>
+                <p className="mt-1 text-xs font-mono font-bold">
+                  {budget!.skipped ? <span className="text-amber-600">跳过</span> : budget!.enabled ? <span className="text-emerald-600">启用</span> : <span className="text-slate-400">未启用</span>}
+                </p>
+                {budget!.skip_reason && <p className="text-[9px] text-amber-500 mt-0.5">{budget!.skip_reason}</p>}
+              </div>
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                <span className="text-[9px] text-slate-400 font-bold uppercase">上下文预算</span>
+                <p className="mt-1"><Num v={budget!.context_budget_tokens} unit="tok" /></p>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                <span className="text-[9px] text-slate-400 font-bold uppercase">Prompt 预算</span>
+                <p className="mt-1"><Num v={budget!.prompt_budget_tokens} unit="tok" /></p>
+              </div>
+            </div>
+
+            {/* Token diff bar */}
+            <div className="space-y-2">
+              <p className="text-[10px] font-bold text-slate-500">Token 变化</p>
+              <div className="flex items-center gap-3">
+                <div className="flex-1">
+                  <div className="flex justify-between text-[9px] text-slate-400 mb-1">
+                    <span>预算前</span>
+                    <span className="font-mono">{budget!.before_tokens || 0} tok</span>
+                  </div>
+                  <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div className="h-full bg-blue-500 rounded-full" style={{ width: '100%' }} />
+                  </div>
+                </div>
+                <ArrowDown size={14} className="text-slate-300 shrink-0" />
+                <div className="flex-1">
+                  <div className="flex justify-between text-[9px] text-slate-400 mb-1">
+                    <span>预算后</span>
+                    <span className="font-mono">{budget!.after_tokens || 0} tok</span>
+                  </div>
+                  <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-500 rounded-full"
+                      style={{ width: `${Math.max(5, ((budget!.after_tokens || 0) / Math.max(budget!.before_tokens || 1, 1)) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+              {(budget!.over_budget_before || budget!.over_budget_after) && (
+                <div className="flex gap-2">
+                  {budget!.over_budget_before && <span className="text-[9px] px-2 py-0.5 bg-amber-50 text-amber-600 rounded border border-amber-100 font-mono">预算前超限</span>}
+                  {budget!.over_budget_after && <span className="text-[9px] px-2 py-0.5 bg-red-50 text-red-600 rounded border border-red-100 font-mono">预算后仍超限</span>}
+                </div>
+              )}
+            </div>
+
+            {/* Trim stats */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                <span className="text-[9px] text-slate-400 font-bold uppercase">截断消息</span>
+                <p className="mt-1"><Num v={budget!.truncated_messages} /></p>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                <span className="text-[9px] text-slate-400 font-bold uppercase">丢弃消息</span>
+                <p className="mt-1"><Num v={budget!.dropped_messages} /></p>
+              </div>
+            </div>
+
+            {/* Tool episode budget (native) */}
+            {budget!.native_tools_budget && (
+              <div>
+                <p className="text-[10px] font-bold text-slate-500 mb-2">工具 Episode 裁剪</p>
+                <div className="grid grid-cols-4 gap-2">
+                  <div className="p-2 rounded-lg border border-slate-100 bg-slate-50 text-center">
+                    <p className="text-[9px] font-bold text-slate-500">Episodes</p>
+                    <p className="text-xs font-mono font-bold text-slate-800 mt-0.5">{budget!.episode_count || 0}</p>
+                  </div>
+                  <div className="p-2 rounded-lg border border-amber-100 bg-amber-50 text-center">
+                    <p className="text-[9px] font-bold text-amber-600">截断</p>
+                    <p className="text-xs font-mono font-bold text-amber-700 mt-0.5">{budget!.episodes_trimmed || 0}</p>
+                  </div>
+                  <div className="p-2 rounded-lg border border-blue-100 bg-blue-50 text-center">
+                    <p className="text-[9px] font-bold text-blue-600">摘要化</p>
+                    <p className="text-xs font-mono font-bold text-blue-700 mt-0.5">{budget!.episodes_summarized || 0}</p>
+                  </div>
+                  <div className="p-2 rounded-lg border border-purple-100 bg-purple-50 text-center">
+                    <p className="text-[9px] font-bold text-purple-600">结果裁剪</p>
+                    <p className="text-xs font-mono font-bold text-purple-700 mt-0.5">{budget!.tool_result_pruned_chars || 0}<span className="text-[9px] text-purple-400 ml-0.5">ch</span></p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : <p className="text-xs text-slate-400">无上下文预算数据</p>}
       </Panel>
 
       {/* 4. Routing */}
@@ -353,15 +536,6 @@ const TraceDetail = ({ trace }: { trace: TraceRecord }) => {
           </div>
         ) : <p className="text-xs text-slate-400">无路由数据</p>}
       </Panel>
-
-      {/* 5. Budget Report */}
-      {t.budget && Object.keys(t.budget).length > 0 && (
-        <Panel title="预算报告" icon={BarChart3}>
-          <pre className="text-[10px] text-slate-700 whitespace-pre-wrap break-all bg-slate-50 p-3 rounded-lg border border-slate-100 font-mono leading-relaxed max-h-60 overflow-y-auto custom-scrollbar">
-            {JSON.stringify(t.budget, null, 2)}
-          </pre>
-        </Panel>
-      )}
     </div>
   );
 };
@@ -392,7 +566,7 @@ export const MemoryPackViewer = () => {
 
   useEffect(() => { load(); }, [load]);
 
-  const hasMemoryData = (t: TraceRecord) => !!(t.trace.retrieval || t.trace.assembly || t.trace.render);
+  const hasMemoryData = (t: TraceRecord) => !!(t.trace.retrieval || t.trace.assembly || t.trace.render || t.trace.budget);
 
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-4">
@@ -452,6 +626,9 @@ export const MemoryPackViewer = () => {
                     {t.trace.render?.trim_passes ? <span className="text-[8px] px-1 py-0.5 bg-amber-50 text-amber-600 rounded border border-amber-100">
                       {t.trace.render.trim_passes} trims
                     </span> : null}
+                    {t.trace.budget && !t.trace.assembly && <span className="text-[8px] px-1 py-0.5 bg-blue-50 text-blue-600 rounded border border-blue-100">
+                      budget
+                    </span>}
                   </div>
                 )}
               </button>

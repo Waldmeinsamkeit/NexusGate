@@ -296,7 +296,24 @@ export interface TraceRecord {
       trimmed_l4_chars?: number;
       sections_after?: Record<string, string>;
     };
-    budget?: Record<string, unknown>;
+    budget?: {
+      enabled?: boolean;
+      native_tools_budget?: boolean;
+      before_tokens?: number;
+      after_tokens?: number;
+      context_budget_tokens?: number;
+      prompt_budget_tokens?: number;
+      truncated_messages?: number;
+      dropped_messages?: number;
+      over_budget_before?: boolean;
+      over_budget_after?: boolean;
+      skipped?: boolean;
+      skip_reason?: string;
+      episode_count?: number;
+      episodes_trimmed?: number;
+      episodes_summarized?: number;
+      tool_result_pruned_chars?: number;
+    };
     routing?: {
       provider?: string;
       model?: string;
