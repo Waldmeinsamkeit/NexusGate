@@ -127,6 +127,11 @@ def create_app() -> FastAPI:
             except Exception:
                 return
         total_saved = max(total_no_arch - total_with_arch, 0)
+        # When total_with_arch is 0 (no upstream usage reported), the derived
+        # total_saved is unreliable — fall back to the sum of per-line saved_prompt_tokens
+        # which already handles the zero-actual-sent guard in _build_solo_token_line.
+        if total_with_arch <= 0 and total_saved_prompt > 0:
+            total_saved = 0
         overall_saved_rate = round(min(float(total_saved) / float(max(total_no_arch, 1)), 1.0) * 100.0, 1)
         summary = (
             f"rows={rows}\n"
