@@ -4,6 +4,7 @@ import {
   Settings,
   Database,
   ArrowRightLeft,
+  Package,
   ChevronRight,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
@@ -28,6 +29,7 @@ export const Sidebar = ({ activeTab, setActiveTab }: SidebarProps) => {
   const items = [
     { id: 'dashboard', label: '看板', icon: LayoutDashboard },
     { id: 'memory', label: '记忆工作台', icon: Database },
+    { id: 'mempack', label: 'Memory Pack', icon: Package },
     { id: 'settings', label: '系统设置', icon: Settings },
     { id: 'providers', label: '上游管理', icon: ArrowRightLeft },
   ];

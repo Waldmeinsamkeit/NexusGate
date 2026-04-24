@@ -10,6 +10,7 @@ import { Dashboard } from './components/Dashboard';
 import { MemoryCenter } from './components/MemoryCenter';
 import { Settings } from './components/Settings';
 import { ProviderManager } from './components/ProviderManager';
+import { MemoryPackViewer } from './components/MemoryPackViewer';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -20,6 +21,7 @@ export default function App() {
     switch (activeTab) {
       case 'dashboard': return <Dashboard />;
       case 'memory': return <MemoryCenter />;
+      case 'mempack': return <MemoryPackViewer />;
       case 'settings': return <Settings onConfigChanged={onConfigChanged} />;
       case 'providers': return <ProviderManager configVersion={configVersion} onConfigChanged={onConfigChanged} />;
       default: return <Dashboard />;

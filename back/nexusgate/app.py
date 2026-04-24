@@ -126,8 +126,8 @@ def create_app() -> FastAPI:
                         rows += 1
             except Exception:
                 return
-        total_saved = total_no_arch - total_with_arch
-        overall_saved_rate = round(float(total_saved) / float(max(total_no_arch, 1)) * 100.0, 1)
+        total_saved = max(total_no_arch - total_with_arch, 0)
+        overall_saved_rate = round(min(float(total_saved) / float(max(total_no_arch, 1)), 1.0) * 100.0, 1)
         summary = (
             f"rows={rows}\n"
             f"with_arch_total_tokens={total_with_arch}\n"
@@ -175,9 +175,9 @@ def create_app() -> FastAPI:
         # rewrite, no memory injection, no system blocks.
         no_arch_prompt_est = raw_input_tokens if raw_input_tokens > 0 else with_prompt
         no_arch_total_est = no_arch_prompt_est + with_completion
-        saved_prompt = no_arch_prompt_est - with_prompt
-        saved_total = no_arch_total_est - with_total
-        saved_rate = round(float(saved_prompt) / float(max(no_arch_prompt_est, 1)), 4)
+        saved_prompt = max(no_arch_prompt_est - with_prompt, 0)
+        saved_total = max(no_arch_total_est - with_total, 0)
+        saved_rate = round(min(float(saved_prompt) / float(max(no_arch_prompt_est, 1)), 1.0), 4)
 
         return {
             "created_at": row.get("created_at"),
@@ -282,8 +282,8 @@ def create_app() -> FastAPI:
                 "total_tokens": total_tokens,
                 "saved_tokens_estimated": saved_estimated,
                 "saved_tokens_actual": saved_actual,
-                "saved_rate_estimated": round(float(saved_estimated) / float(max(no_arch_baseline, 1)), 4) if no_arch_baseline else 0.0,
-                "saved_rate_actual": round(float(saved_actual) / float(max(raw_input_tokens, 1)), 4) if raw_input_tokens and prompt_tokens else 0.0,
+                "saved_rate_estimated": round(min(float(saved_estimated) / float(max(no_arch_baseline, 1)), 1.0), 4) if no_arch_baseline else 0.0,
+                "saved_rate_actual": round(min(float(saved_actual) / float(max(raw_input_tokens, 1)), 1.0), 4) if raw_input_tokens and prompt_tokens else 0.0,
                 "usage_source": "upstream_usage" if prompt_tokens else "estimate_only",
             },
             "budget_diagnostics": budget_diag,
@@ -1492,7 +1492,7 @@ def create_app() -> FastAPI:
                         "total_tokens": 0,
                         "saved_tokens_estimated": max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0),
                         "saved_tokens_actual": 0,
-                        "saved_rate_estimated": round(float(max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0)) / float(max(int(history_stats.get("raw_input_tokens") or 0), 1)), 4),
+                        "saved_rate_estimated": round(min(float(max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0)) / float(max(int(history_stats.get("raw_input_tokens") or 0), 1)), 1.0), 4),
                         "saved_rate_actual": 0.0,
                         "usage_source": "passthrough_unknown",
                     },

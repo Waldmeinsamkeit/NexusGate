@@ -256,15 +256,57 @@ export interface TraceRecord {
       history_replaced_tokens?: number;
       mode?: string;
     };
+    retrieval?: {
+      raw_candidates?: number;
+      kept_candidates?: number;
+      dropped_candidates?: number;
+      dropped_reasons?: string[];
+      memory_budget_tokens?: number;
+      memory_budget_chars?: number;
+    };
+    assembly?: {
+      facts_count?: number;
+      procedures_count?: number;
+      continuity_count?: number;
+      constraints_count?: number;
+    };
     render?: {
+      mode?: string;
+      final_render_strategy?: string;
+      budget_before?: number;
+      budget_after?: number;
       estimated_tokens_before?: number;
       estimated_tokens_after?: number;
+      trimmed_total_chars?: number;
+      final_total_chars?: number;
+      trim_passes?: number;
+      dropped_blocks?: string[];
+      dropped_block_ids?: string[];
+      drop_reason_by_block?: Record<string, string>;
+      drop_reasons?: string[];
+      rendered_block_order?: string[];
+      retained_counts_by_section?: Record<string, number>;
+      retained_fact_ids?: string[];
+      retained_procedure_ids?: string[];
+      retained_continuity_ids?: string[];
+      retained_constraint_ids?: string[];
+      trimmed_l1_chars?: number;
+      trimmed_l2_chars?: number;
+      trimmed_l3_chars?: number;
+      trimmed_l4_chars?: number;
+      sections_after?: Record<string, string>;
     };
+    budget?: Record<string, unknown>;
     routing?: {
       provider?: string;
       model?: string;
       reason_codes?: string[];
+      fallback_chain?: string[];
+      context_budget?: number;
+      grounding_mode?: string;
+      grounding_policy?: string;
     };
+    fallback?: Array<Record<string, unknown>>;
     route_decision?: string;
   };
   error?: string;

@@ -24,14 +24,15 @@ function aggregateTraces(traces: TraceRecord[]): AggregatedStats {
     if (!ts) continue;
     totalRaw += ts.raw_input_tokens || ts.estimated_prompt_tokens || 0;
     totalSent += ts.prompt_tokens || ts.estimated_sent_tokens || 0;
-    totalSaved += ts.saved_tokens_actual || ts.saved_tokens_estimated || 0;
+    totalSaved += Math.max(ts.saved_tokens_actual || ts.saved_tokens_estimated || 0, 0);
   }
+  const clampedSaved = Math.max(totalSaved, 0);
   return {
     totalRequests: traces.length,
     totalRawTokens: totalRaw,
     totalSentTokens: totalSent,
-    totalSaved,
-    savedRate: totalRaw > 0 ? totalSaved / totalRaw : 0,
+    totalSaved: clampedSaved,
+    savedRate: totalRaw > 0 ? Math.min(clampedSaved / totalRaw, 1.0) : 0,
   };
 }
 
@@ -367,7 +368,7 @@ export const Dashboard = () => {
                 const raw = ts?.raw_input_tokens || ts?.estimated_prompt_tokens || 0;
                 const sent = ts?.prompt_tokens || ts?.estimated_sent_tokens || 0;
                 const saved = ts?.saved_tokens_actual || ts?.saved_tokens_estimated || 0;
-                const rate = ts?.saved_rate_actual || ts?.saved_rate_estimated || 0;
+                const rate = Math.min(Math.max(ts?.saved_rate_actual || ts?.saved_rate_estimated || 0, 0), 1.0);
                 return (
                   <tr
                     key={i}
