@@ -66,8 +66,54 @@ def dedupe_and_merge_system_blocks(blocks: list[SystemBlock]) -> list[SystemBloc
 
 
 def render_system_blocks_for_provider(blocks: list[SystemBlock], *, provider_style: str) -> list[str]:
-    _ = provider_style
-    return [block.content.strip() for block in blocks if block.content.strip()]
+    rendered: list[str] = []
+    for block in blocks:
+        text = block.content.strip()
+        if not text:
+            continue
+        if provider_style == "anthropic":
+            if not text.startswith("<"):
+                tag = _category_to_xml_tag(block.category)
+                text = f"<{tag}>\n{text}\n</{tag}>"
+        elif provider_style == "openai":
+            if not text.startswith(("#", "<")):
+                heading = _category_to_heading(block.category)
+                text = f"## {heading}\n{text}"
+        rendered.append(text)
+    return rendered
+
+
+_CATEGORY_XML_TAG_MAP = {
+    "meta_rules": "nexus_rules",
+    "grounding_policy": "grounding",
+    "memory_constraints": "constraints",
+    "memory_facts": "verified_facts",
+    "memory_procedures": "procedures",
+    "memory_continuity": "session_context",
+    "citation_refs": "citations",
+    "memory_context": "nexus_context",
+    "sop": "sop",
+}
+
+_CATEGORY_HEADING_MAP = {
+    "meta_rules": "Core Rules",
+    "grounding_policy": "Grounding Policy",
+    "memory_constraints": "Constraints",
+    "memory_facts": "Verified Facts",
+    "memory_procedures": "Procedures",
+    "memory_continuity": "Session Context",
+    "citation_refs": "Citations",
+    "memory_context": "Memory Context",
+    "sop": "SOP",
+}
+
+
+def _category_to_xml_tag(category: str) -> str:
+    return _CATEGORY_XML_TAG_MAP.get(category, category.replace(" ", "_"))
+
+
+def _category_to_heading(category: str) -> str:
+    return _CATEGORY_HEADING_MAP.get(category, category.replace("_", " ").title())
 
 
 def _coerce_block(*, item: SystemBlock | dict[str, Any] | str, default_category: str) -> SystemBlock | None:

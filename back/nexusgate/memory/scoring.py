@@ -95,6 +95,7 @@ class MemoryScorer:
                     evidence=row.evidence,
                     source=row.source,
                     verified=row.verified,
+                    confidence=row.confidence,
                     score=score,
                     recency=recency,
                     scope=row.scope,

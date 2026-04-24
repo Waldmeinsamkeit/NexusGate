@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from nexusgate.memory.schema import MemoryRecord, QueryFilters
 
 
 class StructuredMemoryRepository:
+    STALE_DAYS = {"L2": 30, "L3": 60, "L4": 7}
+
     def __init__(self, structured_memory_path: Path, *, compact_threshold: int = 2000) -> None:
         self.structured_memory_path = structured_memory_path
         self.compact_threshold = compact_threshold
@@ -61,6 +64,7 @@ class StructuredMemoryRepository:
         rows = self.load_latest_map().values()
         visible: list[MemoryRecord] = []
         allowed_scopes = set(filters.include_scopes or ["session", "project", "user", "global"])
+        now = datetime.now(timezone.utc)
         for row in rows:
             if filters.layers and row.layer not in filters.layers:
                 continue
@@ -74,8 +78,26 @@ class StructuredMemoryRepository:
                 continue
             if filters.exclude_archived and row.archived:
                 continue
+            if self._is_stale_unverified(row, now):
+                continue
             visible.append(row)
         return visible
+
+    def _is_stale_unverified(self, row: MemoryRecord, now: datetime) -> bool:
+        if row.verified:
+            return False
+        limit_days = int(self.STALE_DAYS.get(row.layer, 90))
+        if limit_days <= 0:
+            return False
+        ts_text = (row.updated_at or row.created_at or "").strip()
+        if not ts_text:
+            return False
+        try:
+            ts = datetime.fromisoformat(ts_text.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            return False
+        age_days = max((now - ts).days, 0)
+        return age_days > limit_days
 
     def lexical_query(self, query: str, filters: QueryFilters, *, limit: int = 20) -> list[MemoryRecord]:
         lowered = (query or "").lower().strip()

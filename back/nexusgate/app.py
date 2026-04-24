@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from collections import deque
@@ -20,6 +21,7 @@ from nexusgate.config import settings
 from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
+from nexusgate.memory.models import MemoryPack
 from nexusgate.memory.schema import QueryFilters
 from nexusgate.prompting.plan import build_standard_prompt_plan
 from nexusgate.prompting.preparer import prepare_prompt_for_provider
@@ -36,7 +38,9 @@ from nexusgate.schemas import ChatCompletionRequest, ChatMessage, NormalizedRequ
 L0_META_RULES = (
     "你是由 NexusGate-Core 增强的智能助手。"
     "始终基于 <nexus_context> 中的事实回答；"
-    "如果证据不足或上下文未提及，请明确回答“不知道”。"
+    '如果证据不足或上下文未提及，请明确回答"不知道"。'
+    "在回答之前，先默认检查每个关键断言是否有 <nexus_context> 中的对应证据。"
+    "对于数值、路径、端口、密钥等具体信息，必须逐字引用记忆内容，禁止推断。"
 )
 
 def create_app() -> FastAPI:
@@ -97,6 +101,7 @@ def create_app() -> FastAPI:
         total_memory_before_trim = 0
         total_memory_after_trim = 0
         total_final_input = 0
+        total_saved_prompt = 0
         rows = 0
         if solo_token_path.exists():
             try:
@@ -117,21 +122,25 @@ def create_app() -> FastAPI:
                         total_memory_before_trim += int(payload.get("memory_tokens_before_trim") or 0)
                         total_memory_after_trim += int(payload.get("memory_tokens_after_trim") or 0)
                         total_final_input += int(payload.get("final_input_tokens") or 0)
+                        total_saved_prompt += int(payload.get("saved_prompt_tokens") or 0)
                         rows += 1
             except Exception:
                 return
         total_saved = total_no_arch - total_with_arch
+        overall_saved_rate = round(float(total_saved) / float(max(total_no_arch, 1)) * 100.0, 1)
         summary = (
             f"rows={rows}\n"
             f"with_arch_total_tokens={total_with_arch}\n"
             f"no_arch_est_total_tokens={total_no_arch}\n"
             f"saved_total_tokens={total_saved}\n"
+            f"saved_rate={overall_saved_rate}%\n"
             f"raw_input_tokens_total={total_raw_input}\n"
             f"prepared_messages_tokens_total={total_prepared_input}\n"
             f"history_replaced_tokens_total={total_history_replaced}\n"
             f"memory_tokens_before_trim_total={total_memory_before_trim}\n"
             f"memory_tokens_after_trim_total={total_memory_after_trim}\n"
             f"final_input_tokens_total={total_final_input}\n"
+            f"saved_prompt_tokens_total={total_saved_prompt}\n"
         )
         try:
             sum_memory_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,17 +164,20 @@ def create_app() -> FastAPI:
 
         memory_before = int(render.get("estimated_tokens_before") or 0)
         memory_after = int(render.get("estimated_tokens_after") or 0)
-        no_arch_prompt_est = max(with_prompt - memory_after, 0)
-        no_arch_total_est = no_arch_prompt_est + with_completion
 
         raw_input_tokens = int(history.get("raw_input_tokens") or 0)
         prepared_messages_tokens = int(history.get("prepared_messages_tokens") or 0)
         history_replaced_tokens = int(history.get("history_replaced_tokens") or 0)
         mode = str(history.get("mode") or "unknown")
 
-        # Approximate baseline if full history were sent with current non-history overhead preserved.
-        non_history_overhead = max(with_prompt - prepared_messages_tokens, 0)
-        estimated_full_history_without_replacement = raw_input_tokens + non_history_overhead
+        # Correct baseline: without NexusGate, the client sends the raw
+        # uncompressed messages directly to the provider — no history
+        # rewrite, no memory injection, no system blocks.
+        no_arch_prompt_est = raw_input_tokens if raw_input_tokens > 0 else with_prompt
+        no_arch_total_est = no_arch_prompt_est + with_completion
+        saved_prompt = no_arch_prompt_est - with_prompt
+        saved_total = no_arch_total_est - with_total
+        saved_rate = round(float(saved_prompt) / float(max(no_arch_prompt_est, 1)), 4)
 
         return {
             "created_at": row.get("created_at"),
@@ -177,7 +189,9 @@ def create_app() -> FastAPI:
             "mode": mode,
             "with_arch_total_tokens": with_total,
             "no_arch_est_total_tokens": no_arch_total_est,
-            "delta_total_tokens": with_total - no_arch_total_est,
+            "delta_total_tokens": saved_total,
+            "saved_prompt_tokens": saved_prompt,
+            "saved_rate": saved_rate,
             "with_arch_prompt_tokens": with_prompt,
             "no_arch_est_prompt_tokens": no_arch_prompt_est,
             "memory_render_tokens_est": memory_after,
@@ -187,7 +201,6 @@ def create_app() -> FastAPI:
             "memory_tokens_before_trim": memory_before,
             "memory_tokens_after_trim": memory_after,
             "final_input_tokens": with_prompt,
-            "estimated_full_history_without_replacement": estimated_full_history_without_replacement,
             "budget_prompt_tokens": int(budget.get("prompt_budget_tokens") or 0),
             "budget_before_tokens": int(budget.get("before_tokens") or 0),
             "budget_after_tokens": int(budget.get("after_tokens") or 0),
@@ -237,11 +250,17 @@ def create_app() -> FastAPI:
         budget_diag = _budget_diagnostics_from_report(trace.get("budget") or {})
         estimated_before = int(render.get("estimated_tokens_before") or 0)
         estimated_after = int(render.get("estimated_tokens_after") or 0)
+        history = trace.get("history") or {}
+        raw_input_tokens = int(history.get("raw_input_tokens") or 0)
         prompt_tokens = int((usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0)
         completion_tokens = int((usage or {}).get("completion_tokens") or (usage or {}).get("output_tokens") or 0)
         total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens))
-        saved_estimated = max(estimated_before - estimated_after, 0)
-        saved_actual = max(estimated_before - prompt_tokens, 0) if prompt_tokens > 0 else 0
+        # Correct baseline: raw_input_tokens is what the client would send
+        # directly without NexusGate (no compression, no memory, no system blocks).
+        no_arch_baseline = raw_input_tokens if raw_input_tokens > 0 else estimated_before
+        actual_sent = prompt_tokens if prompt_tokens > 0 else estimated_after
+        saved_estimated = max(no_arch_baseline - actual_sent, 0)
+        saved_actual = max(raw_input_tokens - prompt_tokens, 0) if prompt_tokens > 0 and raw_input_tokens > 0 else 0
         row = {
             "request_id": request_id,
             "created_at": int(time.time()),
@@ -257,13 +276,14 @@ def create_app() -> FastAPI:
             "token_stats": {
                 "estimated_prompt_tokens": estimated_before,
                 "estimated_sent_tokens": estimated_after,
+                "raw_input_tokens": raw_input_tokens,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
                 "saved_tokens_estimated": saved_estimated,
                 "saved_tokens_actual": saved_actual,
-                "saved_rate_estimated": round(float(saved_estimated) / float(max(estimated_before, 1)), 4) if estimated_before else 0.0,
-                "saved_rate_actual": round(float(saved_actual) / float(max(estimated_before, 1)), 4) if estimated_before and prompt_tokens else 0.0,
+                "saved_rate_estimated": round(float(saved_estimated) / float(max(no_arch_baseline, 1)), 4) if no_arch_baseline else 0.0,
+                "saved_rate_actual": round(float(saved_actual) / float(max(raw_input_tokens, 1)), 4) if raw_input_tokens and prompt_tokens else 0.0,
                 "usage_source": "upstream_usage" if prompt_tokens else "estimate_only",
             },
             "budget_diagnostics": budget_diag,
@@ -801,6 +821,20 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="front directory not found")
         return RedirectResponse(url="/admin/ui/", status_code=307)
 
+    def _estimate_memory_budget_tokens_for_request(
+        *,
+        requested_model: str,
+        prepared_rows: list[dict[str, Any]],
+    ) -> int:
+        resolved = provider_router.registry.resolve(requested_model or "")
+        context_window = int(resolved.context_window) if resolved is not None else 32768
+        reserve_ratio = min(max(float(settings.context_budget_response_reserve_ratio or 0.3), 0.05), 0.9)
+        total_prompt_budget = int(context_window * (1.0 - reserve_ratio))
+        history_tokens = _estimate_token_count_from_messages(prepared_rows)
+        system_overhead_tokens = 200
+        remaining = max(total_prompt_budget - history_tokens - system_overhead_tokens, 0)
+        return remaining
+
     def _run_completion(
         req: ChatCompletionRequest,
         data: dict[str, Any],
@@ -822,8 +856,23 @@ def create_app() -> FastAPI:
                 "metadata": prepared_metadata,
             }
         )
-
-        memory_pack = memory.build_memory_pack(session_id, prepared_user_query)
+        needs_memory = _query_needs_memory(
+            user_text=prepared_user_query,
+            messages=prepared_rows,
+            metadata=prepared_req.metadata or {},
+        )
+        if needs_memory and memory.enabled:
+            memory_budget_tokens = _estimate_memory_budget_tokens_for_request(
+                requested_model=req.model or prepared_req.requested_model or settings.target_provider,
+                prepared_rows=prepared_rows,
+            )
+            memory_pack = memory.build_memory_pack(
+                session_id,
+                prepared_user_query,
+                memory_budget_tokens=memory_budget_tokens,
+            )
+        else:
+            memory_pack = _empty_memory_pack(task_type=str((prepared_req.metadata or {}).get("task_type") or "chat"))
         decision = route(
             normalized_req=prepared_req,
             defaults={
@@ -836,27 +885,38 @@ def create_app() -> FastAPI:
             risk_profile=memory_pack.risk_profile,
             router=provider_router,
         )
-        enriched_messages, memory_pack = memory.enrich_from_normalized_request(
-            normalized_req=prepared_req,
-            provider_style=str(decision.get("render_mode") or "openai"),
-            memory_pack=memory_pack,
-        )
-        memory_context = memory.render_memory_for_provider(
-            pack=memory_pack,
-            provider_style=str(decision.get("render_mode") or "openai"),
-        )
+        if needs_memory and memory.enabled:
+            enriched_messages, memory_pack = memory.enrich_from_normalized_request(
+                normalized_req=prepared_req,
+                provider_style=str(decision.get("render_mode") or "openai"),
+                memory_pack=memory_pack,
+            )
+            memory_context = memory.render_memory_for_provider(
+                pack=memory_pack,
+                provider_style=str(decision.get("render_mode") or "openai"),
+            )
+        else:
+            enriched_messages = _normalize_message_rows(prepared_req.messages)
+            memory_context = ""
         grounding_mode = str(decision.get("grounding_mode") or "balanced")
         grounding_policy = _derive_grounding_policy(
             risk_profile=memory_pack.risk_profile,
             pack_features=memory_pack.pack_features,
             metadata=prepared_req.metadata or {},
         )
-        grounding_rules = _build_grounding_system_rules(grounding_mode=grounding_mode, grounding_policy=grounding_policy)
+        grounding_rules = _build_grounding_system_rules(
+            grounding_mode=grounding_mode,
+            grounding_policy=grounding_policy,
+            verified_ratio=float((memory_pack.pack_features or {}).get("verified_ratio") or 0.0),
+        )
         evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
         citation_block = _build_citation_system_block(memory_pack.citations)
         sop_blocks = build_sop_system_blocks(
             user_text=prepared_user_query,
             metadata=prepared_req.metadata or {},
+            has_memory_content=bool(
+                (memory_pack.facts or memory_pack.procedures or memory_pack.continuity or memory_pack.constraints)
+            ),
         )
         prompt_plan = build_standard_prompt_plan(
             provider_style=str(decision.get("render_mode") or "openai"),
@@ -1060,6 +1120,46 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Upstream completion failed after fallbacks: {last_error}",
             ) from last_error
+        if not req.stream:
+            retry_payload = response.model_dump() if hasattr(response, "model_dump") else (response if isinstance(response, dict) else dict(response))
+            retry_text = _extract_openai_text(retry_payload)
+            strict_retry = str(grounding_policy or "") == "strict_citation"
+            retry_check = supported_claim_check(
+                answer_text=retry_text,
+                sources=[str(prepared_user_query or ""), str(memory_context or "")],
+                strict=strict_retry,
+            )
+            if str(retry_check.get("degrade_action") or "") == "retry_with_stricter_grounding":
+                unsupported = retry_check.get("unsupported_claims") or []
+                if unsupported:
+                    retry_feedback = (
+                        "以下声明缺乏证据支持，请基于已提供事实修正或删除：\n"
+                        + "\n".join(f"- {str(item)}" for item in unsupported[:8])
+                    )
+                    retry_messages = list(kwargs.get("messages") or [])
+                    retry_messages.append({"role": "user", "content": retry_feedback})
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["messages"] = retry_messages
+                    try:
+                        response = litellm.completion(**retry_kwargs)
+                        fallback_events.append(
+                            _fallback_event_row(
+                                attempt_index=-1,
+                                model=str(retry_kwargs.get("model") or ""),
+                                provider=str(decision.get("provider") or "openai"),
+                                failure_mode="grounding_retry",
+                                recovery_action="retry_with_stricter_grounding",
+                                same_provider_retry=True,
+                                rerender_only=False,
+                                switched_model=False,
+                                partial_accepted=False,
+                                retry_index=0,
+                                backoff_ms=0,
+                                error="grounding_retry_executed",
+                            )
+                        )
+                    except Exception:
+                        pass
 
         raw_messages = [message.model_dump(exclude_none=True) for message in prepared_req.messages]
         background_tasks.add_task(memory.distill_to_l4, session_id, raw_messages)
@@ -1186,7 +1286,23 @@ def create_app() -> FastAPI:
             passthrough_metadata = extract_metadata_from_responses_payload(prepared_payload)
             passthrough_metadata = {**passthrough_metadata, **prepared_metadata}
             passthrough_user_text = prepared_user_text or extract_user_text_from_responses_payload(prepared_payload)
-            memory_pack = memory.build_memory_pack(session_id, passthrough_user_text)
+            needs_memory = _query_needs_memory(
+                user_text=passthrough_user_text,
+                messages=prepared_rows,
+                metadata=passthrough_metadata,
+            )
+            if needs_memory and memory.enabled:
+                memory_budget_tokens = _estimate_memory_budget_tokens_for_request(
+                    requested_model=req.model or prepared_req.requested_model or settings.target_provider,
+                    prepared_rows=prepared_rows,
+                )
+                memory_pack = memory.build_memory_pack(
+                    session_id,
+                    passthrough_user_text,
+                    memory_budget_tokens=memory_budget_tokens,
+                )
+            else:
+                memory_pack = _empty_memory_pack(task_type=str((prepared_req.metadata or {}).get("task_type") or "chat"))
             decision = route(
                 normalized_req=prepared_req,
                 defaults={
@@ -1199,10 +1315,13 @@ def create_app() -> FastAPI:
                 risk_profile=memory_pack.risk_profile,
                 router=provider_router,
             )
-            memory_context = memory.render_memory_for_provider(
-                pack=memory_pack,
-                provider_style=str(decision.get("render_mode") or "openai"),
-            )
+            if needs_memory and memory.enabled:
+                memory_context = memory.render_memory_for_provider(
+                    pack=memory_pack,
+                    provider_style=str(decision.get("render_mode") or "openai"),
+                )
+            else:
+                memory_context = ""
             grounding_policy = _derive_grounding_policy(
                 risk_profile=memory_pack.risk_profile,
                 pack_features=memory_pack.pack_features,
@@ -1218,6 +1337,9 @@ def create_app() -> FastAPI:
             sop_blocks = build_sop_system_blocks(
                 user_text=passthrough_user_text,
                 metadata=passthrough_metadata,
+                has_memory_content=bool(
+                    (memory_pack.facts or memory_pack.procedures or memory_pack.continuity or memory_pack.constraints)
+                ),
             )
             prompt_plan = build_standard_prompt_plan(
                 provider_style=str(decision.get("render_mode") or "openai"),
@@ -1261,9 +1383,9 @@ def create_app() -> FastAPI:
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "total_tokens": 0,
-                        "saved_tokens_estimated": max(estimated_sent_tokens - (int(memory_pack.trim_report.get("estimated_tokens_after") or 0) if memory_pack.trim_report else estimated_sent_tokens), 0),
+                        "saved_tokens_estimated": max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0),
                         "saved_tokens_actual": 0,
-                        "saved_rate_estimated": 0.0,
+                        "saved_rate_estimated": round(float(max(int(history_stats.get("raw_input_tokens") or 0) - estimated_sent_tokens, 0)) / float(max(int(history_stats.get("raw_input_tokens") or 0), 1)), 4),
                         "saved_rate_actual": 0.0,
                         "usage_source": "passthrough_unknown",
                     },
@@ -1620,7 +1742,7 @@ def _truncate_message_content(content: Any, max_chars: int) -> Any:
 
 
 def _prepare_messages_for_inference(messages: list[Any], *, mode: str) -> tuple[list[dict[str, Any]], dict[str, int | str]]:
-    rows = _normalize_message_rows(messages)
+    rows = _compress_tool_results(_normalize_message_rows(messages))
     raw_tokens = _estimate_token_count_from_messages(rows)
     limits = _window_limits_for_mode(mode)
     remaining = {
@@ -1732,18 +1854,88 @@ def _estimate_token_count_from_messages(messages: list[dict[str, Any]]) -> int:
             return " ".join(parts)
         return str(value)
 
-    total_chars = 0
+    total_tokens = 0.0
     for message in messages:
+        text = _collect_text(message if isinstance(message, dict) else {"content": message})
+        cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+        non_cjk_chars = max(len(text) - cjk_chars, 0)
+        total_tokens += (cjk_chars * 1.5) + (non_cjk_chars / 4.0) + 4.0
         if not isinstance(message, dict):
-            total_chars += len(_collect_text(message))
             continue
-        total_chars += len(str(message.get("role", ""))) + 8
-        total_chars += len(_collect_text(message.get("content")))
         for extra_key in ("tool_calls", "function_call", "name"):
             if extra_key in message:
-                total_chars += len(_collect_text(message.get(extra_key)))
+                extra = _collect_text(message.get(extra_key))
+                cjk_extra = len(re.findall(r"[\u4e00-\u9fff]", extra))
+                non_cjk_extra = max(len(extra) - cjk_extra, 0)
+                total_tokens += (cjk_extra * 1.5) + (non_cjk_extra / 4.0)
 
-    return max(1, total_chars // 4)
+    return max(1, int(total_tokens))
+
+
+def _compress_tool_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compressed: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(rows):
+        row = rows[idx]
+        if str(row.get("role") or "").lower() != "tool":
+            compressed.append(row)
+            idx += 1
+            continue
+        group: list[dict[str, Any]] = []
+        while idx < len(rows) and str(rows[idx].get("role") or "").lower() == "tool":
+            group.append(rows[idx])
+            idx += 1
+        if len(group) == 1:
+            compressed.append(group[0])
+            continue
+        for item in group[:-1]:
+            patched = dict(item)
+            text = _content_to_text(patched.get("content"))
+            patched["content"] = f"{text[:80]}…" if len(text) > 80 else text
+            compressed.append(patched)
+        compressed.append(group[-1])
+    return compressed
+
+
+def _query_needs_memory(user_text: str, messages: list[Any], metadata: dict[str, Any]) -> bool:
+    if bool((metadata or {}).get("skip_memory")):
+        return False
+    if bool((metadata or {}).get("force_memory")):
+        return True
+    lowered = (user_text or "").strip().lower()
+    continuation_terms = ("continue", "resume", "recall", "previous", "last session", "继续", "接着", "上次", "之前", "回忆")
+    if any(term in lowered for term in continuation_terms):
+        return True
+    rows = _normalize_message_rows(messages)
+    user_turns = sum(1 for row in rows if str(row.get("role") or "").lower() == "user")
+    has_tool = any(str(row.get("role") or "").lower() == "tool" for row in rows)
+    if len((user_text or "").strip()) < 15 and len(rows) <= 2 and user_turns <= 1 and not has_tool:
+        return False
+    return True
+
+
+def _empty_memory_pack(task_type: str = "chat") -> MemoryPack:
+    return MemoryPack(
+        task_type=task_type or "chat",
+        budget={},
+        l0="",
+        l1="",
+        l2="",
+        l3="",
+        l4="",
+        citations=[],
+        selected_ids=[],
+        facts=[],
+        procedures=[],
+        continuity=[],
+        constraints=[],
+        risk_profile={},
+        pack_features={},
+        estimated_tokens=0,
+        trim_report={},
+        retrieval_trace={},
+        assembly_trace={},
+    )
 
 
 def _system_drop_rank(content: str) -> int:
@@ -2004,20 +2196,35 @@ def _derive_grounding_policy(
     return "conservative_no_claim_extension"
 
 
-def _build_grounding_system_rules(grounding_mode: str, grounding_policy: str) -> str:
+def _build_grounding_system_rules(
+    grounding_mode: str,
+    grounding_policy: str,
+    *,
+    verified_ratio: float = 0.0,
+) -> str:
     policy_line = f"Grounding policy: {grounding_policy}."
+    if verified_ratio > 0.9 and grounding_mode != "strict":
+        return f"{policy_line} Memory is high-confidence; cite directly, mark any inference."
     if grounding_mode == "strict":
         return (
-            f"{policy_line} Grounding mode: strict. Use only user input and cited memory facts. "
-            "If evidence is missing, say you do not know. Do not invent ports, paths, keys, or config values."
+            f"{policy_line} Grounding mode: strict.\n"
+            "MUST: Only state facts that appear verbatim in <nexus_context> or user input.\n"
+            "MUST: For ports, paths, keys, URLs, versions—quote the exact value from evidence.\n"
+            "MUST: If no evidence exists, reply \"I don't have that information\" instead of guessing.\n"
+            "NEVER: Infer numeric values, file paths, or config keys from partial context."
         )
     if grounding_mode == "relaxed":
         return (
-            f"{policy_line} Grounding mode: relaxed. Prefer cited memory, but reasonable inference is allowed "
-            "when uncertainty is explicit."
+            f"{policy_line} Grounding mode: relaxed.\n"
+            "PREFER: Use cited memory as primary source.\n"
+            "ALLOWED: Reasonable inference when explicitly marked with \"可能\" or \"I believe\".\n"
+            "NEVER: Present inferred values as confirmed facts."
         )
     return (
-        f"{policy_line} Grounding mode: balanced. Prefer cited memory and clearly mark uncertainty when evidence is weak."
+        f"{policy_line} Grounding mode: balanced.\n"
+        "MUST: Use <nexus_context> evidence as primary source for factual claims.\n"
+        "MUST: Prefix uncertain statements with \"据现有信息\" or \"Based on available evidence\".\n"
+        "NEVER: Fabricate specific values (ports, paths, keys) not found in evidence."
     )
 
 
@@ -2027,23 +2234,23 @@ def _build_evidence_policy_blocks(pack: Any) -> dict[str, str]:
     continuity = [str(item).strip() for item in (getattr(pack, "continuity", []) or []) if str(item).strip()]
     constraints = [str(item).strip() for item in (getattr(pack, "constraints", []) or []) if str(item).strip()]
 
-    def block(title: str, rows: list[str], fallback: str) -> str:
+    def block(title: str, rows: list[str]) -> str:
         if not rows:
-            return f"{title}: {fallback}"
+            return ""
         joined = "\n".join(f"- {row}" for row in rows[:8])
         return f"{title}:\n{joined}"
 
     return {
-        "facts": block("Citation-backed facts (safe for direct factual claims)", facts, "none"),
-        "procedures": block("Non-cited procedures (use conservatively, do not over-assert as fact)", procedures, "none"),
-        "continuity": block("Session continuity context (context only, not factual authority)", continuity, "none"),
-        "constraints": block("Hard constraints (must follow)", constraints, "none"),
+        "facts": block("VERIFIED FACTS [cite directly]", facts),
+        "procedures": block("PROCEDURES [use conservatively, not factual authority]", procedures),
+        "continuity": block("SESSION CONTEXT [reference only, do not assert as fact]", continuity),
+        "constraints": block("HARD CONSTRAINTS [must follow]", constraints),
     }
 
 
 def _build_citation_system_block(citations: list[dict[str, Any]]) -> str:
     if not citations:
-        return "Citation refs: none"
+        return ""
     rows = []
     for row in citations[:6]:
         ref = str(row.get("memory_ref") or "memory")

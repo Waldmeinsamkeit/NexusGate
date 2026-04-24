@@ -57,12 +57,27 @@ def build_default_system_blocks(
             if str(block or "").strip()
         ],
         {"category": "grounding_policy", "content": grounding_rules, "source": "grounding", "priority": 20, "singleton": True},
-        {"category": "memory_constraints", "content": str(evidence_blocks.get("constraints") or ""), "source": "memory_evidence", "priority": 30},
-        {"category": "memory_facts", "content": str(evidence_blocks.get("facts") or ""), "source": "memory_evidence", "priority": 31},
-        {"category": "memory_procedures", "content": str(evidence_blocks.get("procedures") or ""), "source": "memory_evidence", "priority": 32},
-        {"category": "memory_continuity", "content": str(evidence_blocks.get("continuity") or ""), "source": "memory_evidence", "priority": 33},
-        {"category": "citation_refs", "content": citation_block, "source": "citations", "priority": 40},
     ]
+    evidence_entries = [
+        ("memory_constraints", "constraints", 30),
+        ("memory_facts", "facts", 31),
+        ("memory_procedures", "procedures", 32),
+        ("memory_continuity", "continuity", 33),
+    ]
+    for category, key, priority in evidence_entries:
+        content = str(evidence_blocks.get(key) or "").strip()
+        if content:
+            blocks.append({"category": category, "content": content, "source": "memory_evidence", "priority": priority})
+    citation_text = str(citation_block or "").strip()
+    if citation_text:
+        blocks.append(
+            {
+                "category": "citation_refs",
+                "content": citation_text,
+                "source": "citations",
+                "priority": 40,
+            }
+        )
     memory_text = str(memory_context or "").strip()
     if memory_text:
         blocks.append(

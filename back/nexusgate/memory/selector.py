@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from nexusgate.memory.models import LayerBudgets, MemoryContext, ScoredMemory
 from nexusgate.memory.scoring import dedupe_items
 from nexusgate.memory.policies import (
@@ -27,8 +29,28 @@ class MemorySelector:
             return "retrieval-only"
         return "chat"
 
-    def budget_for_task(self, task_type: str) -> dict[str, int]:
-        return policy_budget_for_task(task_type, self.budgets)
+    def budget_for_task(self, task_type: str, max_total_chars: int | None = None) -> dict[str, int]:
+        base = policy_budget_for_task(task_type, self.budgets)
+        if not max_total_chars or max_total_chars <= 0:
+            return base
+        base_total = sum(int(v) for v in base.values())
+        if base_total <= 0:
+            return base
+        cap = max(int(max_total_chars), 1)
+        if cap >= base_total:
+            return base
+        scaled: dict[str, int] = {}
+        for key, value in base.items():
+            proportion = float(int(value)) / float(base_total)
+            scaled[key] = max(int(cap * proportion), 1) if int(value) > 0 else 0
+        # Correct rounding drift.
+        drift = cap - sum(scaled.values())
+        if drift != 0:
+            for key in ("L2", "L3", "L1", "L4"):
+                if key in scaled and scaled[key] > 0:
+                    scaled[key] = max(scaled[key] + drift, 1)
+                    break
+        return scaled
 
     def select(
         self,
@@ -64,11 +86,15 @@ class MemorySelector:
         items_by_layer: dict[str, list[ScoredMemory]],
         budget: dict[str, int],
     ) -> dict[str, list[ScoredMemory]]:
-        return {
+        selected = {
             "L1": self.select_layer_items(items_by_layer.get("L1", []), budget.get("L1", 0)),
             "L2": self.select_layer_items(items_by_layer.get("L2", []), budget.get("L2", 0)),
             "L3": self.select_layer_items(items_by_layer.get("L3", []), budget.get("L3", 0)),
             "L4": self.select_layer_items(items_by_layer.get("L4", []), budget.get("L4", 0)),
+        }
+        return {
+            layer: self.resolve_conflicts(rows)
+            for layer, rows in selected.items()
         }
 
     @staticmethod
@@ -91,8 +117,57 @@ class MemorySelector:
     def render_items(items: list[ScoredMemory], budget: int) -> str:
         if not items or budget <= 0:
             return "(empty)"
-        rows = [item.text.strip() for item in items if item.text.strip()]
+        rows: list[str] = []
+        for item in items:
+            text = item.text.strip()
+            if not text:
+                continue
+            if (not item.verified) or float(item.confidence or 0.0) < 0.6:
+                text = f"[unverified] {text}"
+            rows.append(text)
         return "\n".join(rows) if rows else "(empty)"
+
+    def resolve_conflicts(self, items: list[ScoredMemory]) -> list[ScoredMemory]:
+        if len(items) <= 1:
+            return items
+        latest_by_subject: dict[str, ScoredMemory] = {}
+        passthrough: list[ScoredMemory] = []
+        for item in items:
+            subject_value = self._subject_value(item.text)
+            if subject_value is None:
+                passthrough.append(item)
+                continue
+            subject, _ = subject_value
+            existing = latest_by_subject.get(subject)
+            if existing is None:
+                latest_by_subject[subject] = item
+                continue
+            latest_by_subject[subject] = self._pick_better(existing, item)
+        resolved = [*latest_by_subject.values(), *passthrough]
+        return sorted(resolved, key=lambda row: (row.score, row.verified, row.confidence, row.recency), reverse=True)
+
+    @staticmethod
+    def _pick_better(a: ScoredMemory, b: ScoredMemory) -> ScoredMemory:
+        rank_a = (a.verified, float(a.confidence or 0.0), a.recency, a.score)
+        rank_b = (b.verified, float(b.confidence or 0.0), b.recency, b.score)
+        return a if rank_a >= rank_b else b
+
+    @staticmethod
+    def _subject_value(text: str) -> tuple[str, str] | None:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return None
+        match = re.search(
+            r"([a-z_][a-z0-9_\-./]{1,40}|[\u4e00-\u9fff]{2,8})\s*(?:[:=]|是|为)\s*([a-z0-9_./:\-]{1,80}|\d+)",
+            lowered,
+        )
+        if not match:
+            return None
+        subject = (match.group(1) or "").strip()
+        value = (match.group(2) or "").strip()
+        if not subject or not value:
+            return None
+        return subject, value
 
     def dedupe_items(self, items: list[ScoredMemory]) -> list[ScoredMemory]:
         return dedupe_items(items)

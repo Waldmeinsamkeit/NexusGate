@@ -452,6 +452,7 @@ class MemoryManager:
                     evidence=row.evidence,
                     source=row.source,
                     verified=row.verified,
+                    confidence=row.confidence,
                     score=row.score,
                     recency=row.recency,
                     scope=row.scope,
@@ -564,7 +565,14 @@ class MemoryManager:
             "l4": l4,
         }
 
-    def build_memory_pack(self, session_id: str, query: str, project_id: str = "") -> MemoryPack:
+    def build_memory_pack(
+        self,
+        session_id: str,
+        query: str,
+        project_id: str = "",
+        *,
+        memory_budget_tokens: int | None = None,
+    ) -> MemoryPack:
         task_type = self.selector.classify_task(query)
         include_l4 = task_type in {"debug", "planning"} or self._contains_continuity_terms(query)
         scored_by_layer, dropped, stats = self._query_scored_layers(
@@ -575,7 +583,11 @@ class MemoryManager:
             include_l4=include_l4,
         )
         compressed = self._semantic_compress(scored_by_layer)
-        selected_by_layer = compressed
+        max_total_chars = None
+        if memory_budget_tokens is not None and int(memory_budget_tokens) > 0:
+            max_total_chars = int(memory_budget_tokens) * 4
+        effective_budget = self.selector.budget_for_task(task_type, max_total_chars=max_total_chars)
+        selected_by_layer = self.selector.select_items_by_layer(compressed, effective_budget)
         l0_text = "\n".join(self.l0_rules.splitlines()[:12]).strip()
         selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in selected_by_layer.get(layer, [])]
         citations = self._ensure_citations(self._build_pack_citations_from_scored(items=selected_items), query)
@@ -607,7 +619,7 @@ class MemoryManager:
         )
         return MemoryPack(
             task_type=task_type,
-            budget=self.selector.budget_for_task(task_type),
+            budget=effective_budget,
             l0=l0_text,
             l1=legacy_layers["l1"],
             l2=legacy_layers["l2"],
@@ -627,6 +639,8 @@ class MemoryManager:
                 "kept_candidates": stats["kept_candidates"],
                 "dropped_candidates": stats["dropped_candidates"],
                 "dropped_reasons": [row.reason for row in dropped[:12]],
+                "memory_budget_tokens": int(memory_budget_tokens or 0),
+                "memory_budget_chars": int(max_total_chars or 0),
             },
             assembly_trace={
                 "facts_count": len(compressed.get("L2", [])),
