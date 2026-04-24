@@ -21,6 +21,11 @@ from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.memory.schema import QueryFilters
+from nexusgate.prompting.system_blocks import (
+    build_system_blocks,
+    dedupe_and_merge_system_blocks,
+    render_system_blocks_for_provider,
+)
 from nexusgate.prompt_policies import (
     build_sop_system_blocks,
     extract_metadata_from_responses_payload,
@@ -838,18 +843,26 @@ def create_app() -> FastAPI:
             user_text=prepared_user_query,
             metadata=prepared_req.metadata or {},
         )
-        sop_messages = [{"role": "system", "content": block} for block in sop_blocks]
-        enhanced_messages = [
-            {"role": "system", "content": L0_META_RULES},
-            *sop_messages,
-            {"role": "system", "content": grounding_rules},
-            {"role": "system", "content": evidence_blocks["facts"]},
-            {"role": "system", "content": evidence_blocks["constraints"]},
-            {"role": "system", "content": evidence_blocks["procedures"]},
-            {"role": "system", "content": evidence_blocks["continuity"]},
-            {"role": "system", "content": citation_block},
-            *enriched_messages,
+        raw_system_blocks: list[dict[str, Any]] = [
+            {"category": "meta_rules", "content": L0_META_RULES, "source": "l0", "priority": 5, "singleton": True},
+            *[
+                {"category": "sop", "content": block, "source": "sop", "priority": 10}
+                for block in sop_blocks
+            ],
+            {"category": "grounding_policy", "content": grounding_rules, "source": "grounding", "priority": 20, "singleton": True},
+            {"category": "memory_constraints", "content": evidence_blocks["constraints"], "source": "memory_evidence", "priority": 30},
+            {"category": "memory_facts", "content": evidence_blocks["facts"], "source": "memory_evidence", "priority": 31},
+            {"category": "memory_procedures", "content": evidence_blocks["procedures"], "source": "memory_evidence", "priority": 32},
+            {"category": "memory_continuity", "content": evidence_blocks["continuity"], "source": "memory_evidence", "priority": 33},
+            {"category": "citation_refs", "content": citation_block, "source": "citations", "priority": 40},
         ]
+        merged_system_blocks = dedupe_and_merge_system_blocks(build_system_blocks(raw_system_blocks))
+        rendered_system_blocks = render_system_blocks_for_provider(
+            merged_system_blocks,
+            provider_style=str(decision.get("render_mode") or "openai"),
+        )
+        system_messages = [{"role": "system", "content": block} for block in rendered_system_blocks]
+        enhanced_messages = [*system_messages, *enriched_messages]
         enhanced_messages, budget_report = _apply_total_context_budget(
             enhanced_messages,
             context_budget_tokens=decision.get("context_budget"),

@@ -833,27 +833,32 @@ class MemoryManager:
         return kept, report
 
     @staticmethod
-    def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
+    def build_memory_system_blocks(pack: MemoryPack, provider_style: str = "openai") -> list[dict[str, str]]:
         max_chars = MemoryManager._provider_char_budget(provider_style)
         render_blocks = MemoryManager._build_render_blocks(pack)
         kept_blocks, report = MemoryManager._apply_provider_trim(blocks=render_blocks, max_chars=max_chars)
         pack.trim_report = report
         sections = MemoryManager._render_sections_from_blocks(kept_blocks)
         if provider_style == "anthropic_messages":
-            return (
-                f"{pack.l0}\n\n"
-                f"<anthropic_memory_index>\n{sections['constraints']}\n</anthropic_memory_index>\n\n"
-                f"<anthropic_relevant_skills>\n{sections['procedures']}\n</anthropic_relevant_skills>\n\n"
-                f"<anthropic_session_recall_hints>\n{sections['continuity']}\n</anthropic_session_recall_hints>\n\n"
-                f"<anthropic_relevant_memory>\n{sections['facts']}\n</anthropic_relevant_memory>"
-            )
-        return (
-            f"{pack.l0}\n\n"
-            f"<memory_index>\n{sections['constraints']}\n</memory_index>\n\n"
-            f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>\n\n"
-            f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>\n\n"
-            f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"
-        )
+            return [
+                {"category": "memory_l0", "content": pack.l0},
+                {"category": "memory_constraints", "content": f"<anthropic_memory_index>\n{sections['constraints']}\n</anthropic_memory_index>"},
+                {"category": "memory_procedures", "content": f"<anthropic_relevant_skills>\n{sections['procedures']}\n</anthropic_relevant_skills>"},
+                {"category": "memory_continuity", "content": f"<anthropic_session_recall_hints>\n{sections['continuity']}\n</anthropic_session_recall_hints>"},
+                {"category": "memory_facts", "content": f"<anthropic_relevant_memory>\n{sections['facts']}\n</anthropic_relevant_memory>"},
+            ]
+        return [
+            {"category": "memory_l0", "content": pack.l0},
+            {"category": "memory_constraints", "content": f"<memory_index>\n{sections['constraints']}\n</memory_index>"},
+            {"category": "memory_procedures", "content": f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>"},
+            {"category": "memory_continuity", "content": f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>"},
+            {"category": "memory_facts", "content": f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"},
+        ]
+
+    @staticmethod
+    def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
+        rows = MemoryManager.build_memory_system_blocks(pack=pack, provider_style=provider_style)
+        return "\n\n".join(str(row.get("content") or "").strip() for row in rows if str(row.get("content") or "").strip())
 
     def build_memory_header(self, session_id: str, query: str) -> str:
         return self.render_memory_for_provider(pack=self.build_memory_pack(session_id=session_id, query=query), provider_style="openai")

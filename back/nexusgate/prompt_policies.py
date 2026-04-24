@@ -5,6 +5,11 @@ import json
 from typing import Any
 
 from nexusgate.config import settings
+from nexusgate.prompting.system_blocks import (
+    build_system_blocks,
+    dedupe_and_merge_system_blocks,
+    render_system_blocks_for_provider,
+)
 
 
 _RECALL_KEYWORDS = (
@@ -122,9 +127,28 @@ def build_responses_system_blocks(
 ) -> list[str]:
     blocks = build_sop_system_blocks(user_text=user_text, metadata=metadata)
     memory_text = str(memory_context or "").strip()
+    raw_blocks: list[dict[str, Any]] = [
+        {
+            "category": "sop",
+            "content": block,
+            "source": "sop",
+            "priority": 20,
+        }
+        for block in blocks
+        if str(block or "").strip()
+    ]
     if memory_text:
-        blocks.append(memory_text)
-    return [block for block in blocks if str(block or "").strip()]
+        raw_blocks.append(
+            {
+                "category": "memory_context",
+                "content": memory_text,
+                "source": "memory",
+                "priority": 30,
+                "singleton": True,
+            }
+        )
+    merged = dedupe_and_merge_system_blocks(build_system_blocks(raw_blocks))
+    return render_system_blocks_for_provider(merged, provider_style="openai")
 
 
 
