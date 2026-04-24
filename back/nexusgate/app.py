@@ -22,7 +22,7 @@ from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.memory.models import MemoryPack
-from nexusgate.memory.schema import QueryFilters
+from nexusgate.memory.schema import MemoryRecord, QueryFilters
 from nexusgate.prompting.plan import build_standard_prompt_plan
 from nexusgate.prompting.preparer import prepare_prompt_for_provider
 from nexusgate.prompt_policies import (
@@ -693,6 +693,109 @@ def create_app() -> FastAPI:
             "missing_ids": missing_ids,
         }
 
+    @app.post("/admin/memories")
+    async def admin_memory_create(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        payload = await request.json()
+        now = datetime.now(timezone.utc).isoformat()
+
+        raw_tags = payload.get("tags")
+        tags: list[str] = []
+        if isinstance(raw_tags, list):
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        elif isinstance(raw_tags, str):
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+
+        layer = str(payload.get("layer") or "L2").strip()
+
+        # L1+L2 paired creation: l1_index (pointer) + content (L2 fact)
+        if layer == "L1L2":
+            l1_index = str(payload.get("l1_index") or "").strip()
+            content = str(payload.get("content") or "").strip()
+            if not l1_index:
+                raise HTTPException(status_code=400, detail="l1_index is required for L1L2 mode")
+            if not content:
+                raise HTTPException(status_code=400, detail="content is required for L1L2 mode")
+            l2_id = f"mem_{uuid4().hex[:12]}"
+            # Ensure L1 pointer contains "->" (required by L1Layer.accepts)
+            if "->" not in l1_index:
+                l1_index = f"{l1_index} -> {l2_id}"
+            l1_record = MemoryRecord(
+                memory_id=f"mem_{uuid4().hex[:12]}",
+                layer="L1",
+                memory_type="index_pointer",
+                scope=str(payload.get("scope") or "global"),
+                content=l1_index[:96],
+                summary="",
+                verified=True,
+                confidence=0.9,
+                tags=tags,
+                source="admin:create",
+                created_at=now,
+                updated_at=now,
+            )
+            l2_record = MemoryRecord(
+                memory_id=l2_id,
+                layer="L2",
+                memory_type="stable_fact",
+                scope=str(payload.get("scope") or "global"),
+                content=content,
+                summary=str(payload.get("summary") or ""),
+                verified=bool(payload.get("verified", True)),
+                confidence=float(payload.get("confidence") or 0.8),
+                tags=tags,
+                source="admin:create",
+                created_at=now,
+                updated_at=now,
+            )
+            memory.repository.upsert(l1_record)
+            memory.repository.upsert(l2_record)
+            try:
+                memory.index.upsert([l1_record, l2_record])
+            except Exception:
+                pass
+            return {
+                "status": "ok",
+                "items": [l1_record.to_dict(), l2_record.to_dict()],
+            }
+
+        # Single layer creation
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+        if layer not in ("L1", "L2", "L3", "L4"):
+            raise HTTPException(status_code=400, detail="layer must be L1, L2, L3, L4, or L1L2")
+        record = MemoryRecord(
+            memory_id=f"mem_{uuid4().hex[:12]}",
+            layer=layer,
+            memory_type=str(payload.get("memory_type") or "stable_fact"),
+            scope=str(payload.get("scope") or "global"),
+            content=content,
+            summary=str(payload.get("summary") or ""),
+            verified=bool(payload.get("verified")),
+            confidence=float(payload.get("confidence") or 0.5),
+            tags=tags,
+            source="admin:create",
+            created_at=now,
+            updated_at=now,
+        )
+        memory.repository.upsert(record)
+        try:
+            memory.index.upsert([record])
+        except Exception:
+            pass
+        return {"status": "ok", "item": record.to_dict()}
+
     @app.get("/admin/memories/{memory_id}")
     async def admin_memory_detail(
         memory_id: str,
@@ -768,6 +871,10 @@ def create_app() -> FastAPI:
                 updated.tags = [str(item).strip() for item in raw_tags if str(item).strip()]
             elif isinstance(raw_tags, str):
                 updated.tags = [item.strip() for item in raw_tags.split(",") if item.strip()]
+        if "layer" in payload:
+            new_layer = str(payload.get("layer") or "").strip()
+            if new_layer in ("L1", "L2", "L3", "L4"):
+                updated.layer = new_layer
         if "archived" in payload:
             updated.archived = bool(payload.get("archived"))
         updated.updated_at = now

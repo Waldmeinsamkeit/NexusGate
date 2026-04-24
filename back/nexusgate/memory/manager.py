@@ -90,6 +90,7 @@ class MemoryManager:
         self.event_logger = event_logger or MemoryEventLogger(self.candidate_events_path)
         self.skill_manifest = self._load_skill_manifest()
         self._index_l3_skills()
+        self._sync_txt_to_jsonl()
 
     @property
     def backend_status(self) -> MemoryBackendStatus:
@@ -225,6 +226,139 @@ class MemoryManager:
         self.repository.upsert_many(records)
         if records:
             self.index.upsert(records)
+
+    def _sync_txt_to_jsonl(self) -> None:
+        """Parse L1/L2 txt files and upsert into structured_memory.jsonl so the admin API can serve them."""
+        existing_map = self.repository.load_latest_map()
+        # Archive stale txt_sync records so fresh parse replaces them
+        stale_ids: list[str] = []
+        for mid, rec in existing_map.items():
+            if rec.source and rec.source.startswith("txt_sync:"):
+                stale_ids.append(mid)
+        existing_ids = set(existing_map.keys()) - set(stale_ids)
+        now = datetime.now(timezone.utc).isoformat()
+        # Mark old txt_sync entries as archived
+        if stale_ids:
+            archive_records: list[MemoryRecord] = []
+            for sid in stale_ids:
+                old = existing_map[sid]
+                old.archived = True
+                old.updated_at = now
+                archive_records.append(old)
+            self.repository.upsert_many(archive_records)
+        records: list[MemoryRecord] = []
+
+        # ── L2: global_mem.txt (one record per ## section) ──
+        # Parse sections first so L1 can reference them
+        try:
+            l2_raw = self.l2_path.read_text(encoding="utf-8")
+        except Exception:
+            l2_raw = ""
+        l2_sections: list[tuple[str, list[str]]] = []
+        current_section = ""
+        current_lines: list[str] = []
+        section_header_re = re.compile(r"^##\s*\[(.+?)\]\s*$")
+        for line in l2_raw.splitlines():
+            stripped = line.strip()
+            m = section_header_re.match(stripped)
+            if m:
+                if current_section and current_lines:
+                    l2_sections.append((current_section, current_lines))
+                current_section = m.group(1).strip()
+                current_lines = []
+                continue
+            if stripped.startswith("#") or not stripped:
+                continue
+            current_lines.append(stripped)
+        if current_section and current_lines:
+            l2_sections.append((current_section, current_lines))
+
+        # Build L2 section name → memory_id map for cross-referencing
+        l2_section_ids: dict[str, str] = {}
+        for section_name, lines in l2_sections:
+            mid = hashlib.sha1(f"txt:L2:{section_name}".encode("utf-8")).hexdigest()
+            l2_section_ids[section_name] = mid
+
+        # ── L1: global_mem_insight.txt ──
+        l1_ref_re = re.compile(r"L2\.\[(.+?)\]")
+        try:
+            l1_raw = self.l1_path.read_text(encoding="utf-8")
+        except Exception:
+            l1_raw = ""
+        for line in l1_raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            mid = hashlib.sha1(f"txt:L1:{line}".encode("utf-8")).hexdigest()
+            if mid in existing_ids:
+                continue
+            # Extract L1 key name (before ->) and linked L2 sections
+            l1_key = line.split("->")[0].strip() if "->" in line else line[:32]
+            linked_l2 = l1_ref_re.findall(line)
+            tags = [f"L1:{l1_key}"]
+            for ref in linked_l2:
+                tags.append(f"→L2:{ref}")
+            evidence_ref = ",".join(f"L2:{r}" for r in linked_l2) if linked_l2 else ""
+            records.append(MemoryRecord(
+                memory_id=mid,
+                layer="L1",
+                memory_type=MemoryType.INDEX_POINTER,
+                scope=MemoryScope.GLOBAL,
+                content=line[:96],
+                summary=l1_key,
+                evidence_ref=evidence_ref,
+                verified=True,
+                confidence=0.9,
+                dedupe_key=self._default_dedupe_key(line),
+                tags=tags,
+                source="txt_sync:l1",
+                created_at=now,
+                updated_at=now,
+            ))
+
+        # ── Create L2 records with back-reference tags to L1 ──
+        # Build reverse map: L2 section → list of L1 keys that point to it
+        l1_to_l2_map: dict[str, list[str]] = {}
+        for line in l1_raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "->" not in line:
+                continue
+            l1_key = line.split("->")[0].strip()
+            for ref in l1_ref_re.findall(line):
+                l1_to_l2_map.setdefault(ref, []).append(l1_key)
+
+        for section_name, lines in l2_sections:
+            content = "\n".join(lines)
+            if not content.strip():
+                continue
+            mid = l2_section_ids[section_name]
+            if mid in existing_ids:
+                continue
+            tags = [f"L2:{section_name}"]
+            for l1_key in l1_to_l2_map.get(section_name, []):
+                tags.append(f"←L1:{l1_key}")
+            records.append(MemoryRecord(
+                memory_id=mid,
+                layer="L2",
+                memory_type=MemoryType.STABLE_FACT,
+                scope=MemoryScope.GLOBAL,
+                content=content,
+                summary=section_name,
+                verified=True,
+                confidence=0.8,
+                dedupe_key=self._default_dedupe_key(section_name),
+                tags=tags,
+                source="txt_sync:l2",
+                created_at=now,
+                updated_at=now,
+            ))
+
+        if records:
+            self.repository.upsert_many(records)
+            try:
+                self.index.upsert(records)
+            except Exception:
+                pass
 
     def _build_skill_payload(self, entry: dict[str, Any]) -> str:
         raw = self._load_skill_raw(entry).strip()

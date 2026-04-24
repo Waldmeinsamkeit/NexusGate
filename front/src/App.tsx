@@ -3,33 +3,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { Dashboard } from './components/Dashboard';
-import { UpstreamConfigView } from './components/UpstreamConfig';
 import { MemoryCenter } from './components/MemoryCenter';
-import { RequestTracing } from './components/RequestTracing';
-import { SafetyGrounding } from './components/SafetyGrounding';
-import { ClientAccess } from './components/ClientAccess';
-import { MemoryPackPreview } from './components/MemoryPackPreview';
 import { Settings } from './components/Settings';
-import { MemoryExtraction } from './components/MemoryExtraction';
+import { ProviderManager } from './components/ProviderManager';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [configVersion, setConfigVersion] = useState(0);
+  const onConfigChanged = useCallback(() => setConfigVersion(v => v + 1), []);
 
   const renderContent = () => {
     switch (activeTab) {
       case 'dashboard': return <Dashboard />;
-      case 'config': return <UpstreamConfigView />;
       case 'memory': return <MemoryCenter />;
-      case 'traces': return <RequestTracing />;
-      case 'extraction': return <MemoryExtraction />;
-      case 'pack': return <MemoryPackPreview />;
-      case 'safety': return <SafetyGrounding />;
-      case 'client': return <ClientAccess />;
-      case 'settings': return <Settings />;
+      case 'settings': return <Settings onConfigChanged={onConfigChanged} />;
+      case 'providers': return <ProviderManager configVersion={configVersion} onConfigChanged={onConfigChanged} />;
       default: return <Dashboard />;
     }
   };
