@@ -90,6 +90,7 @@ class MemoryManager:
         self.event_logger = event_logger or MemoryEventLogger(self.candidate_events_path)
         self.skill_manifest = self._load_skill_manifest()
         self._index_l3_skills()
+        self._sync_txt_to_jsonl()
 
     @property
     def backend_status(self) -> MemoryBackendStatus:
@@ -225,6 +226,139 @@ class MemoryManager:
         self.repository.upsert_many(records)
         if records:
             self.index.upsert(records)
+
+    def _sync_txt_to_jsonl(self) -> None:
+        """Parse L1/L2 txt files and upsert into structured_memory.jsonl so the admin API can serve them."""
+        existing_map = self.repository.load_latest_map()
+        # Archive stale txt_sync records so fresh parse replaces them
+        stale_ids: list[str] = []
+        for mid, rec in existing_map.items():
+            if rec.source and rec.source.startswith("txt_sync:"):
+                stale_ids.append(mid)
+        existing_ids = set(existing_map.keys()) - set(stale_ids)
+        now = datetime.now(timezone.utc).isoformat()
+        # Mark old txt_sync entries as archived
+        if stale_ids:
+            archive_records: list[MemoryRecord] = []
+            for sid in stale_ids:
+                old = existing_map[sid]
+                old.archived = True
+                old.updated_at = now
+                archive_records.append(old)
+            self.repository.upsert_many(archive_records)
+        records: list[MemoryRecord] = []
+
+        # ── L2: global_mem.txt (one record per ## section) ──
+        # Parse sections first so L1 can reference them
+        try:
+            l2_raw = self.l2_path.read_text(encoding="utf-8")
+        except Exception:
+            l2_raw = ""
+        l2_sections: list[tuple[str, list[str]]] = []
+        current_section = ""
+        current_lines: list[str] = []
+        section_header_re = re.compile(r"^##\s*\[(.+?)\]\s*$")
+        for line in l2_raw.splitlines():
+            stripped = line.strip()
+            m = section_header_re.match(stripped)
+            if m:
+                if current_section and current_lines:
+                    l2_sections.append((current_section, current_lines))
+                current_section = m.group(1).strip()
+                current_lines = []
+                continue
+            if stripped.startswith("#") or not stripped:
+                continue
+            current_lines.append(stripped)
+        if current_section and current_lines:
+            l2_sections.append((current_section, current_lines))
+
+        # Build L2 section name → memory_id map for cross-referencing
+        l2_section_ids: dict[str, str] = {}
+        for section_name, lines in l2_sections:
+            mid = hashlib.sha1(f"txt:L2:{section_name}".encode("utf-8")).hexdigest()
+            l2_section_ids[section_name] = mid
+
+        # ── L1: global_mem_insight.txt ──
+        l1_ref_re = re.compile(r"L2\.\[(.+?)\]")
+        try:
+            l1_raw = self.l1_path.read_text(encoding="utf-8")
+        except Exception:
+            l1_raw = ""
+        for line in l1_raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            mid = hashlib.sha1(f"txt:L1:{line}".encode("utf-8")).hexdigest()
+            if mid in existing_ids:
+                continue
+            # Extract L1 key name (before ->) and linked L2 sections
+            l1_key = line.split("->")[0].strip() if "->" in line else line[:32]
+            linked_l2 = l1_ref_re.findall(line)
+            tags = [f"L1:{l1_key}"]
+            for ref in linked_l2:
+                tags.append(f"→L2:{ref}")
+            evidence_ref = ",".join(f"L2:{r}" for r in linked_l2) if linked_l2 else ""
+            records.append(MemoryRecord(
+                memory_id=mid,
+                layer="L1",
+                memory_type=MemoryType.INDEX_POINTER,
+                scope=MemoryScope.GLOBAL,
+                content=line[:96],
+                summary=l1_key,
+                evidence_ref=evidence_ref,
+                verified=True,
+                confidence=0.9,
+                dedupe_key=self._default_dedupe_key(line),
+                tags=tags,
+                source="txt_sync:l1",
+                created_at=now,
+                updated_at=now,
+            ))
+
+        # ── Create L2 records with back-reference tags to L1 ──
+        # Build reverse map: L2 section → list of L1 keys that point to it
+        l1_to_l2_map: dict[str, list[str]] = {}
+        for line in l1_raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "->" not in line:
+                continue
+            l1_key = line.split("->")[0].strip()
+            for ref in l1_ref_re.findall(line):
+                l1_to_l2_map.setdefault(ref, []).append(l1_key)
+
+        for section_name, lines in l2_sections:
+            content = "\n".join(lines)
+            if not content.strip():
+                continue
+            mid = l2_section_ids[section_name]
+            if mid in existing_ids:
+                continue
+            tags = [f"L2:{section_name}"]
+            for l1_key in l1_to_l2_map.get(section_name, []):
+                tags.append(f"←L1:{l1_key}")
+            records.append(MemoryRecord(
+                memory_id=mid,
+                layer="L2",
+                memory_type=MemoryType.STABLE_FACT,
+                scope=MemoryScope.GLOBAL,
+                content=content,
+                summary=section_name,
+                verified=True,
+                confidence=0.8,
+                dedupe_key=self._default_dedupe_key(section_name),
+                tags=tags,
+                source="txt_sync:l2",
+                created_at=now,
+                updated_at=now,
+            ))
+
+        if records:
+            self.repository.upsert_many(records)
+            try:
+                self.index.upsert(records)
+            except Exception:
+                pass
 
     def _build_skill_payload(self, entry: dict[str, Any]) -> str:
         raw = self._load_skill_raw(entry).strip()
@@ -452,6 +586,7 @@ class MemoryManager:
                     evidence=row.evidence,
                     source=row.source,
                     verified=row.verified,
+                    confidence=row.confidence,
                     score=row.score,
                     recency=row.recency,
                     scope=row.scope,
@@ -564,7 +699,14 @@ class MemoryManager:
             "l4": l4,
         }
 
-    def build_memory_pack(self, session_id: str, query: str, project_id: str = "") -> MemoryPack:
+    def build_memory_pack(
+        self,
+        session_id: str,
+        query: str,
+        project_id: str = "",
+        *,
+        memory_budget_tokens: int | None = None,
+    ) -> MemoryPack:
         task_type = self.selector.classify_task(query)
         include_l4 = task_type in {"debug", "planning"} or self._contains_continuity_terms(query)
         scored_by_layer, dropped, stats = self._query_scored_layers(
@@ -575,7 +717,11 @@ class MemoryManager:
             include_l4=include_l4,
         )
         compressed = self._semantic_compress(scored_by_layer)
-        selected_by_layer = compressed
+        max_total_chars = None
+        if memory_budget_tokens is not None and int(memory_budget_tokens) > 0:
+            max_total_chars = int(memory_budget_tokens) * 4
+        effective_budget = self.selector.budget_for_task(task_type, max_total_chars=max_total_chars)
+        selected_by_layer = self.selector.select_items_by_layer(compressed, effective_budget)
         l0_text = "\n".join(self.l0_rules.splitlines()[:12]).strip()
         selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in selected_by_layer.get(layer, [])]
         citations = self._ensure_citations(self._build_pack_citations_from_scored(items=selected_items), query)
@@ -607,7 +753,7 @@ class MemoryManager:
         )
         return MemoryPack(
             task_type=task_type,
-            budget=self.selector.budget_for_task(task_type),
+            budget=effective_budget,
             l0=l0_text,
             l1=legacy_layers["l1"],
             l2=legacy_layers["l2"],
@@ -627,6 +773,8 @@ class MemoryManager:
                 "kept_candidates": stats["kept_candidates"],
                 "dropped_candidates": stats["dropped_candidates"],
                 "dropped_reasons": [row.reason for row in dropped[:12]],
+                "memory_budget_tokens": int(memory_budget_tokens or 0),
+                "memory_budget_chars": int(max_total_chars or 0),
             },
             assembly_trace={
                 "facts_count": len(compressed.get("L2", [])),
@@ -833,27 +981,32 @@ class MemoryManager:
         return kept, report
 
     @staticmethod
-    def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
+    def build_memory_system_blocks(pack: MemoryPack, provider_style: str = "openai") -> list[dict[str, str]]:
         max_chars = MemoryManager._provider_char_budget(provider_style)
         render_blocks = MemoryManager._build_render_blocks(pack)
         kept_blocks, report = MemoryManager._apply_provider_trim(blocks=render_blocks, max_chars=max_chars)
         pack.trim_report = report
         sections = MemoryManager._render_sections_from_blocks(kept_blocks)
         if provider_style == "anthropic_messages":
-            return (
-                f"{pack.l0}\n\n"
-                f"<anthropic_memory_index>\n{sections['constraints']}\n</anthropic_memory_index>\n\n"
-                f"<anthropic_relevant_skills>\n{sections['procedures']}\n</anthropic_relevant_skills>\n\n"
-                f"<anthropic_session_recall_hints>\n{sections['continuity']}\n</anthropic_session_recall_hints>\n\n"
-                f"<anthropic_relevant_memory>\n{sections['facts']}\n</anthropic_relevant_memory>"
-            )
-        return (
-            f"{pack.l0}\n\n"
-            f"<memory_index>\n{sections['constraints']}\n</memory_index>\n\n"
-            f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>\n\n"
-            f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>\n\n"
-            f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"
-        )
+            return [
+                {"category": "memory_l0", "content": pack.l0},
+                {"category": "memory_constraints", "content": f"<anthropic_memory_index>\n{sections['constraints']}\n</anthropic_memory_index>"},
+                {"category": "memory_procedures", "content": f"<anthropic_relevant_skills>\n{sections['procedures']}\n</anthropic_relevant_skills>"},
+                {"category": "memory_continuity", "content": f"<anthropic_session_recall_hints>\n{sections['continuity']}\n</anthropic_session_recall_hints>"},
+                {"category": "memory_facts", "content": f"<anthropic_relevant_memory>\n{sections['facts']}\n</anthropic_relevant_memory>"},
+            ]
+        return [
+            {"category": "memory_l0", "content": pack.l0},
+            {"category": "memory_constraints", "content": f"<memory_index>\n{sections['constraints']}\n</memory_index>"},
+            {"category": "memory_procedures", "content": f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>"},
+            {"category": "memory_continuity", "content": f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>"},
+            {"category": "memory_facts", "content": f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"},
+        ]
+
+    @staticmethod
+    def render_memory_for_provider(pack: MemoryPack, provider_style: str = "openai") -> str:
+        rows = MemoryManager.build_memory_system_blocks(pack=pack, provider_style=provider_style)
+        return "\n\n".join(str(row.get("content") or "").strip() for row in rows if str(row.get("content") or "").strip())
 
     def build_memory_header(self, session_id: str, query: str) -> str:
         return self.render_memory_for_provider(pack=self.build_memory_pack(session_id=session_id, query=query), provider_style="openai")

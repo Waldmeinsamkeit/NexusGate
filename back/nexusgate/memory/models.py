@@ -36,6 +36,7 @@ class ScoredMemory:
     evidence: str = ""
     source: str = ""
     verified: bool = False
+    confidence: float = 0.0
     score: float = 0.0
     recency: float = 0.0
     scope: str = ""

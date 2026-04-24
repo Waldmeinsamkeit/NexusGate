@@ -5,6 +5,11 @@ import json
 from typing import Any
 
 from nexusgate.config import settings
+from nexusgate.prompting.system_blocks import (
+    build_system_blocks,
+    dedupe_and_merge_system_blocks,
+    render_system_blocks_for_provider,
+)
 
 
 _RECALL_KEYWORDS = (
@@ -27,11 +32,9 @@ _RECALL_MODES = {"off", "auto", "always"}
 def build_memory_management_sop_block() -> str:
     return (
         "<memory_management_sop>\n"
-        "- Use only evidence-backed facts from <nexus_context>.\n"
-        "- Prefer verified and stable constraints over speculative memory.\n"
-        "- Resolve conflicts by prioritizing newer verifiable evidence.\n"
-        "- Keep stable constraints intact unless contradicted by strong evidence.\n"
-        "- If evidence is incomplete, explicitly state unknowns.\n"
+        "1. ONLY use facts from <nexus_context>; treat [unverified] items as hints, not truth.\n"
+        "2. When two memories conflict, trust the one with newer timestamp + verified=true.\n"
+        "3. Never extend a fact beyond what the evidence literally states.\n"
         "</memory_management_sop>"
     )
 
@@ -39,16 +42,8 @@ def build_memory_management_sop_block() -> str:
 def build_session_memory_recall_sop_block() -> str:
     return (
         "<session_memory_recall>\n"
-        "Recover session state from available evidence only.\n"
-        "Label each field as confirmed, inferred, or unknown.\n"
-        "Return the minimal recall fields:\n"
-        "- goal\n"
-        "- constraints\n"
-        "- decisions_made\n"
-        "- work_completed\n"
-        "- blockers\n"
-        "- next_step\n"
-        "Do not fabricate missing details.\n"
+        "Recover: goal, constraints, decisions, completed_work, blockers, next_step.\n"
+        "Label each as confirmed/inferred/unknown. Never fabricate missing fields.\n"
         "</session_memory_recall>"
     )
 
@@ -67,19 +62,21 @@ def should_enable_session_memory_recall(user_text: str, metadata: dict[str, Any]
 def build_memory_usage_skill_block() -> str:
     return (
         "<memory_usage_skill>\n"
-        "When operating through NexusGate with long-running coding or agent workflows:\n"
-        "- Check <nexus_context> first for recalled session state, constraints, decisions, and prior work.\n"
-        "- If the user asks to continue, resume, recall, or pick up previous work, summarize the recovered state briefly before acting.\n"
-        "- Distinguish confirmed memory from inference; do not present guessed details as facts.\n"
-        "- If the recovered context is insufficient to act safely, ask a targeted clarification question before making irreversible changes.\n"
-        "- Preserve stable constraints and prior decisions unless newer evidence in <nexus_context> contradicts them.\n"
+        "1. Check <nexus_context> before acting; on resume/continue requests, summarize recovered state first.\n"
+        "2. Items marked [unverified] are hypotheses—never cite them as confirmed.\n"
+        "3. If context is insufficient for a safe action, ask one clarification question before proceeding.\n"
         "</memory_usage_skill>"
     )
 
 
-def build_sop_system_blocks(user_text: str, metadata: dict[str, Any] | None) -> list[str]:
+def build_sop_system_blocks(
+    user_text: str,
+    metadata: dict[str, Any] | None,
+    *,
+    has_memory_content: bool = False,
+) -> list[str]:
     blocks: list[str] = []
-    if settings.enable_memory_management_sop:
+    if settings.enable_memory_management_sop and has_memory_content:
         blocks.append(build_memory_management_sop_block())
         blocks.append(build_memory_usage_skill_block())
 
@@ -120,11 +117,34 @@ def build_responses_system_blocks(
     metadata: dict[str, Any] | None,
     memory_context: str | None = None,
 ) -> list[str]:
-    blocks = build_sop_system_blocks(user_text=user_text, metadata=metadata)
+    blocks = build_sop_system_blocks(
+        user_text=user_text,
+        metadata=metadata,
+        has_memory_content=bool(str(memory_context or "").strip()),
+    )
     memory_text = str(memory_context or "").strip()
+    raw_blocks: list[dict[str, Any]] = [
+        {
+            "category": "sop",
+            "content": block,
+            "source": "sop",
+            "priority": 20,
+        }
+        for block in blocks
+        if str(block or "").strip()
+    ]
     if memory_text:
-        blocks.append(memory_text)
-    return [block for block in blocks if str(block or "").strip()]
+        raw_blocks.append(
+            {
+                "category": "memory_context",
+                "content": memory_text,
+                "source": "memory",
+                "priority": 30,
+                "singleton": True,
+            }
+        )
+    merged = dedupe_and_merge_system_blocks(build_system_blocks(raw_blocks))
+    return render_system_blocks_for_provider(merged, provider_style="openai")
 
 
 
