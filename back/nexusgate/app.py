@@ -21,6 +21,7 @@ from nexusgate.gateway import route
 from nexusgate.local_proxy import ClientSyncService, LocalKeyManager, SyncStatus
 from nexusgate.memory import MemoryManager
 from nexusgate.memory.schema import QueryFilters
+from nexusgate.prompting.responses_budget import budget_native_responses_payload
 from nexusgate.prompting.system_blocks import (
     build_system_blocks,
     dedupe_and_merge_system_blocks,
@@ -148,6 +149,7 @@ def create_app() -> FastAPI:
         render = trace.get("render") or {}
         history = trace.get("history") or {}
         budget = trace.get("budget") or {}
+        budget_diag = _budget_diagnostics_from_report(budget)
 
         with_prompt = int(token_stats.get("prompt_tokens") or 0)
         with_completion = int(token_stats.get("completion_tokens") or 0)
@@ -196,6 +198,22 @@ def create_app() -> FastAPI:
             "budget_after_tokens": int(budget.get("after_tokens") or 0),
             "budget_dropped_messages": int(budget.get("dropped_messages") or 0),
             "budget_truncated_messages": int(budget.get("truncated_messages") or 0),
+            "budget_native_tools": bool(budget_diag.get("native_tools_budget")),
+            "budget_episode_count": int(budget_diag.get("episode_count") or 0),
+            "budget_episodes_trimmed": int(budget_diag.get("episodes_trimmed") or 0),
+            "budget_episodes_summarized": int(budget_diag.get("episodes_summarized") or 0),
+            "budget_tool_result_pruned_chars": int(budget_diag.get("tool_result_pruned_chars") or 0),
+        }
+
+    def _budget_diagnostics_from_report(report: dict[str, Any] | None) -> dict[str, Any]:
+        budget = report or {}
+        return {
+            "native_tools_budget": bool(budget.get("native_tools_budget")),
+            "episode_count": int(budget.get("episode_count") or 0),
+            "episodes_trimmed": int(budget.get("episodes_trimmed") or 0),
+            "episodes_summarized": int(budget.get("episodes_summarized") or 0),
+            "tool_result_pruned_chars": int(budget.get("tool_result_pruned_chars") or 0),
+            "skip_reason": str(budget.get("skip_reason") or ""),
         }
 
     def _append_solo_token_line(line: dict[str, Any]) -> None:
@@ -221,6 +239,7 @@ def create_app() -> FastAPI:
         routing = trace.get("routing") or {}
         fallback_events = trace.get("fallback") or []
         render = trace.get("render") or {}
+        budget_diag = _budget_diagnostics_from_report(trace.get("budget") or {})
         estimated_before = int(render.get("estimated_tokens_before") or 0)
         estimated_after = int(render.get("estimated_tokens_after") or 0)
         prompt_tokens = int((usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0)
@@ -252,6 +271,7 @@ def create_app() -> FastAPI:
                 "saved_rate_actual": round(float(saved_actual) / float(max(estimated_before, 1)), 4) if estimated_before and prompt_tokens else 0.0,
                 "usage_source": "upstream_usage" if prompt_tokens else "estimate_only",
             },
+            "budget_diagnostics": budget_diag,
             "trace": trace,
         }
         recent_traces.appendleft(row)
@@ -1205,19 +1225,11 @@ def create_app() -> FastAPI:
                 memory_context=memory_context,
             )
             if passthrough_payload.get("tools"):
-                budget_report = {
-                    "enabled": False,
-                    "before_tokens": 0,
-                    "after_tokens": 0,
-                    "context_budget_tokens": int(decision.get("context_budget") or 0),
-                    "prompt_budget_tokens": 0,
-                    "truncated_messages": 0,
-                    "dropped_messages": 0,
-                    "over_budget_before": False,
-                    "over_budget_after": False,
-                    "skipped": True,
-                    "skip_reason": "responses_tools_passthrough",
-                }
+                passthrough_payload, budget_report = budget_native_responses_payload(
+                    passthrough_payload,
+                    context_budget_tokens=int(decision.get("context_budget") or 0),
+                    reserve_ratio=float(settings.context_budget_response_reserve_ratio or 0.3),
+                )
             else:
                 passthrough_budget_messages = _responses_payload_to_messages(passthrough_payload)
                 passthrough_budget_messages, budget_report = _apply_total_context_budget(
@@ -1252,6 +1264,7 @@ def create_app() -> FastAPI:
                         "saved_rate_actual": 0.0,
                         "usage_source": "passthrough_unknown",
                     },
+                    "budget_diagnostics": _budget_diagnostics_from_report(budget_report),
                     "trace": {
                         "history": history_stats,
                         "budget": budget_report,
