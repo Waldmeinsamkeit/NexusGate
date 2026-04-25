@@ -1075,6 +1075,10 @@ def create_app() -> FastAPI:
             verified_ratio=float((memory_pack.pack_features or {}).get("verified_ratio") or 0.0),
         )
         evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
+        # When memory_context is available, it already contains grouped L2 facts
+        # with pointer resolution. Skip facts in evidence_blocks to avoid duplication.
+        if memory_context:
+            evidence_blocks["facts"] = ""
         citation_block = _build_citation_system_block(memory_pack.citations)
         sop_blocks = build_sop_system_blocks(
             user_text=prepared_user_query,
@@ -1500,6 +1504,10 @@ def create_app() -> FastAPI:
                 grounding_policy=grounding_policy,
             )
             evidence_blocks = _build_evidence_policy_blocks(pack=memory_pack)
+            # When memory_context is available, it already contains grouped L2 facts
+            # with pointer resolution. Skip facts in evidence_blocks to avoid duplication.
+            if memory_context:
+                evidence_blocks["facts"] = ""
             citation_block = _build_citation_system_block(memory_pack.citations)
             sop_blocks = build_sop_system_blocks(
                 user_text=passthrough_user_text,
