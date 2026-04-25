@@ -1419,6 +1419,7 @@ def create_app() -> FastAPI:
 
         # Prefer raw pass-through for Responses API so Codex tool-calling semantics
         # are preserved (editing files, running commands, multi-turn tool loops).
+        print(f"[RESPONSES-API] model={data.get('model')} stream={data.get('stream')} effective_base_url={settings.effective_target_base_url} path={'passthrough' if settings.effective_target_base_url else '_run_completion'}")
         if settings.effective_target_base_url:
             prepared_payload = _replace_responses_input_with_prepared_window(data, prepared_rows)
             passthrough_metadata = extract_metadata_from_responses_payload(prepared_payload)
@@ -3183,6 +3184,7 @@ async def _passthrough_responses_to_upstream(
     url = f"{base}/responses"
     headers = _build_upstream_headers(request, upstream_api_key)
     stream = bool(payload.get("stream"))
+    print(f"[PASSTHROUGH] url={url} stream={stream} model={payload.get('model')} has_tools={bool(payload.get('tools'))} input_items={len(payload.get('input', [])) if isinstance(payload.get('input'), list) else 1}")
 
     if stream:
         async def event_stream() -> Iterator[bytes]:
@@ -3196,6 +3198,7 @@ async def _passthrough_responses_to_upstream(
                         body = await resp.aread()
                         detail = body.decode("utf-8", errors="replace")
                         message = f"Upstream responses stream failed ({resp.status_code}): {detail}"
+                        print(f"[PASSTHROUGH-ERROR] stream failed: status={resp.status_code} detail={detail[:500]}")
                         for terminal_chunk in _responses_incomplete_terminal_events(message, code="upstream_http_error"):
                             yield terminal_chunk
                         return
@@ -3240,6 +3243,7 @@ async def _passthrough_responses_to_upstream(
 
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(url, headers=headers, json=payload)
+    print(f"[PASSTHROUGH] non-stream status={resp.status_code}")
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
