@@ -221,6 +221,10 @@ export function archiveMemory(id: string): Promise<{ status: string; memory_id: 
   return request(`/admin/memories/${id}`, { method: 'DELETE' });
 }
 
+export function archiveMemoryLayer(layer: string): Promise<{ status: string; layer: string; archived_count: number }> {
+  return request(`/admin/memories-layer/${layer}`, { method: 'DELETE' });
+}
+
 // ── Traces ──────────────────────────────────────────────────────────
 
 export interface TraceRecord {

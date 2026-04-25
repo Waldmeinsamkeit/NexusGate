@@ -10,7 +10,7 @@ import {
   Check,
   Shield,
 } from 'lucide-react';
-import { fetchMemories, createMemory, updateMemory, archiveMemory, type MemoryRecord } from '../services/api';
+import { fetchMemories, createMemory, updateMemory, archiveMemory, archiveMemoryLayer, type MemoryRecord } from '../services/api';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -85,6 +85,19 @@ export const MemoryCenter = () => {
     }
   };
 
+  const handleClearLayer = async () => {
+    const layer = activeLayer === 'all' ? '' : activeLayer;
+    if (!layer) { alert('请先选择一个具体层级'); return; }
+    if (!window.confirm(`确认清空 ${layer} 层所有记忆？此操作不可恢复！`)) return;
+    try {
+      const res = await archiveMemoryLayer(layer);
+      alert(`已归档 ${res.archived_count} 条 ${layer} 记忆`);
+      load();
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
+
   const handleSave = async (form: SaveForm) => {
     setSaving(true);
     const tags = form.tags.split(',').map(s => s.trim()).filter(Boolean);
@@ -140,6 +153,11 @@ export const MemoryCenter = () => {
           <button onClick={load} disabled={loading} className="p-1.5 hover:bg-slate-100 rounded-md text-slate-400 disabled:opacity-50">
             <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
           </button>
+          {activeLayer !== 'all' && (
+            <button onClick={handleClearLayer} className="bg-rose-50 hover:bg-rose-100 text-rose-600 px-3 py-2 rounded-lg font-bold text-xs flex items-center gap-1.5 transition-colors border border-rose-200">
+              <Trash2 size={12} /> 清空此层
+            </button>
+          )}
           <button onClick={openAdd} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition-colors shadow-sm">
             <Plus size={14} /> 新建条目
           </button>

@@ -722,6 +722,51 @@ class MemoryManager:
             max_total_chars = int(memory_budget_tokens) * 4
         effective_budget = self.selector.budget_for_task(task_type, max_total_chars=max_total_chars)
         selected_by_layer = self.selector.select_items_by_layer(compressed, effective_budget)
+        print(f"[BUILD-PACK] task_type={task_type} budget={effective_budget} max_total_chars={max_total_chars} scored_L2={len(compressed.get('L2',[]))} selected_L2={len(selected_by_layer.get('L2',[]))}")
+
+        # Force-include L2 facts referenced by L1 pointer indexes (unlimited budget).
+        # We include ALL pointer-referenced L2 facts and let the model decide
+        # which ones are relevant — we don't filter by query terms.
+        # The model reads <memory_index> for pointers and finds expanded
+        # content in <relevant_memory> under matching group headers.
+        selected_l2_ids = {row.memory_id for row in selected_by_layer.get("L2", [])}
+        l1_selected = selected_by_layer.get("L1", [])
+        l1_constraints = [row.text for row in l1_selected]
+        pointer_groups = MemoryManager._parse_l1_pointer_keys(l1_constraints, facts=None)
+
+        # Build a map of full-text L2 items from compressed (before truncation)
+        full_l2_by_id: dict[str, ScoredMemory] = {row.memory_id: row for row in compressed.get("L2", [])}
+
+        if pointer_groups:
+            all_l2_scored = compressed.get("L2", [])
+            for item in all_l2_scored:
+                if item.memory_id in selected_l2_ids:
+                    continue
+                lines = [line.strip().lstrip("- ").strip() for line in item.text.split("\n")]
+                for line in lines:
+                    if not line:
+                        continue
+                    prefix = line.split(":")[0].split("=")[0].strip().replace(" ", "_").lower()
+                    for group_name, keys in pointer_groups.items():
+                        for key in keys:
+                            key_norm = key.replace(" ", "_").lower()
+                            if key_norm and len(key_norm) >= 3 and (key_norm in prefix or prefix.startswith(key_norm)):
+                                selected_by_layer.setdefault("L2", []).append(item)
+                                selected_l2_ids.add(item.memory_id)
+                                break
+                        else:
+                            continue
+                        break
+
+        # Replace any truncated L2 items with their full versions from compressed.
+        # The selector may have truncated items to fit budget, but L1-pointer-
+        # referenced facts must be complete for accurate pointer resolution.
+        l2_list = selected_by_layer.get("L2", [])
+        for i, row in enumerate(l2_list):
+            full_item = full_l2_by_id.get(row.memory_id)
+            if full_item and len(full_item.text) > len(row.text):
+                l2_list[i] = full_item
+
         l0_text = "\n".join(self.l0_rules.splitlines()[:12]).strip()
         selected_items = [row for layer in ("L1", "L2", "L3", "L4") for row in selected_by_layer.get(layer, [])]
         citations = self._ensure_citations(self._build_pack_citations_from_scored(items=selected_items), query)
@@ -846,8 +891,8 @@ class MemoryManager:
     @staticmethod
     def _provider_char_budget(provider_style: str) -> int:
         if provider_style == "anthropic_messages":
-            return 3000
-        return 2200
+            return 4000
+        return 4000
 
     @staticmethod
     def _block_priority(section: str) -> int:
@@ -856,8 +901,134 @@ class MemoryManager:
         return priorities.get(section, 9)
 
     @staticmethod
+    def _parse_l1_pointer_keys(constraints: list[str], facts: list[str] | None = None) -> dict[str, list[str]]:
+        """Parse L1 constraint lines for L2 pointer syntax like 'key -> L2.[GROUP_NAME]'.
+
+        Returns a mapping of POINTER_KEY -> [match_key1, match_key2, ...] so that L2 facts
+        whose text starts with a listed match_key can be grouped under that header.
+
+        The POINTER_KEY (text before '->') is used as the group header in rendered output,
+        so the model can directly map L1 pointer names to L2 content sections.
+
+        If keys= is missing or truncated (L1 has 96-char limit), infer keys
+        from the prefixes of L2 facts (text before the first ':' or '=').
+        """
+        groups: dict[str, list[str]] = {}
+        for line in constraints:
+            # Match patterns like: project_structure -> L2.[PROJECT_STRUCTURE]; keys=a,b,c
+            for m in re.finditer(r"L2\.\[([^\]]+)\]", line):
+                group_name = m.group(1).strip()
+                # Use the pointer key (text before '->') as the header name
+                pointer_key = line.split("->")[0].strip() if "->" in line else group_name
+                keys: list[str] = []
+                # Extract keys=... portion after the pointer
+                keys_match = re.search(r"keys=([^\s;]+)", line)
+                if keys_match:
+                    keys = [k.strip() for k in keys_match.group(1).split(",") if k.strip()]
+                groups[pointer_key] = keys
+
+        # If keys list is empty (L1 96-char limit truncated keys=), mark as
+        # catch-all group that should contain ALL L2 facts.
+        if facts is not None:
+            for group_name, keys in groups.items():
+                if not keys:
+                    # Use sentinel to indicate catch-all
+                    groups[group_name] = ["*"]
+        return groups
+
+    @staticmethod
+    def _group_facts_by_pointer(facts: list[str], pointer_groups: dict[str, list[str]]) -> list[str]:
+        """Group L2 facts under their L1-referenced key headers.
+
+        Matching strategy (in order of priority):
+        1. Exact normalized prefix match (underscore-insensitive)
+        2. Key is a substring of the fact's prefix (handles truncated L1 keys)
+        3. Fact prefix contains the key (handles partial keys like 'rou' matching 'routing')
+        4. Catch-all '*' key matches any fact (for groups with no explicit keys)
+
+        Facts not matching any key are kept as-is.
+        """
+        if not pointer_groups:
+            return facts
+
+        # Separate specific-key groups from catch-all groups
+        key_to_group: dict[str, str] = {}
+        catch_all_groups: list[str] = []
+        for group_name, keys in pointer_groups.items():
+            if keys == ["*"]:
+                catch_all_groups.append(group_name)
+            else:
+                for key in keys:
+                    key_to_group[key] = group_name
+
+        grouped: dict[str, list[str]] = {}  # group_name -> [facts]
+        ungrouped: list[str] = []
+        for fact in facts:
+            fact_stripped = fact.strip()
+            if not fact_stripped:
+                continue
+            # Check each line of the fact for key matches, but assign the WHOLE fact
+            lines = [line.strip().lstrip("- ").strip() for line in fact_stripped.split("\n") if line.strip()]
+            matched = False
+            for line in lines:
+                fact_prefix = line.split(":")[0].split("=")[0].strip()
+                fact_prefix_norm = fact_prefix.replace(" ", "_").lower()
+                for key, group_name in key_to_group.items():
+                    key_norm = key.replace(" ", "_").lower()
+                    # Strategy 1: exact normalized prefix match
+                    if fact_prefix_norm == key_norm:
+                        grouped.setdefault(group_name, []).append(fact_stripped)
+                        matched = True
+                        break
+                    # Strategy 2: key is a substring of fact prefix (handles truncated keys)
+                    if key_norm and len(key_norm) >= 3 and (key_norm in fact_prefix_norm or fact_prefix_norm.startswith(key_norm)):
+                        grouped.setdefault(group_name, []).append(fact_stripped)
+                        matched = True
+                        break
+                    # Strategy 3: fact prefix contains key (handles partial like 'rou' → 'routing')
+                    if key_norm and len(key_norm) >= 3 and line.lower().startswith(key.replace("_", " ").lower()):
+                        grouped.setdefault(group_name, []).append(fact_stripped)
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched:
+                ungrouped.append(fact_stripped)
+
+        # Assign ungrouped facts to the first catch-all group, if any
+        if catch_all_groups and ungrouped:
+            catch_all = catch_all_groups[0]
+            grouped.setdefault(catch_all, []).extend(ungrouped)
+            ungrouped = []
+
+        # Emit all pointer group names as headers so every L1 pointer is resolvable.
+        # Groups with matched facts get their facts; groups without matched facts
+        # get the union of all other groups' facts (same content, different header).
+        all_group_names = list(pointer_groups.keys())
+        result: list[str] = []
+        for group_name in all_group_names:
+            if group_name in grouped and grouped[group_name]:
+                result.append(f"[{group_name}]")
+                result.extend(grouped[group_name])
+            else:
+                # This pointer group had no direct matches — emit header only.
+                # The model can resolve the pointer by checking other group headers
+                # in <relevant_memory>. No need to duplicate facts here.
+                result.append(f"[{group_name}]")
+        result.extend(ungrouped)
+        return result
+
+    @staticmethod
     def _build_render_blocks(pack: MemoryPack) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
+
+        # Parse L1→L2 pointer references so L2 facts can be grouped
+        constraints_list = list(pack.constraints or [])
+        raw_facts = list(pack.facts or [])
+        pointer_groups = MemoryManager._parse_l1_pointer_keys(constraints_list, facts=raw_facts)
+        facts_list = MemoryManager._group_facts_by_pointer(
+            list(pack.facts or []), pointer_groups
+        )
 
         def add(section: str, rows: list[str]) -> None:
             for idx, text in enumerate(rows):
@@ -880,8 +1051,8 @@ class MemoryManager:
                     }
                 )
 
-        add("constraints", list(pack.constraints or []))
-        add("facts", list(pack.facts or []))
+        add("constraints", constraints_list)
+        add("facts", facts_list)
         add("procedures", list(pack.procedures or []))
         add("continuity", list(pack.continuity or []))
         return blocks
@@ -906,12 +1077,16 @@ class MemoryManager:
         if not blocks:
             return None
         # drop the lowest-priority block, biasing to the last block for stable progressive trimming
+        # NEVER drop facts — verified facts must not be trimmed for budget reasons
         ordered = sorted(
-            range(len(blocks)),
+            (
+                i for i in range(len(blocks))
+                if str(blocks[i].get("section") or "") != "facts"
+            ),
             key=lambda i: (int(blocks[i].get("priority", 9)), i),
             reverse=True,
         )
-        return ordered[0] if ordered else None
+        return next(iter(ordered), None)
 
     @staticmethod
     def _apply_provider_trim(
@@ -997,7 +1172,7 @@ class MemoryManager:
             ]
         return [
             {"category": "memory_l0", "content": pack.l0},
-            {"category": "memory_constraints", "content": f"<memory_index>\n{sections['constraints']}\n</memory_index>"},
+            {"category": "memory_constraints", "content": f"<memory_index>\nPointers below use format: name -> L2.[GROUP]; keys=...\nTo resolve a pointer, find its [GROUP] header in <relevant_memory> below.\n{sections['constraints']}\n</memory_index>"},
             {"category": "memory_procedures", "content": f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>"},
             {"category": "memory_continuity", "content": f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>"},
             {"category": "memory_facts", "content": f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"},

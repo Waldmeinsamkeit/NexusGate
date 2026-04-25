@@ -86,6 +86,7 @@ class MemorySelector:
         items_by_layer: dict[str, list[ScoredMemory]],
         budget: dict[str, int],
     ) -> dict[str, list[ScoredMemory]]:
+        # L2 facts matching L1 pointers get unlimited budget (handled in build_memory_pack)
         selected = {
             "L1": self.select_layer_items(items_by_layer.get("L1", []), budget.get("L1", 0)),
             "L2": self.select_layer_items(items_by_layer.get("L2", []), budget.get("L2", 0)),
@@ -100,22 +101,37 @@ class MemorySelector:
     @staticmethod
     def select_layer_items(items: list[ScoredMemory], budget: int) -> list[ScoredMemory]:
         selected: list[ScoredMemory] = []
-        remaining = max(budget, 0)
+        unlimited = budget <= 0  # budget=0 means unlimited (no trimming)
+        remaining = max(budget, 0) if not unlimited else 0
         for item in items:
             text = item.text.strip()
-            if remaining <= 0:
+            if not unlimited and remaining <= 0:
                 break
             if not text:
                 continue
-            if len(text) > remaining:
-                continue
-            selected.append(item)
-            remaining -= len(text)
+            if not unlimited and len(text) > remaining:
+                # Truncate rather than skip — a partial fact is better than none
+                text = text[:remaining]
+            selected.append(
+                ScoredMemory(
+                    layer=item.layer,
+                    text=text,
+                    memory_id=item.memory_id,
+                    evidence=item.evidence,
+                    source=item.source,
+                    verified=item.verified,
+                    confidence=item.confidence,
+                    score=item.score,
+                    recency=item.recency,
+                )
+            )
+            if not unlimited:
+                remaining -= len(text)
         return selected
 
     @staticmethod
     def render_items(items: list[ScoredMemory], budget: int) -> str:
-        if not items or budget <= 0:
+        if not items:
             return "(empty)"
         rows: list[str] = []
         for item in items:

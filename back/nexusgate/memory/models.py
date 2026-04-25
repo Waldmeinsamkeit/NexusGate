@@ -58,8 +58,8 @@ class MemoryContext:
 @dataclass(slots=True)
 class LayerBudgets:
     l0: int = 300
-    l1: int = 600
-    l2: int = 1200
+    l1: int = 900
+    l2: int = 2400
     l3: int = 1200
     l4: int = 600
 

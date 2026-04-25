@@ -936,6 +936,33 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="memory not found")
         return {"status": "ok", "memory_id": memory_id, "archived": True}
 
+    @app.delete("/admin/memories-layer/{layer}")
+    async def admin_memories_archive_by_layer(
+        layer: str,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+        api_key: str | None = Header(default=None, alias="api-key"),
+    ) -> dict[str, Any]:
+        auth_value = authorization
+        if not auth_value and x_api_key:
+            auth_value = f"Bearer {x_api_key}"
+        if not auth_value and api_key:
+            auth_value = f"Bearer {api_key}"
+        _validate_api_key(auth_value, local_api_key=resolved_local_api_key)
+        layer = layer.strip().upper()
+        if layer not in {"L1", "L2", "L3", "L4"}:
+            raise HTTPException(status_code=400, detail="invalid layer")
+        filters = QueryFilters(layers=[layer], include_scopes=["session", "project", "user", "global"], exclude_archived=True)
+        rows = memory.repository.filter_visible(filters)
+        archived_count = 0
+        for row in rows:
+            row.archived = True
+            memory.repository.upsert(row)
+            archived_count += 1
+        # Compact to physically remove archived records
+        memory.repository.compact()
+        return {"status": "ok", "layer": layer, "archived_count": archived_count}
+
     @app.get("/admin/traces")
     async def admin_traces(
         limit: int = 50,
@@ -1425,11 +1452,11 @@ def create_app() -> FastAPI:
             passthrough_metadata = extract_metadata_from_responses_payload(prepared_payload)
             passthrough_metadata = {**passthrough_metadata, **prepared_metadata}
             passthrough_user_text = prepared_user_text or extract_user_text_from_responses_payload(prepared_payload)
-            needs_memory = _query_needs_memory(
-                user_text=passthrough_user_text,
-                messages=prepared_rows,
-                metadata=passthrough_metadata,
-            )
+            # Responses API passthrough always needs memory because Codex relies on
+            # L1→L2 pointer resolution to understand project structure and constraints.
+            needs_memory = True
+            if not memory.enabled:
+                needs_memory = False
             if needs_memory and memory.enabled:
                 memory_budget_tokens = _estimate_memory_budget_tokens_for_request(
                     requested_model=req.model or prepared_req.requested_model or settings.target_provider,
@@ -1461,6 +1488,7 @@ def create_app() -> FastAPI:
                 )
             else:
                 memory_context = ""
+            print(f"[MEMORY-PACK-DEBUG] needs_memory={needs_memory} facts={len(memory_pack.facts or [])} constraints={len(memory_pack.constraints or [])} procedures={len(memory_pack.procedures or [])} continuity={len(memory_pack.continuity or [])} query={repr(passthrough_user_text[:80])}")
             grounding_policy = _derive_grounding_policy(
                 risk_profile=memory_pack.risk_profile,
                 pack_features=memory_pack.pack_features,
@@ -1511,6 +1539,9 @@ def create_app() -> FastAPI:
             # so they cancel out and should NOT be added to estimated_sent_tokens.
             budget_after_tokens = int((budget_report or {}).get("after_tokens") or 0)
             instructions_text = str(passthrough_payload.get("instructions") or "").strip()
+            print(f"[INSTRUCTIONS-DEBUG] len={len(instructions_text)} has_memory_index={'<memory_index>' in instructions_text} has_relevant_memory={'<relevant_memory>' in instructions_text} has_project_structure={'[PROJECT_STRUCTURE]' in instructions_text}")
+            if instructions_text:
+                print(f"[INSTRUCTIONS-PREVIEW]\n{instructions_text[:3000]}")
             instructions_tokens = _estimate_token_count_from_messages(
                 [{"role": "system", "content": instructions_text}] if instructions_text else []
             )
