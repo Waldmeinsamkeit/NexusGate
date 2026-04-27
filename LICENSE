@@ -1,21 +1,46 @@
-MIT License
+NexusGate 开源协议
+Version 1.0, 2026
 
 Copyright (c) 2026 Waldmeinsamkeit
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+---
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## 授权条款
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+在遵守以下前提条件下，授予您使用、复制、修改、合并、发布、分发本软件的权利：
+
+### ✅ 允许
+
+- **自由使用** — 个人、学术、非商业用途均可免费使用
+- **自由传播** — 可分享、转载、分发本软件及其衍生作品
+- **开源修改** — 可修改源代码，但修改后的衍生作品必须以相同协议开源发布
+- **署名** — 分发或转载时必须保留原作者版权声明和本协议全文
+
+### 🚫 禁止
+
+- **禁止商业用途** — 严禁将本软件或其衍生作品用于任何商业目的，包括但不限于：销售、租赁、商业化 SaaS 服务、企业内部商业使用
+- **禁止闭源篡改** — 严禁将本软件修改后以闭源形式发布或分发
+- **禁止倒卖** — 严禁以任何形式出售本软件或其衍生作品，无论是否经过修改
+- **禁止移除协议** — 严禁移除或篡改本协议及原作者版权声明
+
+### 📌 衍生作品条款
+
+- 衍生作品必须以本协议（或同等或更严格的非商业+开源协议）发布
+- 衍生作品必须明确标注基于本软件修改，并保留原作者署名
+- 衍生作品同样禁止商业用途、闭源发布和倒卖
+
+### 📌 免责声明
+
+本软件按"原样"提供，不做任何明示或暗示的保证，包括但不限于：
+适销性、特定用途适用性和非侵权性。在任何情况下，作者或版权持有人
+均不对因使用本软件而产生的任何索赔、损害或其他责任负责。
+
+---
+
+## 商业授权
+
+如需商业使用，请联系原作者获取单独的商业授权协议。
+
+---
+
+本协议基于 Creative Commons BY-NC-SA 4.0 精神制定，并额外增加闭源篡改和倒卖禁止条款。

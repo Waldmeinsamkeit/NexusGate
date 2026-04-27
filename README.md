@@ -14,7 +14,7 @@
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+"></a>
   <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.100+-00a393.svg" alt="FastAPI"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/"><img src="https://img.shields.io/badge/License-BY--NC--SA%204.0-orange.svg" alt="License: BY-NC-SA 4.0"></a>
   <a href="http://makeapullrequest.com"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
 </p>
 
@@ -497,4 +497,4 @@ Contributions are welcome! Please follow this flow:
 
 ## 📄 License
 
-[MIT License](LICENSE) — Copyright (c) 2026 Waldmeinsamkeit
+[NexusGate 开源协议 (BY-NC-SA + 反闭源倒卖)](LICENSE) — Copyright (c) 2026 Waldmeinsamkeit
