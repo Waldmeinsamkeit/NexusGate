@@ -16,6 +16,7 @@
   <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.100+-00a393.svg" alt="FastAPI"></a>
   <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/"><img src="https://img.shields.io/badge/License-BY--NC--SA%204.0-orange.svg" alt="License: BY-NC-SA 4.0"></a>
   <a href="http://makeapullrequest.com"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+  <a href="https://linux.do"><img src="https://img.shields.io/badge/Community-Linux.do-6a4fc2.svg" alt="Linux.do Community"></a>
 </p>
 
 ---
