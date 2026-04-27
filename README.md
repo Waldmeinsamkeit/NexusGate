@@ -26,19 +26,26 @@ It sits between your AI clients (Cursor, Codex CLI, Aider, custom agents…) and
 
 > **一句话概括**：在 AI 请求到达云端之前，自动注入本地记忆、压缩上下文、抑制幻觉——零代码改动，即插即用。
 
-## Table of Contents
+## Table of Contents / 目录
 
-- [Why NexusGate](#-why-nexusgate)
-- [Core Features](#-core-features)
-- [Architecture](#-architecture)
-- [Quick Start](#-quick-start)
-- [Usage](#-usage)
-- [Best Practices](#-best-practices)
-- [Project Structure](#-project-structure)
-- [Configuration Reference](#-configuration-reference)
-- [API Endpoints](#-api-endpoints)
-- [Contributing](#-contributing)
-- [License](#-license)
+- [Why NexusGate / 为什么需要 NexusGate](#-why-nexusgate)
+- [Core Features / 核心特性](#-core-features)
+  - [Tiered Memory System / 五层记忆系统](#tiered-memory-system-l0l4)
+  - [Structured JSON + TOON Rendering / 结构化 JSON + TOON 渲染](#structured-json--toon-rendering)
+  - [Provider-Aware Rendering / 多模型适配渲染](#provider-aware-rendering)
+  - [Dynamic Context Compression / 动态上下文压缩](#dynamic-context-compression)
+  - [Token Savings / Token 节省](#token-savings-measurement)
+  - [Grounding & Hallucination Guard / 幻觉抑制](#grounding--hallucination-guard)
+  - [Smart Routing & Fallback / 智能路由与降级](#smart-routing--fallback)
+- [Architecture / 架构](#-architecture)
+- [Quick Start / 快速开始](#-quick-start)
+- [Usage / 使用方法](#-usage)
+- [Best Practices / 最佳实践](#-best-practices)
+- [Project Structure / 项目结构](#-project-structure)
+- [Configuration Reference / 配置参考](#-configuration-reference)
+- [API Endpoints / API 端点](#-api-endpoints)
+- [Contributing / 贡献](#-contributing)
+- [License / 许可证](#-license)
 
 ## 💡 Why NexusGate
 
@@ -71,9 +78,9 @@ Not a naive RAG paste. NexusGate classifies local knowledge into five semantic l
 | Layer | Name | Purpose | Max chars | Injection |
 |-------|------|---------|-----------|-----------|
 | **L0** | Meta Rules | Immutable system constraints (SOP) | — | Always |
-| **L1** | Constraints | Index pointers, env requirements | 96 | Always |
+| **L1** | Constraints | Index pointers, preferences, env requirements (JSON + TOON) | 96 | Always |
 | **L2** | Facts | Verified business knowledge (Top-K retrieval) | 240 | By relevance |
-| **L3** | Procedures | Reusable SOP / task takeaways | 240 | By task type |
+| **L3** | Procedures | Reusable skills / task takeaways (JSON + TOON) | 240 | By task type |
 | **L4** | Continuity | Session archive for long tasks | 600 | Debug / planning / on trigger |
 
 **How injection works:**
@@ -82,6 +89,27 @@ Not a naive RAG paste. NexusGate classifies local knowledge into five semantic l
 3. Score, deduplicate, resolve conflicts, filter stale/unverified entries
 4. Allocate token budget per layer based on task type
 5. Render with provider-specific formatting (XML for Claude, Markdown for GPT)
+
+### Structured JSON + TOON Rendering
+
+L1 constraints and L3 skills are stored as **structured JSON** source files (`l1_constraints.json`, `l3_skills.json`) instead of free-text, enabling:
+
+- **Strict schema validation** — each entry has typed fields (name, type, keys, rules, triggers)
+- **TOON (Table-Oriented Object Notation) rendering** — compact table format injected into prompts, saving tokens vs verbose prose
+
+TOON example rendered into `<memory_index>`:
+
+```
+pointers[2]{name,group,keys}:
+  project_structure,PROJECT_STRUCTURE,backend_entry+config+gateway
+  nexusgate_structure,Nexusgate_structure,-
+constraints[1]{name,rules}:
+  memory_write_rules,session_recall -> L4;task_takeaway -> L3
+preferences[1]{name,rules}:
+  user_preference,先证据后结论;修改前先读源码;尽量中文回答
+```
+
+This is significantly more token-efficient than the previous free-text format, especially for L1 entries with many pointer keys.
 
 ### Provider-Aware Rendering
 
@@ -362,7 +390,9 @@ NexusGate/
 │   ├── local_proxy.py          # API key management + IDE client sync
 │   ├── prompt_policies.py      # SOP blocks + session recall injection
 │   ├── memory/                 # Five-layer memory system
-│   │   ├── manager.py          # MemoryManager (build, enrich, render, distill)
+│   │   ├── manager.py          # MemoryManager (build, enrich, render, distill, TOON)
+│   │   ├── schema.py           # MemoryRecord, PendingMemoryRecord, structured_data
+│   │   ├── models.py           # MemoryPack, ScoredMemory, l1_records
 │   │   ├── repository.py       # JSONL-backed persistent storage
 │   │   ├── index.py            # ChromaDB vector index + NullIndex fallback
 │   │   ├── query_service.py    # Hybrid search (vector + lexical + scorer)
@@ -385,7 +415,12 @@ NexusGate/
 │   └── src/
 │       ├── App.tsx             # Tab-based SPA
 │       └── components/         # Dashboard, Memory, Tracing, Settings, ...
-├── memory/                     # Runtime memory storage (auto-generated)
+├── memory/                     # Runtime memory storage
+│   ├── l1_constraints.json     # L1 structured source (pointers, constraints, preferences)
+│   ├── l3_skills.json           # L3 structured source (skills, lessons)
+│   ├── global_mem.txt          # L2 facts (section-based text)
+│   ├── skill_manifest.json     # Skill manifest for L3 indexing
+│   └── structured_memory.jsonl # JSONL persistence (auto-generated)
 ├── .env.example                # Configuration template
 ├── requirements.txt            # Python dependencies
 ├── run.sh                      # Start script (Linux/macOS)
