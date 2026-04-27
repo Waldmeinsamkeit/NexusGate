@@ -1097,6 +1097,7 @@ def create_app() -> FastAPI:
             citation_block=citation_block,
             citations=memory_pack.citations,
             metadata=prepared_req.metadata or {},
+            detected_language=prepared_req.detected_language,
         )
         enhanced_messages, budget_report = prepare_prompt_for_provider(
             prompt_plan=prompt_plan,
@@ -1527,6 +1528,7 @@ def create_app() -> FastAPI:
                 citations=memory_pack.citations,
                 metadata=passthrough_metadata,
                 memory_context=memory_context,
+                detected_language=prepared_req.detected_language,
             )
             passthrough_payload, budget_report = prepare_prompt_for_provider(
                 prompt_plan=prompt_plan,
@@ -1787,44 +1789,50 @@ def _resolve_session_id(req: ChatCompletionRequest) -> str:
 
 
 def _normalize_chat_request(data: dict[str, Any], req: ChatCompletionRequest) -> NormalizedRequest:
+    user_text = _extract_latest_user_query(req.messages)
     return NormalizedRequest(
         api_style="chat_completions",
         session_id=_resolve_session_id(req),
-        user_text=_extract_latest_user_query(req.messages),
+        user_text=user_text,
         messages=req.messages,
         requested_model=req.model or "auto",
         metadata=req.metadata or {},
         stream=bool(req.stream),
         tool_required=bool(data.get("tools")),
         response_mode="chat",
+        detected_language=_detect_language(user_text),
     )
 
 
 def _normalize_responses_request(data: dict[str, Any], req: ChatCompletionRequest) -> NormalizedRequest:
+    user_text = _extract_latest_user_query(req.messages)
     return NormalizedRequest(
         api_style="responses",
         session_id=_resolve_session_id(req),
-        user_text=_extract_latest_user_query(req.messages),
+        user_text=user_text,
         messages=req.messages,
         requested_model=req.model or "auto",
         metadata=req.metadata or {},
         stream=bool(req.stream),
         tool_required=bool(data.get("tools")),
         response_mode="responses",
+        detected_language=_detect_language(user_text),
     )
 
 
 def _normalize_messages_request(data: dict[str, Any], req: ChatCompletionRequest) -> NormalizedRequest:
+    user_text = _extract_latest_user_query(req.messages)
     return NormalizedRequest(
         api_style="messages",
         session_id=_resolve_session_id(req),
-        user_text=_extract_latest_user_query(req.messages),
+        user_text=user_text,
         messages=req.messages,
         requested_model=req.model or "auto",
         metadata=req.metadata or {},
         stream=bool(req.stream),
         tool_required=bool(data.get("tools")),
         response_mode="messages",
+        detected_language=_detect_language(user_text),
     )
 
 
@@ -1859,6 +1867,44 @@ def _extract_latest_user_query_from_rows(messages: list[dict[str, Any]]) -> str:
             return content
         return json.dumps(content, ensure_ascii=False)
     return ""
+
+
+def _detect_language(text: str) -> str:
+    """Detect the dominant language of user text using Unicode ranges.
+
+    Returns ISO 639-1 codes: zh, ja, ko, ru, ar, en, or 'unknown'.
+    No external dependencies — uses character range heuristics.
+    """
+    if not text or not text.strip():
+        return "unknown"
+    counts: dict[str, int] = {"zh": 0, "ja": 0, "ko": 0, "ru": 0, "ar": 0, "en": 0}
+    for ch in text:
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or 0xF900 <= cp <= 0xFAFF:
+            counts["zh"] += 1
+        elif 0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF:
+            counts["ja"] += 1
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:
+            counts["ko"] += 1
+        elif 0x0400 <= cp <= 0x04FF:
+            counts["ru"] += 1
+        elif 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F:
+            counts["ar"] += 1
+        elif ch.isascii() and ch.isalpha():
+            counts["en"] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return "unknown"
+    best = max(counts, key=counts.get)
+    if counts[best] == 0:
+        return "unknown"
+    # If CJK is present at all, prefer CJK even if English chars outnumber it
+    cjk_total = counts["zh"] + counts["ja"] + counts["ko"]
+    if cjk_total > 0 and counts["en"] > cjk_total and cjk_total >= total * 0.15:
+        # Mixed CJK+English — return the dominant CJK language
+        cjk_best = max(("zh", "ja", "ko"), key=lambda k: counts[k])
+        return cjk_best if counts[cjk_best] > 0 else best
+    return best
 
 
 def _resolve_task_mode(*, metadata: dict[str, Any], session_id: str, user_text: str) -> str:

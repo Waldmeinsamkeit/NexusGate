@@ -40,6 +40,16 @@ class NormalizedPromptPlan:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+_LANGUAGE_HINTS: dict[str, str] = {
+    "zh": "用户使用中文，请用中文回复。",
+    "ja": "ユーザーは日本語を使用しています。日本語で回答してください。",
+    "ko": "사용자가 한국어를 사용하고 있습니다. 한국어로 답변해 주세요.",
+    "ru": "Пользователь использует русский язык. Отвечайте на русском.",
+    "ar": "المستخدم يستخدم العربية. يرجى الرد باللغة العربية.",
+    "en": "User is using English. Respond in English.",
+}
+
+
 def build_default_system_blocks(
     *,
     l0_meta_rules: str,
@@ -48,16 +58,23 @@ def build_default_system_blocks(
     evidence_blocks: dict[str, str],
     citation_block: str,
     memory_context: str | None = None,
+    detected_language: str = "unknown",
 ) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [
         {"category": "meta_rules", "content": l0_meta_rules, "source": "l0", "priority": 5, "singleton": True},
-        *[
+    ]
+    # Language hint — high priority so model sees it early
+    lang_hint = _LANGUAGE_HINTS.get(detected_language, "")
+    if lang_hint:
+        blocks.append({"category": "language_hint", "content": lang_hint, "source": "detected_language", "priority": 6, "singleton": True})
+    blocks.extend(
+        [
             {"category": "sop", "content": block, "source": "sop", "priority": 10}
             for block in sop_blocks
             if str(block or "").strip()
         ],
-        {"category": "grounding_policy", "content": grounding_rules, "source": "grounding", "priority": 20, "singleton": True},
-    ]
+    )
+    blocks.append({"category": "grounding_policy", "content": grounding_rules, "source": "grounding", "priority": 20, "singleton": True})
     evidence_entries = [
         ("memory_constraints", "constraints", 30),
         ("memory_facts", "facts", 31),
@@ -104,6 +121,7 @@ def build_standard_prompt_plan(
     citations: list[dict[str, Any]] | None = None,
     metadata: dict[str, Any] | None = None,
     memory_context: str | None = None,
+    detected_language: str = "unknown",
 ) -> NormalizedPromptPlan:
     raw_blocks = build_default_system_blocks(
         l0_meta_rules=l0_meta_rules,
@@ -112,6 +130,7 @@ def build_standard_prompt_plan(
         evidence_blocks=evidence_blocks,
         citation_block=citation_block,
         memory_context=memory_context,
+        detected_language=detected_language,
     )
     return build_prompt_plan(
         provider_style=provider_style,

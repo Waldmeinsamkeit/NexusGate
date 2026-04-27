@@ -42,6 +42,7 @@ class NormalizedRequest(BaseModel):
     stream: bool = False
     tool_required: bool = False
     response_mode: str = "chat"
+    detected_language: str = "unknown"
 
 
 class HealthResponse(BaseModel):
