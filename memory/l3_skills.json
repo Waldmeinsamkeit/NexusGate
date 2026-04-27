@@ -1,0 +1,18 @@
+[
+  {
+    "type": "skill",
+    "name": "session_memory_recall",
+    "group": "SESSION_OPS",
+    "summary": "从 L4 恢复先前的会话状态，验证最新可用上下文",
+    "triggers": ["回忆", "之前", "上次", "历史", "session", "l4", "context"],
+    "task_types": ["chat", "planning", "debug", "retrieval-only"],
+    "when": "用户提到之前的会话或上下文",
+    "rules": [
+      "只信任 tool-verified 数据",
+      "先摘要再追问细节"
+    ],
+    "file": "session_memory_recall.md",
+    "injection_mode": "summary",
+    "max_chars": 600
+  }
+]

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nexusgate.memory.schema import MemoryRecord
 
 
 @dataclass(slots=True)
@@ -85,6 +89,7 @@ class MemoryPack:
     trim_report: dict[str, int | str] = field(default_factory=dict)
     retrieval_trace: dict[str, object] = field(default_factory=dict)
     assembly_trace: dict[str, object] = field(default_factory=dict)
+    l1_records: list[MemoryRecord] = field(default_factory=list)
 
 
 @dataclass(slots=True)

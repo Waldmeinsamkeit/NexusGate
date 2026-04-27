@@ -1,0 +1,56 @@
+[
+  {
+    "name": "memory_write_rules",
+    "type": "constraint",
+    "target_layer": null,
+    "target_group": null,
+    "keys": [],
+    "rules": [
+      "session_recall -> L4",
+      "task_takeaway -> L3"
+    ]
+  },
+  {
+    "name": "user_preference",
+    "type": "preference",
+    "target_layer": null,
+    "target_group": null,
+    "keys": [],
+    "rules": [
+      "先证据后结论",
+      "修改前先读源码",
+      "尽量中文回答",
+      "回答带文件路径和行号",
+      "能不改代码就先不改"
+    ]
+  },
+  {
+    "name": "Genricagent_project_structure",
+    "type": "pointer",
+    "target_layer": "L2",
+    "target_group": "PROJECT_STRUCTURE",
+    "keys": [
+      "backend_entry",
+      "backend_package",
+      "gateway_flow",
+      "routing_modules",
+      "memory_modules",
+      "safety_modules",
+      "frontend_root",
+      "frontend_entry",
+      "frontend_views",
+      "compat_shim"
+    ],
+    "triggers": [],
+    "task_types": ["coding", "debug"]
+  },
+  {
+    "name": "Nexusgate_structure",
+    "type": "pointer",
+    "target_layer": "L2",
+    "target_group": "Nexusgate_structure",
+    "keys": [],
+    "triggers": [],
+    "task_types": ["*"]
+  }
+]

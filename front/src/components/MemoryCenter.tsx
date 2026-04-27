@@ -9,6 +9,10 @@ import {
   RefreshCw,
   Check,
   Shield,
+  Pointer,
+  BookOpen,
+  Heart,
+  Zap,
 } from 'lucide-react';
 import { fetchMemories, createMemory, updateMemory, archiveMemory, archiveMemoryLayer, type MemoryRecord } from '../services/api';
 import { cn } from '../lib/utils';
@@ -202,7 +206,12 @@ export const MemoryCenter = () => {
                 {mem.verified && <Shield size={12} className="text-emerald-500" />}
                 <span className="text-[9px] text-slate-400 font-mono ml-auto">{mem.scope}</span>
               </div>
-              <p className="text-[11px] text-slate-700 leading-relaxed mb-3 line-clamp-4">{mem.content}</p>
+              {/* Structured data card for L1/L3 */}
+              {mem.structured_data ? (
+                <StructuredCard data={mem.structured_data} />
+              ) : (
+                <p className="text-[11px] text-slate-700 leading-relaxed mb-3 line-clamp-4">{mem.content}</p>
+              )}
               {mem.summary && (
                 <p className="text-[10px] font-bold text-slate-500 mb-2 truncate">{mem.summary}</p>
               )}
@@ -251,6 +260,114 @@ export const MemoryCenter = () => {
         )}
       </AnimatePresence>
     </motion.div>
+  );
+};
+
+/* ── structured data card ─────────────────────────────────────────── */
+
+const TYPE_ICONS: Record<string, React.ReactNode> = {
+  pointer: <Pointer size={11} className="text-amber-600" />,
+  constraint: <BookOpen size={11} className="text-blue-600" />,
+  preference: <Heart size={11} className="text-rose-500" />,
+  skill: <Zap size={11} className="text-indigo-600" />,
+  lesson: <BookOpen size={11} className="text-teal-600" />,
+};
+
+const TYPE_LABELS: Record<string, string> = {
+  pointer: '指针',
+  constraint: '约束',
+  preference: '偏好',
+  skill: '技能',
+  lesson: '经验',
+};
+
+const StructuredCard: React.FC<{ data: Record<string, unknown> }> = ({ data }) => {
+  const type = String(data.type || '');
+  const name = String(data.name || '');
+  const icon = TYPE_ICONS[type];
+  const label = TYPE_LABELS[type] || type;
+
+  return (
+    <div className="space-y-2 mb-3">
+      {/* Header */}
+      <div className="flex items-center gap-1.5">
+        {icon}
+        <span className="text-[9px] font-bold uppercase text-slate-400">{label}</span>
+        <span className="text-[11px] font-bold text-slate-700 truncate">{name}</span>
+      </div>
+
+      {/* Pointer: group + keys */}
+      {type === 'pointer' && (
+        <div className="space-y-1">
+          {data.target_group && (
+            <div className="text-[10px] text-slate-500">
+              → L2.<span className="font-mono font-bold text-emerald-600">[{String(data.target_group)}]</span>
+            </div>
+          )}
+          {Array.isArray(data.keys) && data.keys.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {data.keys.map((k: unknown, i: number) => (
+                <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-100 font-mono">
+                  {String(k)}
+                </span>
+              ))}
+            </div>
+          )}
+          {Array.isArray(data.keys) && data.keys.length === 0 && (
+            <span className="text-[9px] text-slate-300 italic">catch-all (*)</span>
+          )}
+        </div>
+      )}
+
+      {/* Constraint / Preference: rules */}
+      {(type === 'constraint' || type === 'preference') && Array.isArray(data.rules) && (
+        <ul className="space-y-0.5">
+          {data.rules.map((rule: unknown, i: number) => (
+            <li key={i} className="text-[11px] text-slate-600 leading-snug flex gap-1.5">
+              <span className="text-slate-300 mt-px">•</span>
+              <span>{String(rule)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Skill: summary + triggers + rules */}
+      {type === 'skill' && (
+        <div className="space-y-1.5">
+          {data.summary && (
+            <p className="text-[11px] text-slate-600 leading-snug">{String(data.summary)}</p>
+          )}
+          {Array.isArray(data.triggers) && data.triggers.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {data.triggers.map((t: unknown, i: number) => (
+                <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-100">
+                  {String(t)}
+                </span>
+              ))}
+            </div>
+          )}
+          {Array.isArray(data.rules) && data.rules.length > 0 && (
+            <ul className="space-y-0.5">
+              {data.rules.map((r: unknown, i: number) => (
+                <li key={i} className="text-[10px] text-slate-500 leading-snug flex gap-1.5">
+                  <span className="text-slate-300 mt-px">•</span>
+                  <span>{String(r)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* Lesson: goal/action/result */}
+      {type === 'lesson' && (
+        <div className="space-y-1 text-[11px] text-slate-600">
+          {data.goal && <div><span className="font-bold text-slate-400">goal:</span> {String(data.goal)}</div>}
+          {data.action && <div><span className="font-bold text-slate-400">action:</span> {String(data.action)}</div>}
+          {data.result && <div><span className="font-bold text-slate-400">result:</span> {String(data.result)}</div>}
+        </div>
+      )}
+    </div>
   );
 };
 

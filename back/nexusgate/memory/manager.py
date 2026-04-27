@@ -64,7 +64,9 @@ class MemoryManager:
         self.structured_memory_path = self.workspace / "structured_memory.jsonl"
         self.sop_path = self.workspace / "memory_management_sop.md"
         self.l1_path = self.workspace / "global_mem_insight.txt"
+        self.l1_json_path = self.workspace / "l1_constraints.json"
         self.l2_path = self.workspace / "global_mem.txt"
+        self.l3_json_path = self.workspace / "l3_skills.json"
 
         self._bootstrap_files()
         self.l0_rules = self.load_l0_sop()
@@ -90,7 +92,7 @@ class MemoryManager:
         self.event_logger = event_logger or MemoryEventLogger(self.candidate_events_path)
         self.skill_manifest = self._load_skill_manifest()
         self._index_l3_skills()
-        self._sync_txt_to_jsonl()
+        self._sync_source_to_jsonl()
 
     @property
     def backend_status(self) -> MemoryBackendStatus:
@@ -105,6 +107,16 @@ class MemoryManager:
         l1_seed = self._load_template(self.source_root / "assets" / "insight_fixed_structure.txt", "# [Global Memory Insight]\n")
         self._copy_if_missing(self.source_root / "assets" / "global_mem_insight_template.txt", self.l1_path, l1_seed)
         self._copy_if_missing(self.source_root / "memory" / "global_mem.txt", self.l2_path, "## [FACTS]\n")
+        self._copy_if_missing(
+            self.source_root / "memory" / "l1_constraints.json",
+            self.l1_json_path,
+            json.dumps([], ensure_ascii=False, indent=2),
+        )
+        self._copy_if_missing(
+            self.source_root / "memory" / "l3_skills.json",
+            self.l3_json_path,
+            json.dumps([], ensure_ascii=False, indent=2),
+        )
         self._copy_if_missing(
             self.source_root / "memory" / self.SKILL_MANIFEST_FILE,
             self.workspace / self.SKILL_MANIFEST_FILE,
@@ -227,17 +239,21 @@ class MemoryManager:
         if records:
             self.index.upsert(records)
 
-    def _sync_txt_to_jsonl(self) -> None:
-        """Parse L1/L2 txt files and upsert into structured_memory.jsonl so the admin API can serve them."""
+    def _sync_source_to_jsonl(self) -> None:
+        """Parse L1 JSON + L2 txt + L3 JSON source files and upsert into structured_memory.jsonl.
+
+        L1 and L3 are now read from JSON files (l1_constraints.json, l3_skills.json)
+        which provide structured_data for TOON rendering. L2 remains txt-based.
+        """
         existing_map = self.repository.load_latest_map()
-        # Archive stale txt_sync records so fresh parse replaces them
+        # Archive stale source_sync records so fresh parse replaces them
         stale_ids: list[str] = []
         for mid, rec in existing_map.items():
-            if rec.source and rec.source.startswith("txt_sync:"):
+            if rec.source and (rec.source.startswith("txt_sync:") or rec.source.startswith("src_sync:")):
                 stale_ids.append(mid)
         existing_ids = set(existing_map.keys()) - set(stale_ids)
         now = datetime.now(timezone.utc).isoformat()
-        # Mark old txt_sync entries as archived
+        # Mark old sync entries as archived
         if stale_ids:
             archive_records: list[MemoryRecord] = []
             for sid in stale_ids:
@@ -248,8 +264,64 @@ class MemoryManager:
             self.repository.upsert_many(archive_records)
         records: list[MemoryRecord] = []
 
+        # ── L1: l1_constraints.json ──
+        l1_items: list[dict[str, Any]] = []
+        try:
+            l1_raw = self.l1_json_path.read_text(encoding="utf-8")
+            l1_items = json.loads(l1_raw)
+            if not isinstance(l1_items, list):
+                l1_items = []
+        except Exception:
+            l1_items = []
+
+        l1_to_l2_map: dict[str, list[str]] = {}
+        for item in l1_items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            item_type = str(item.get("type") or "constraint").strip()
+            target_group = str(item.get("target_group") or "").strip() or None
+            keys = item.get("keys") or []
+            rules = item.get("rules") or []
+            # Build compatible content text for backward compat / text search
+            if item_type == "pointer" and target_group:
+                keys_str = ",".join(str(k) for k in keys) if keys else ""
+                content = f"{name} -> L2.[{target_group}]; keys={keys_str}" if keys_str else f"{name} -> L2.[{target_group}]"
+            elif rules:
+                content = f"{name} -> {'; '.join(str(r) for r in rules)}"
+            else:
+                content = name
+            content = content[:96]
+            mid = hashlib.sha1(f"src:L1:{name}".encode("utf-8")).hexdigest()
+            if mid in existing_ids:
+                continue
+            tags = [f"L1:{name}"]
+            evidence_ref = ""
+            if item_type == "pointer" and target_group:
+                tags.append(f"→L2:{target_group}")
+                evidence_ref = f"L2:{target_group}"
+                l1_to_l2_map.setdefault(target_group, []).append(name)
+            records.append(MemoryRecord(
+                memory_id=mid,
+                layer="L1",
+                memory_type=MemoryType.INDEX_POINTER,
+                scope=MemoryScope.GLOBAL,
+                content=content,
+                summary=name,
+                evidence_ref=evidence_ref,
+                verified=True,
+                confidence=0.9,
+                dedupe_key=self._default_dedupe_key(name),
+                tags=tags,
+                source="src_sync:l1",
+                created_at=now,
+                updated_at=now,
+                structured_data=item,
+            ))
+
         # ── L2: global_mem.txt (one record per ## section) ──
-        # Parse sections first so L1 can reference them
         try:
             l2_raw = self.l2_path.read_text(encoding="utf-8")
         except Exception:
@@ -273,65 +345,11 @@ class MemoryManager:
         if current_section and current_lines:
             l2_sections.append((current_section, current_lines))
 
-        # Build L2 section name → memory_id map for cross-referencing
-        l2_section_ids: dict[str, str] = {}
-        for section_name, lines in l2_sections:
-            mid = hashlib.sha1(f"txt:L2:{section_name}".encode("utf-8")).hexdigest()
-            l2_section_ids[section_name] = mid
-
-        # ── L1: global_mem_insight.txt ──
-        l1_ref_re = re.compile(r"L2\.\[(.+?)\]")
-        try:
-            l1_raw = self.l1_path.read_text(encoding="utf-8")
-        except Exception:
-            l1_raw = ""
-        for line in l1_raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            mid = hashlib.sha1(f"txt:L1:{line}".encode("utf-8")).hexdigest()
-            if mid in existing_ids:
-                continue
-            # Extract L1 key name (before ->) and linked L2 sections
-            l1_key = line.split("->")[0].strip() if "->" in line else line[:32]
-            linked_l2 = l1_ref_re.findall(line)
-            tags = [f"L1:{l1_key}"]
-            for ref in linked_l2:
-                tags.append(f"→L2:{ref}")
-            evidence_ref = ",".join(f"L2:{r}" for r in linked_l2) if linked_l2 else ""
-            records.append(MemoryRecord(
-                memory_id=mid,
-                layer="L1",
-                memory_type=MemoryType.INDEX_POINTER,
-                scope=MemoryScope.GLOBAL,
-                content=line[:96],
-                summary=l1_key,
-                evidence_ref=evidence_ref,
-                verified=True,
-                confidence=0.9,
-                dedupe_key=self._default_dedupe_key(line),
-                tags=tags,
-                source="txt_sync:l1",
-                created_at=now,
-                updated_at=now,
-            ))
-
-        # ── Create L2 records with back-reference tags to L1 ──
-        # Build reverse map: L2 section → list of L1 keys that point to it
-        l1_to_l2_map: dict[str, list[str]] = {}
-        for line in l1_raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "->" not in line:
-                continue
-            l1_key = line.split("->")[0].strip()
-            for ref in l1_ref_re.findall(line):
-                l1_to_l2_map.setdefault(ref, []).append(l1_key)
-
         for section_name, lines in l2_sections:
             content = "\n".join(lines)
             if not content.strip():
                 continue
-            mid = l2_section_ids[section_name]
+            mid = hashlib.sha1(f"txt:L2:{section_name}".encode("utf-8")).hexdigest()
             if mid in existing_ids:
                 continue
             tags = [f"L2:{section_name}"]
@@ -353,6 +371,59 @@ class MemoryManager:
                 updated_at=now,
             ))
 
+        # ── L3: l3_skills.json ──
+        l3_items: list[dict[str, Any]] = []
+        try:
+            l3_raw = self.l3_json_path.read_text(encoding="utf-8")
+            l3_items = json.loads(l3_raw)
+            if not isinstance(l3_items, list):
+                l3_items = []
+        except Exception:
+            l3_items = []
+
+        for item in l3_items:
+            if not isinstance(item, dict):
+                continue
+            skill_type = str(item.get("type") or "skill").strip()
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            # Build compatible content text
+            if skill_type == "skill":
+                summary = str(item.get("summary") or "")
+                rules = item.get("rules") or []
+                triggers = item.get("triggers") or []
+                content = f"skill: {name}\nsummary: {summary}\ntriggers: {','.join(str(t) for t in triggers)}\nrules: {';'.join(str(r) for r in rules)}"
+            else:
+                goal = str(item.get("goal") or "")
+                action = str(item.get("action") or "unknown")
+                result = str(item.get("result") or "")
+                content = f"task_takeaway: goal={goal}; action={action}; result={result}"
+            content = content[:240]
+            mid = hashlib.sha1(f"src:L3:{name}".encode("utf-8")).hexdigest()
+            if mid in existing_ids:
+                continue
+            tags = [f"L3:{name}"]
+            group = str(item.get("group") or "").strip()
+            if group:
+                tags.append(f"group:{group}")
+            records.append(MemoryRecord(
+                memory_id=mid,
+                layer="L3",
+                memory_type=MemoryType.PROCEDURE if skill_type == "skill" else MemoryType.LESSON,
+                scope=MemoryScope.GLOBAL if skill_type == "skill" else MemoryScope.SESSION,
+                content=content,
+                summary=name,
+                verified=True,
+                confidence=0.8,
+                dedupe_key=self._default_dedupe_key(name),
+                tags=tags,
+                source="src_sync:l3",
+                created_at=now,
+                updated_at=now,
+                structured_data=item,
+            ))
+
         if records:
             self.repository.upsert_many(records)
             try:
@@ -369,21 +440,13 @@ class MemoryManager:
         if not skill:
             return ""
         summary = str(entry.get("summary") or "").strip() or metadata.get("one_line_summary") or metadata.get("description") or "skill summary unavailable"
-        tags = self._to_csv(entry.get("tags")) or metadata.get("tags") or "skill"
-        task_types = self._to_csv(entry.get("task_types")) or "chat"
-        triggers = self._to_csv(entry.get("triggers")) or skill
-        when = self._extract_markdown_section(body, "When to use")
-        rules = self._extract_markdown_section(body, "Core rules")
-        lines = [
-            f"skill: {skill}",
-            f"summary: {summary}",
-            f"tags: {tags}",
-            f"task_types: {task_types}",
-            f"triggers: {triggers}",
-            f"when: {when or 'recover prior conversation context'}",
-            f"rules: {rules or 'only trust tool-verified artifacts'}",
-        ]
-        return "\n".join(lines)
+        triggers = entry.get("triggers") or []
+        triggers_str = "+".join(str(t) for t in triggers) if triggers else skill
+        when = str(entry.get("when") or "").strip() or self._extract_markdown_section(body, "When to use") or "recover prior conversation context"
+        rules = entry.get("rules") or []
+        rules_str = ";".join(str(r) for r in rules) if rules else self._extract_markdown_section(body, "Core rules") or "only trust tool-verified artifacts"
+        # TOON format for skills
+        return f"skills[1]{{name,triggers,when,rules}}:\n  {skill},{triggers_str},{when},{rules_str}"
 
     def _load_skill_raw(self, entry: dict[str, Any]) -> str:
         path_value = str(entry.get("path") or "").strip()
@@ -774,6 +837,10 @@ class MemoryManager:
         procedures = [row.text for row in selected_by_layer.get("L3", [])]
         continuity = [row.text for row in selected_by_layer.get("L4", [])]
         constraints = [row.text for row in selected_by_layer.get("L1", [])]
+        # Fetch L1 MemoryRecords with structured_data for TOON rendering
+        l1_records = self.repository.filter_visible(
+            QueryFilters(layers=["L1"], include_scopes=[MemoryScope.GLOBAL], exclude_archived=True)
+        )
         legacy_layers = self._legacy_layers_from_sections(
             facts=facts,
             procedures=procedures,
@@ -827,6 +894,7 @@ class MemoryManager:
                 "continuity_count": len(compressed.get("L4", [])),
                 "constraints_count": len(compressed.get("L1", [])),
             },
+            l1_records=l1_records,
         )
 
     @staticmethod
@@ -901,19 +969,39 @@ class MemoryManager:
         return priorities.get(section, 9)
 
     @staticmethod
-    def _parse_l1_pointer_keys(constraints: list[str], facts: list[str] | None = None) -> dict[str, list[str]]:
+    def _parse_l1_pointer_keys(constraints: list[str], facts: list[str] | None = None, l1_records: list[MemoryRecord] | None = None) -> dict[str, list[str]]:
         """Parse L1 constraint lines for L2 pointer syntax like 'key -> L2.[GROUP_NAME]'.
 
         Returns a mapping of POINTER_KEY -> [match_key1, match_key2, ...] so that L2 facts
         whose text starts with a listed match_key can be grouped under that header.
 
-        The POINTER_KEY (text before '->') is used as the group header in rendered output,
-        so the model can directly map L1 pointer names to L2 content sections.
-
-        If keys= is missing or truncated (L1 has 96-char limit), infer keys
-        from the prefixes of L2 facts (text before the first ':' or '=').
+        If l1_records with structured_data are provided, reads from structured_data directly.
+        Otherwise falls back to regex parsing of constraint text lines.
         """
         groups: dict[str, list[str]] = {}
+        # Prefer structured_data when available
+        if l1_records:
+            for rec in l1_records:
+                sd = rec.structured_data
+                if not sd:
+                    continue
+                if str(sd.get("type") or "") != "pointer":
+                    continue
+                if str(sd.get("target_layer") or "") != "L2":
+                    continue
+                name = str(sd.get("name") or "").strip()
+                keys = sd.get("keys") or []
+                if not name:
+                    continue
+                groups[name] = [str(k).strip() for k in keys if str(k).strip()]
+            # If no structured_data pointers found, fall through to regex
+            if groups:
+                if facts is not None:
+                    for name, keys in groups.items():
+                        if not keys:
+                            groups[name] = ["*"]
+                return groups
+        # Fallback: regex parsing of text lines
         for line in constraints:
             # Match patterns like: project_structure -> L2.[PROJECT_STRUCTURE]; keys=a,b,c
             for m in re.finditer(r"L2\.\[([^\]]+)\]", line):
@@ -950,16 +1038,62 @@ class MemoryManager:
         return [f.strip() for f in facts if f.strip()]
 
     @staticmethod
+    def _render_toon_table(header_name: str, fields: list[str], rows: list[list[str]]) -> str:
+        """Render a TOON-style compact table: name[N]{f1,f2,...}: row1 row2 ..."""
+        n = len(rows)
+        if n == 0:
+            return ""
+        field_list = ",".join(fields)
+        lines = [f"{header_name}[{n}]{{{field_list}}}:"]
+        for row in rows:
+            values = ",".join(str(v) for v in row)
+            lines.append(f"  {values}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_render_blocks(pack: MemoryPack) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
 
         # Parse L1→L2 pointer references so L2 facts can be grouped
         constraints_list = list(pack.constraints or [])
         raw_facts = list(pack.facts or [])
-        pointer_groups = MemoryManager._parse_l1_pointer_keys(constraints_list, facts=raw_facts)
+        pointer_groups = MemoryManager._parse_l1_pointer_keys(
+            constraints_list, facts=raw_facts, l1_records=pack.l1_records,
+        )
         facts_list = MemoryManager._group_facts_by_pointer(
             list(pack.facts or []), pointer_groups
         )
+
+        # Build TOON constraint block from structured_data if available
+        toon_parts: list[str] = []
+        pointers_rows: list[list[str]] = []
+        constraints_rows: list[list[str]] = []
+        preferences_rows: list[list[str]] = []
+        for rec in pack.l1_records:
+            sd = rec.structured_data
+            if not sd:
+                continue
+            item_type = str(sd.get("type") or "").strip()
+            name = str(sd.get("name") or "").strip()
+            if item_type == "pointer":
+                group = str(sd.get("target_group") or "-")
+                keys = sd.get("keys") or []
+                pointers_rows.append([name, group, "+".join(str(k) for k in keys) or "-"])
+            elif item_type == "constraint":
+                rules = sd.get("rules") or []
+                constraints_rows.append([name, ";".join(str(r) for r in rules)])
+            elif item_type == "preference":
+                rules = sd.get("rules") or []
+                preferences_rows.append([name, ";".join(str(r) for r in rules)])
+
+        if pointers_rows:
+            toon_parts.append(MemoryManager._render_toon_table("pointers", ["name", "group", "keys"], pointers_rows))
+        if constraints_rows:
+            toon_parts.append(MemoryManager._render_toon_table("constraints", ["name", "rules"], constraints_rows))
+        if preferences_rows:
+            toon_parts.append(MemoryManager._render_toon_table("preferences", ["name", "rules"], preferences_rows))
+
+        toon_constraints = "\n".join(toon_parts) if toon_parts else ""
 
         def add(section: str, rows: list[str]) -> None:
             for idx, text in enumerate(rows):
@@ -982,7 +1116,8 @@ class MemoryManager:
                     }
                 )
 
-        add("constraints", constraints_list)
+        # Use TOON text for constraints if available, else fallback to plain text
+        add("constraints", [toon_constraints] if toon_constraints else constraints_list)
         add("facts", facts_list)
         add("procedures", list(pack.procedures or []))
         add("continuity", list(pack.continuity or []))
@@ -1103,7 +1238,7 @@ class MemoryManager:
             ]
         return [
             {"category": "memory_l0", "content": pack.l0},
-            {"category": "memory_constraints", "content": f"<memory_index>\nPointers: name -> L2.[GROUP]; keys=...\nTo resolve: match pointer keys to fact line prefixes in <relevant_memory>.\n{sections['constraints']}\n</memory_index>"},
+            {"category": "memory_constraints", "content": f"<memory_index>\nTOON format: section[N]{{fields}}: rows indented.\npointers: name→L2.[group]; match keys to fact prefixes in <relevant_memory>.\nconstraints/preferences: name→rules.\n{sections['constraints']}\n</memory_index>"},
             {"category": "memory_procedures", "content": f"<relevant_skills>\n{sections['procedures']}\n</relevant_skills>"},
             {"category": "memory_continuity", "content": f"<session_recall_hints>\n{sections['continuity']}\n</session_recall_hints>"},
             {"category": "memory_facts", "content": f"<relevant_memory>\n{sections['facts']}\n</relevant_memory>"},

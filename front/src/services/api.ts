@@ -169,6 +169,7 @@ export interface MemoryRecord {
   last_accessed_at: string;
   archived: boolean;
   supersedes: string;
+  structured_data: Record<string, unknown> | null;
 }
 
 export function fetchMemories(params?: {

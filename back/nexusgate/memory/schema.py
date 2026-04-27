@@ -52,6 +52,7 @@ class MemoryRecord:
     last_accessed_at: str = ""
     archived: bool = False
     supersedes: str = ""
+    structured_data: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
