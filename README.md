@@ -38,6 +38,7 @@ It sits between your AI clients (Cursor, Codex CLI, Aider, custom agents…) and
   - [Grounding & Hallucination Guard / 幻觉抑制](#grounding--hallucination-guard)
   - [Smart Routing & Fallback / 智能路由与降级](#smart-routing--fallback)
 - [Architecture / 架构](#-architecture)
+- [Frontend Screenshots / 前端截图](#front-image)
 - [Quick Start / 快速开始](#-quick-start)
 - [Usage / 使用方法](#-usage)
 - [Best Practices / 最佳实践](#-best-practices)
@@ -206,6 +207,16 @@ Multi-factor model selection considering quality tier, cost, health (circuit bre
 **Deployment modes:**
 - **Mode A (Direct):** `Client → NexusGate → OpenAI / Anthropic API`
 - **Mode B (Aggregated):** `Client → NexusGate → Ollama / vLLM / third-party aggregator`
+
+## front image
+![alt text](f6201dcf-0f39-4dbb-88af-df895a37b52a.png)
+记忆仓库页面，可自由编辑你的记忆
+
+![alt text](d9bb4e38-449b-4edb-9bc8-fb20d7f6ca24.png)
+看板页面，看使用该架构节省了多少token
+
+![alt text](9fe44d60-36f4-415a-8b89-dfc13908ae83.png)
+该界面你可以看到记忆的拼装逻辑
 
 ## 🚀 Quick Start
 
