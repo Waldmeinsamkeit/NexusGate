@@ -72,8 +72,10 @@ class StructuredMemoryRepository:
                 continue
             if row.scope == "session" and filters.session_id and row.session_id != filters.session_id:
                 continue
-            if row.scope == "project" and filters.project_id and row.project_id != filters.project_id:
-                continue
+            if row.scope == "project":
+                # Project-scoped records only visible when project_id matches
+                if not filters.project_id or row.project_id != filters.project_id:
+                    continue
             if filters.only_verified and not row.verified:
                 continue
             if filters.exclude_archived and row.archived:

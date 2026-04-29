@@ -1031,9 +1031,11 @@ def create_app() -> FastAPI:
                 requested_model=req.model or prepared_req.requested_model or settings.target_provider,
                 prepared_rows=prepared_rows,
             )
+            project_id = _infer_project_id(prepared_rows, user_text=prepared_user_query)
             memory_pack = memory.build_memory_pack(
                 session_id,
                 prepared_user_query,
+                project_id=project_id,
                 memory_budget_tokens=memory_budget_tokens,
             )
         else:
@@ -1467,9 +1469,11 @@ def create_app() -> FastAPI:
                     requested_model=req.model or prepared_req.requested_model or settings.target_provider,
                     prepared_rows=prepared_rows,
                 )
+                project_id = _infer_project_id(prepared_rows, user_text=passthrough_user_text)
                 memory_pack = memory.build_memory_pack(
                     session_id,
                     passthrough_user_text,
+                    project_id=project_id,
                     memory_budget_tokens=memory_budget_tokens,
                 )
             else:
@@ -1834,6 +1838,29 @@ def _normalize_messages_request(data: dict[str, Any], req: ChatCompletionRequest
         response_mode="messages",
         detected_language=_detect_language(user_text),
     )
+
+
+def _infer_project_id(messages: list[Any] | list[dict[str, Any]], user_text: str = "") -> str:
+    """Infer project_id from message content by checking for known project paths."""
+    # Collect all text from messages for path detection
+    all_text = user_text
+    for msg in messages:
+        if isinstance(msg, dict):
+            content = str(msg.get("content") or "")
+        else:
+            content = str(getattr(msg, "content", ""))
+        all_text += " " + content
+    # Check for NexusGate project indicators
+    nexusgate_indicators = [
+        "NexusGate", "nexusgate", "nexus_gate",
+        "back/nexusgate/", "back\\nexusgate\\",
+        "memory/manager.py", "memory\\manager.py",
+        "memory/l1_constraints", "memory/l3_skills",
+    ]
+    for indicator in nexusgate_indicators:
+        if indicator in all_text:
+            return "nexusgate"
+    return ""
 
 
 def _extract_latest_user_query(messages: list[Any]) -> str:
